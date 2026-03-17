@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
 from homeassistant.components.climate import (
@@ -475,7 +475,12 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self.async_set_updated_data(self._build_state_dict())
 
     async def _apply_learned_entry(self, learned: dict[str, Any]) -> None:
-        """Add a learned pattern to the schedule."""
+        """Add a learned pattern to the schedule.
+
+        When a preset is active the weekday/weekend entries are bypassed, so
+        update the preset's own entry directly.  Without an active preset the
+        entry is appended to the weekday/weekend schedule as before.
+        """
         try:
             minutes = int(learned["time"].split(":")[0]) * 60 + int(
                 learned["time"].split(":")[1]
@@ -483,23 +488,59 @@ class GTTCCoordinator(DataUpdateCoordinator):
             start_min = max(0, minutes - 30)
             end_min = min(1439, minutes + 30)
 
-            entry = ScheduleEntry(
-                time_start=f"{start_min // 60:02d}:{start_min % 60:02d}",
-                time_end=f"{end_min // 60:02d}:{end_min % 60:02d}",
-                target_temp=learned["temp"],
-                zone_id=learned.get("zone_id"),
-            )
-
-            day_type = learned.get("day_type", "daily")
-            if day_type == "weekday":
-                self.scheduler.add_entry_to_day("weekday", entry)
-            elif day_type == "weekend":
-                self.scheduler.add_entry_to_day("weekend", entry)
+            active_preset = self.scheduler.schedule.active_preset
+            if active_preset and active_preset in self.scheduler.presets:
+                # Preset takes priority over weekday/weekend schedule, so we
+                # must update the preset entry itself to make the learned temp
+                # persist after the manual override expires.
+                self._update_preset_learned_temp(
+                    active_preset, minutes, learned["temp"]
+                )
             else:
-                self.scheduler.add_entry_to_day("weekday", entry)
-                self.scheduler.add_entry_to_day("weekend", entry)
+                entry = ScheduleEntry(
+                    time_start=f"{start_min // 60:02d}:{start_min % 60:02d}",
+                    time_end=f"{end_min // 60:02d}:{end_min % 60:02d}",
+                    target_temp=learned["temp"],
+                    zone_id=learned.get("zone_id"),
+                )
+                day_type = learned.get("day_type", "daily")
+                if day_type == "weekday":
+                    self.scheduler.add_entry_to_day("weekday", entry)
+                elif day_type == "weekend":
+                    self.scheduler.add_entry_to_day("weekend", entry)
+                else:
+                    self.scheduler.add_entry_to_day("weekday", entry)
+                    self.scheduler.add_entry_to_day("weekend", entry)
         except Exception as err:
             _LOGGER.warning("Error applying learned entry: %s", err)
+
+    def _update_preset_learned_temp(
+        self, preset_name: str, learned_minutes: int, learned_temp: float
+    ) -> None:
+        """Update the preset entry that covers the learned time with the learned temperature.
+
+        Iterates every day in the preset so the temperature change is consistent
+        across the whole schedule (e.g. all weekdays and weekends share the same
+        entry objects when the preset was built).
+        """
+        learned_time = time(learned_minutes // 60, learned_minutes % 60)
+        preset = self.scheduler.presets[preset_name]
+        updated = False
+
+        for day_schedule in preset.schedule.values():
+            entry = self.scheduler._find_entry_for_time(day_schedule, learned_time)
+            if entry is not None and entry.target_temp != learned_temp:
+                entry.target_temp = learned_temp
+                updated = True
+
+        if updated:
+            _LOGGER.info(
+                "Updated preset '%s' entry covering %02d:%02d to %.1f° from learned pattern",
+                preset_name,
+                learned_minutes // 60,
+                learned_minutes % 60,
+                learned_temp,
+            )
 
     async def _set_thermostat_temp(self, temperature: float) -> None:
         """Set the real thermostat's target temperature."""
