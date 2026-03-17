@@ -44,6 +44,7 @@ _LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL = timedelta(seconds=30)
 TEMP_HYSTERESIS = 0.5  # Minimum change (degrees) before updating thermostat
+MAX_TEMP_OFFSET = 5.0  # Maximum offset correction between zone and thermostat sensors
 
 
 class GTTCCoordinator(DataUpdateCoordinator):
@@ -213,13 +214,21 @@ class GTTCCoordinator(DataUpdateCoordinator):
             # Determine target temperature
             desired_temp = self._calculate_desired_temp()
 
+            # Calculate offset-adjusted target for the real thermostat.
+            # Instead of blindly setting the thermostat to the desired temp,
+            # use zone sensor feedback to compensate for the difference
+            # between the thermostat's own sensor and the zone sensors.
+            thermostat_target = self._calculate_thermostat_target(
+                desired_temp, active_zone
+            )
+
             # Apply to thermostat if changed beyond hysteresis threshold
-            if desired_temp is not None:
+            if thermostat_target is not None:
                 if self._last_thermostat_temp is None or abs(
-                    desired_temp - self._last_thermostat_temp
+                    thermostat_target - self._last_thermostat_temp
                 ) >= TEMP_HYSTERESIS:
-                    await self._set_thermostat_temp(desired_temp)
-                    self._last_thermostat_temp = desired_temp
+                    await self._set_thermostat_temp(thermostat_target)
+                    self._last_thermostat_temp = thermostat_target
 
             self.target_temp = desired_temp
 
@@ -368,6 +377,52 @@ class GTTCCoordinator(DataUpdateCoordinator):
 
         # 4. Fall back to current target or default comfort temp
         return self.target_temp if self.target_temp is not None else self._default_comfort_temp
+
+    def _calculate_thermostat_target(
+        self, desired_temp: float | None, active_zone
+    ) -> float | None:
+        """Adjust thermostat target using zone sensor feedback.
+
+        If zone sensors read differently from the thermostat's own sensor,
+        apply an offset so the *zone* reaches the desired temperature rather
+        than the thermostat's sensor.
+
+        Example: zone reads 70, thermostat reads 68, goal is 71.
+          offset = 68 - 70 = -2  →  thermostat target = 71 + (-2) = 69
+          Thermostat heats to 69 at its sensor, zone lands at ~71.
+        """
+        if desired_temp is None:
+            return None
+
+        thermostat_reading = self._get_thermostat_current_temp()
+        zone_reading = (
+            active_zone.current_temp
+            if active_zone and active_zone.current_temp is not None
+            else None
+        )
+
+        if thermostat_reading is not None and zone_reading is not None:
+            offset = thermostat_reading - zone_reading
+            # Cap offset to prevent extreme corrections
+            offset = max(-MAX_TEMP_OFFSET, min(MAX_TEMP_OFFSET, offset))
+            adjusted = desired_temp + offset
+            # Clamp to valid range
+            adjusted = max(self.temp_min, min(self.temp_max, adjusted))
+
+            if abs(offset) >= 0.5:
+                _LOGGER.info(
+                    "Zone temp: %.1f°, Thermostat reads: %.1f°, "
+                    "Offset: %+.1f°, Goal: %.1f°, Adjusted thermostat target: %.1f°",
+                    zone_reading,
+                    thermostat_reading,
+                    offset,
+                    desired_temp,
+                    adjusted,
+                )
+            return adjusted
+
+        # No zone data available — fall back to direct control
+        return desired_temp
 
     def _get_current_schedule_info(self) -> dict[str, Any] | None:
         if not self.schedule_enabled:
