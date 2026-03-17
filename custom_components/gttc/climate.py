@@ -1,4 +1,4 @@
-"""Climate entity for Better Thermostat."""
+"""Climate entity for GTTC."""
 from __future__ import annotations
 
 import logging
@@ -35,7 +35,7 @@ from .const import (
     PRESET_LABEL_TO_KEY,
     PRESETS,
 )
-from .coordinator import BetterThermostatCoordinator
+from .coordinator import GTTCCoordinator
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -47,17 +47,17 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Better Thermostat climate entity."""
-    coordinator: BetterThermostatCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    """Set up GTTC climate entity."""
+    coordinator: GTTCCoordinator = hass.data[DOMAIN][config_entry.entry_id]
     name = config_entry.data.get(CONF_NAME, DEFAULT_NAME)
     temp_unit = config_entry.data.get(CONF_TEMP_UNIT, DEFAULT_TEMP_UNIT)
 
     async_add_entities(
-        [BetterThermostatClimate(coordinator, config_entry, name, temp_unit)]
+        [GTTCClimate(coordinator, config_entry, name, temp_unit)]
     )
 
 
-class BetterThermostatClimate(CoordinatorEntity, ClimateEntity):
+class GTTCClimate(CoordinatorEntity, ClimateEntity):
     """Virtual climate entity that controls the real thermostat via zone-aware scheduling."""
 
     _attr_has_entity_name = True
@@ -66,7 +66,7 @@ class BetterThermostatClimate(CoordinatorEntity, ClimateEntity):
 
     def __init__(
         self,
-        coordinator: BetterThermostatCoordinator,
+        coordinator: GTTCCoordinator,
         config_entry: ConfigEntry,
         name: str,
         temp_unit: str,

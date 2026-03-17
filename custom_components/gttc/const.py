@@ -1,7 +1,7 @@
-"""Constants for Better Thermostat."""
+"""Constants for Goal Temp Thermostat Control (GTTC)."""
 from __future__ import annotations
 
-DOMAIN = "better_thermostat"
+DOMAIN = "gttc"
 PLATFORMS = ["climate", "sensor", "select", "switch", "number"]
 
 # Config keys
@@ -61,7 +61,7 @@ WEEKEND = ["saturday", "sunday"]
 ALL_DAYS = WEEKDAYS + WEEKEND
 
 # Defaults
-DEFAULT_NAME = "Better Thermostat"
+DEFAULT_NAME = "GTTC"
 DEFAULT_TEMP_MIN = 50.0
 DEFAULT_TEMP_MAX = 90.0
 DEFAULT_AWAY_TEMP = 62.0

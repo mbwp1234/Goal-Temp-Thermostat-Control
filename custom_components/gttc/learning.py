@@ -1,4 +1,4 @@
-"""Learning engine for Better Thermostat - detects patterns and auto-creates schedules."""
+"""Learning engine for GTTC - detects patterns and auto-creates schedules."""
 from __future__ import annotations
 
 import logging

@@ -1,4 +1,4 @@
-"""Data models for Better Thermostat."""
+"""Data models for GTTC."""
 from __future__ import annotations
 
 import logging

@@ -1,4 +1,4 @@
-"""Switch entities for Better Thermostat."""
+"""Switch entities for GTTC."""
 from __future__ import annotations
 
 from homeassistant.components.switch import SwitchEntity
@@ -8,7 +8,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import CONF_NAME, DEFAULT_NAME, DOMAIN
-from .coordinator import BetterThermostatCoordinator
+from .coordinator import GTTCCoordinator
 
 
 async def async_setup_entry(
@@ -16,7 +16,7 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    coordinator: BetterThermostatCoordinator = hass.data[DOMAIN][config_entry.entry_id]
+    coordinator: GTTCCoordinator = hass.data[DOMAIN][config_entry.entry_id]
     name = config_entry.data.get(CONF_NAME, DEFAULT_NAME)
 
     async_add_entities([

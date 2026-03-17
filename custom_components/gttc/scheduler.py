@@ -1,4 +1,4 @@
-"""Schedule management for Better Thermostat."""
+"""Schedule management for GTTC."""
 from __future__ import annotations
 
 import logging

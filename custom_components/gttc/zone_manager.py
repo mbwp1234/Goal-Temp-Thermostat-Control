@@ -1,4 +1,4 @@
-"""Zone management for Better Thermostat."""
+"""Zone management for GTTC."""
 from __future__ import annotations
 
 import logging
