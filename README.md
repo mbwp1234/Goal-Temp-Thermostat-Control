@@ -1,4 +1,4 @@
-# Better Thermostat
+Goal Temp Thermostat Control
 
 A smart, zone-aware thermostat integration for Home Assistant (HACS). Control your thermostat using temperature sensors from different rooms/floors, with intelligent scheduling, occupancy detection, and automatic pattern learning.
 
