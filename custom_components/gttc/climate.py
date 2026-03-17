@@ -26,6 +26,7 @@ from .const import (
     ATTR_OVERRIDE_REMAINING,
     ATTR_PRESENCE_HOME,
     ATTR_SCHEDULE_ACTIVE,
+    ATTR_ZONE_DETAILS,
     ATTR_ZONE_TEMPS,
     CONF_NAME,
     CONF_TEMP_UNIT,
@@ -148,6 +149,7 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
             ATTR_OVERRIDE_ACTIVE: data.get("override_active", False),
             ATTR_OVERRIDE_REMAINING: data.get("override_remaining", 0),
             ATTR_ALL_ZONES: self.coordinator.zone_manager.get_all_zone_names(),
+            ATTR_ZONE_DETAILS: self.coordinator.zone_manager.get_zone_details(),
         }
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
@@ -167,6 +169,10 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
                 self.coordinator.scheduler.activate_preset(key)
             else:
                 _LOGGER.warning("Unknown preset mode: %s", preset_mode)
+                return
+        # Persist immediately so preset survives HA restart
+        await self.coordinator.async_save()
+        self.coordinator.async_set_updated_data(self.coordinator._build_state_dict())
 
     async def async_turn_on(self) -> None:
         modes = self.hvac_modes

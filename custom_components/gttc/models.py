@@ -47,6 +47,7 @@ class Zone:
     sensor_entities: list[str] = field(default_factory=list)
     occupancy_sensor_entities: list[str] = field(default_factory=list)
     area_id: str | None = None
+    floor_id: str | None = None
     away_temp: float | None = None
     occupancy_override: bool = True
     current_temp: float | None = None
@@ -59,6 +60,7 @@ class Zone:
             "sensor_entities": self.sensor_entities,
             "occupancy_sensor_entities": self.occupancy_sensor_entities,
             "area_id": self.area_id,
+            "floor_id": self.floor_id,
             "away_temp": self.away_temp,
             "occupancy_override": self.occupancy_override,
         }
@@ -71,6 +73,7 @@ class Zone:
             sensor_entities=data.get("sensor_entities", []),
             occupancy_sensor_entities=data.get("occupancy_sensor_entities", []),
             area_id=data.get("area_id"),
+            floor_id=data.get("floor_id"),
             away_temp=data.get("away_temp"),
             occupancy_override=data.get("occupancy_override", True),
         )
