@@ -169,6 +169,10 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
                 self.coordinator.scheduler.activate_preset(key)
             else:
                 _LOGGER.warning("Unknown preset mode: %s", preset_mode)
+                return
+        # Persist immediately so preset survives HA restart
+        await self.coordinator.async_save()
+        self.coordinator.async_set_updated_data(self.coordinator._build_state_dict())
 
     async def async_turn_on(self) -> None:
         modes = self.hvac_modes

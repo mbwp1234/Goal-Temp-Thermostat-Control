@@ -161,3 +161,31 @@ remove_sensor_from_zone:
       required: false
       selector:
         text:
+
+cancel_override:
+  name: Cancel Manual Override
+  description: Cancel the active manual temperature override and resume scheduled automation.
+  fields:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID (optional).
+      required: false
+      selector:
+        text:
+
+toggle_schedule:
+  name: Toggle Schedule
+  description: Enable or disable the schedule-based temperature automation.
+  fields:
+    enabled:
+      name: Enabled
+      description: Whether to enable or disable the schedule.
+      required: true
+      selector:
+        boolean:
+    entry_id:
+      name: Entry ID
+      description: Config entry ID (optional).
+      required: false
+      selector:
+        text:

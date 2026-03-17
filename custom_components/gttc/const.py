@@ -85,6 +85,8 @@ SERVICE_CLEAR_LEARNED = "clear_learned_schedule"
 SERVICE_SET_PRESET = "set_preset"
 SERVICE_ASSIGN_SENSOR = "assign_sensor_to_zone"
 SERVICE_REMOVE_SENSOR = "remove_sensor_from_zone"
+SERVICE_CANCEL_OVERRIDE = "cancel_override"
+SERVICE_TOGGLE_SCHEDULE = "toggle_schedule"
 
 # Attributes
 ATTR_ACTIVE_ZONE = "active_zone"

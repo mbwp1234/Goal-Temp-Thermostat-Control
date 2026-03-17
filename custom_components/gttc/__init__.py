@@ -16,11 +16,13 @@ from .const import (
     DOMAIN,
     PLATFORMS,
     SERVICE_ASSIGN_SENSOR,
+    SERVICE_CANCEL_OVERRIDE,
     SERVICE_CLEAR_LEARNED,
     SERVICE_REMOVE_SENSOR,
     SERVICE_SET_PRESET,
     SERVICE_SET_SCHEDULE,
     SERVICE_SET_ZONE_TEMP,
+    SERVICE_TOGGLE_SCHEDULE,
 )
 from .coordinator import GTTCCoordinator
 from .models import Zone
@@ -78,6 +80,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             SERVICE_SET_PRESET,
             SERVICE_ASSIGN_SENSOR,
             SERVICE_REMOVE_SENSOR,
+            SERVICE_CANCEL_OVERRIDE,
+            SERVICE_TOGGLE_SCHEDULE,
         ):
             hass.services.async_remove(DOMAIN, service)
 
@@ -287,6 +291,44 @@ def _register_services(hass: HomeAssistant) -> None:
                 vol.Optional("sensor_type", default="temperature"): vol.In(
                     ["temperature", "occupancy"]
                 ),
+                vol.Optional("entry_id"): cv.string,
+            }
+        ),
+    )
+
+    async def handle_cancel_override(call: ServiceCall) -> None:
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No GTTC instance found")
+            return
+        await coordinator.async_cancel_override()
+
+    async def handle_toggle_schedule(call: ServiceCall) -> None:
+        enabled = call.data["enabled"]
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No GTTC instance found")
+            return
+        await coordinator.async_set_schedule_enabled(enabled)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CANCEL_OVERRIDE,
+        handle_cancel_override,
+        schema=vol.Schema(
+            {
+                vol.Optional("entry_id"): cv.string,
+            }
+        ),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_TOGGLE_SCHEDULE,
+        handle_toggle_schedule,
+        schema=vol.Schema(
+            {
+                vol.Required("enabled"): cv.boolean,
                 vol.Optional("entry_id"): cv.string,
             }
         ),

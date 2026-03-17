@@ -43,6 +43,7 @@ from .zone_manager import ZoneManager
 _LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL = timedelta(seconds=30)
+TEMP_HYSTERESIS = 0.5  # Minimum change (degrees) before updating thermostat
 
 
 class GTTCCoordinator(DataUpdateCoordinator):
@@ -89,9 +90,12 @@ class GTTCCoordinator(DataUpdateCoordinator):
             )
         )
 
+        # Default comfort temperature: midpoint of configured range
+        self._default_comfort_temp: float = round((self.temp_min + self.temp_max) / 2) + 4
+
         # State
         self.manual_override: ManualOverride | None = None
-        self.target_temp: float | None = None
+        self.target_temp: float | None = self._default_comfort_temp
         self.current_temp: float | None = None
         self.hvac_mode: HVACMode | None = None
         self.hvac_action: HVACAction | None = None
@@ -106,12 +110,22 @@ class GTTCCoordinator(DataUpdateCoordinator):
 
     async def async_initialize(self) -> None:
         """Load stored data and set up initial state."""
+        first_run = True
         try:
             stored = await self._store.async_load()
             if stored and isinstance(stored, dict):
                 self._load_stored_data(stored)
+                first_run = False
         except Exception as err:
             _LOGGER.warning("Error loading stored data, starting fresh: %s", err)
+
+        # On first run (no stored data), activate the Home preset so the
+        # thermostat has a sensible schedule immediately.
+        if first_run and self.scheduler.schedule.active_preset is None:
+            _LOGGER.info("First run detected - activating Home preset as default schedule")
+            self.scheduler.activate_preset("home")
+            self.schedule_enabled = True
+            self.scheduler.enabled = True
 
         self._initialized = True
         _LOGGER.info("GTTC coordinator initialized")
@@ -199,10 +213,13 @@ class GTTCCoordinator(DataUpdateCoordinator):
             # Determine target temperature
             desired_temp = self._calculate_desired_temp()
 
-            # Apply to thermostat if changed
-            if desired_temp is not None and desired_temp != self._last_thermostat_temp:
-                await self._set_thermostat_temp(desired_temp)
-                self._last_thermostat_temp = desired_temp
+            # Apply to thermostat if changed beyond hysteresis threshold
+            if desired_temp is not None:
+                if self._last_thermostat_temp is None or abs(
+                    desired_temp - self._last_thermostat_temp
+                ) >= TEMP_HYSTERESIS:
+                    await self._set_thermostat_temp(desired_temp)
+                    self._last_thermostat_temp = desired_temp
 
             self.target_temp = desired_temp
 
@@ -320,20 +337,24 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 pass
         return self.temp_max
 
-    def _calculate_desired_temp(self) -> float | None:
-        """Determine target temp: manual > occupancy > schedule > last setting."""
+    def _calculate_desired_temp(self) -> float:
+        """Determine target temp: manual > occupancy > schedule > last setting > comfort default."""
         # 1. Manual override (highest priority)
         if self.manual_override and not self.manual_override.is_expired:
             return self.manual_override.target_temp
 
-        # 2. Occupancy check
+        # 2. Occupancy check (only when sensors are explicitly reporting)
         if self.occupancy_enabled:
             active_zone = self.zone_manager.active_zone
-            # Per-zone occupancy
-            if active_zone and active_zone.occupancy_override:
-                if active_zone.is_occupied is False:
-                    zone_away = active_zone.away_temp or self.away_temp
-                    return zone_away
+            # Per-zone occupancy: only trigger if sensors exist and report unoccupied
+            if (
+                active_zone
+                and active_zone.occupancy_override
+                and active_zone.occupancy_sensor_entities
+                and active_zone.is_occupied is False
+            ):
+                zone_away = active_zone.away_temp or self.away_temp
+                return zone_away
 
             # Global: nobody home
             if not self.zone_manager.is_anyone_home():
@@ -345,8 +366,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
             if entry:
                 return entry.target_temp
 
-        # 4. Fall back to current target
-        return self.target_temp
+        # 4. Fall back to current target or default comfort temp
+        return self.target_temp if self.target_temp is not None else self._default_comfort_temp
 
     def _get_current_schedule_info(self) -> dict[str, Any] | None:
         if not self.schedule_enabled:
@@ -471,12 +492,27 @@ class GTTCCoordinator(DataUpdateCoordinator):
             await self.async_save()
             self.async_set_updated_data(self._build_state_dict())
 
+    async def async_cancel_override(self) -> None:
+        """Cancel the manual override and resume automation."""
+        self.manual_override = None
+        await self.async_save()
+        self.async_set_updated_data(self._build_state_dict())
+
     def cancel_override(self) -> None:
-        """Cancel the manual override."""
+        """Cancel the manual override (sync version)."""
         self.manual_override = None
 
+    async def async_set_schedule_enabled(self, enabled: bool) -> None:
+        """Toggle schedule on/off and persist."""
+        self.schedule_enabled = enabled
+        self.scheduler.enabled = enabled
+        if not enabled:
+            self.scheduler.deactivate_preset()
+        await self.async_save()
+        self.async_set_updated_data(self._build_state_dict())
+
     def set_schedule_enabled(self, enabled: bool) -> None:
-        """Toggle schedule on/off."""
+        """Toggle schedule on/off (sync version)."""
         self.schedule_enabled = enabled
         self.scheduler.enabled = enabled
         if not enabled:
