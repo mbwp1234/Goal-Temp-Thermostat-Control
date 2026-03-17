@@ -1,0 +1,225 @@
+"""Better Thermostat - Smart zone-aware thermostat with learning and scheduling."""
+from __future__ import annotations
+
+import logging
+from typing import Any
+
+import voluptuous as vol
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import ATTR_TEMPERATURE
+from homeassistant.core import HomeAssistant, ServiceCall
+from homeassistant.helpers import config_validation as cv
+
+from .const import (
+    CONF_ZONES,
+    DOMAIN,
+    PLATFORMS,
+    SERVICE_CLEAR_LEARNED,
+    SERVICE_SET_PRESET,
+    SERVICE_SET_SCHEDULE,
+    SERVICE_SET_ZONE_TEMP,
+)
+from .coordinator import BetterThermostatCoordinator
+from .models import Zone
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Better Thermostat from a config entry."""
+    hass.data.setdefault(DOMAIN, {})
+
+    coordinator = BetterThermostatCoordinator(hass, entry)
+
+    # Load zones from config
+    zones_data = entry.data.get(CONF_ZONES, [])
+    for zone_data in zones_data:
+        try:
+            zone = Zone.from_dict(zone_data)
+            coordinator.zone_manager.add_zone(zone)
+        except Exception as err:
+            _LOGGER.warning("Skipping invalid zone config: %s", err)
+
+    # Initialize (loads stored state)
+    await coordinator.async_initialize()
+
+    # Do first refresh
+    await coordinator.async_config_entry_first_refresh()
+
+    hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    # Set up platforms
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # Register services (idempotent)
+    _register_services(hass)
+
+    # Listen for options updates
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if unload_ok:
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+
+    # Unregister services if no more entries
+    if not hass.data.get(DOMAIN):
+        for service in (
+            SERVICE_SET_ZONE_TEMP,
+            SERVICE_SET_SCHEDULE,
+            SERVICE_CLEAR_LEARNED,
+            SERVICE_SET_PRESET,
+        ):
+            hass.services.async_remove(DOMAIN, service)
+
+    return unload_ok
+
+
+async def _async_update_listener(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> None:
+    """Handle options update - reload the integration."""
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+def _get_coordinator(
+    hass: HomeAssistant, entry_id: str | None = None
+) -> BetterThermostatCoordinator | None:
+    """Safely get a coordinator instance."""
+    entries = hass.data.get(DOMAIN, {})
+    if not entries:
+        return None
+
+    if entry_id:
+        coordinator = entries.get(entry_id)
+        if isinstance(coordinator, BetterThermostatCoordinator):
+            return coordinator
+        return None
+
+    # Return the first coordinator found
+    for coordinator in entries.values():
+        if isinstance(coordinator, BetterThermostatCoordinator):
+            return coordinator
+    return None
+
+
+def _register_services(hass: HomeAssistant) -> None:
+    """Register custom services (idempotent)."""
+    if hass.services.has_service(DOMAIN, SERVICE_SET_ZONE_TEMP):
+        return
+
+    async def handle_set_zone_temp(call: ServiceCall) -> None:
+        zone_id = call.data["zone_id"]
+        temperature = call.data[ATTR_TEMPERATURE]
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No Better Thermostat instance found")
+            return
+        zone = coordinator.zone_manager.get_zone(zone_id)
+        if zone is None:
+            _LOGGER.error("Zone '%s' not found", zone_id)
+            return
+        await coordinator.async_set_active_zone(zone_id)
+        await coordinator.async_set_temperature(temperature)
+
+    async def handle_set_schedule(call: ServiceCall) -> None:
+        day = call.data["day"]
+        entries = call.data["entries"]
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No Better Thermostat instance found")
+            return
+        if not entries:
+            _LOGGER.warning("Empty schedule entries for day '%s'", day)
+            return
+        if day == "weekday":
+            coordinator.scheduler.set_weekday_schedule(entries)
+        elif day == "weekend":
+            coordinator.scheduler.set_weekend_schedule(entries)
+        else:
+            coordinator.scheduler.set_day_schedule(day, entries)
+        await coordinator.async_save()
+
+    async def handle_clear_learned(call: ServiceCall) -> None:
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No Better Thermostat instance found")
+            return
+        coordinator.learning.clear_learned()
+        await coordinator.async_save()
+
+    async def handle_set_preset(call: ServiceCall) -> None:
+        preset = call.data["preset"]
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No Better Thermostat instance found")
+            return
+        if not coordinator.scheduler.activate_preset(preset):
+            _LOGGER.error("Unknown preset '%s'", preset)
+        await coordinator.async_save()
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_ZONE_TEMP,
+        handle_set_zone_temp,
+        schema=vol.Schema(
+            {
+                vol.Required("zone_id"): cv.string,
+                vol.Required(ATTR_TEMPERATURE): vol.Coerce(float),
+                vol.Optional("entry_id"): cv.string,
+            }
+        ),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_SCHEDULE,
+        handle_set_schedule,
+        schema=vol.Schema(
+            {
+                vol.Required("day"): cv.string,
+                vol.Required("entries"): vol.All(
+                    cv.ensure_list,
+                    [
+                        vol.Schema(
+                            {
+                                vol.Required("time_start"): cv.string,
+                                vol.Required("time_end"): cv.string,
+                                vol.Required("target_temp"): vol.Coerce(float),
+                                vol.Optional("zone_id"): cv.string,
+                            }
+                        )
+                    ],
+                ),
+                vol.Optional("entry_id"): cv.string,
+            }
+        ),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CLEAR_LEARNED,
+        handle_clear_learned,
+        schema=vol.Schema(
+            {
+                vol.Optional("entry_id"): cv.string,
+            }
+        ),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_SET_PRESET,
+        handle_set_preset,
+        schema=vol.Schema(
+            {
+                vol.Required("preset"): cv.string,
+                vol.Optional("entry_id"): cv.string,
+            }
+        ),
+    )
