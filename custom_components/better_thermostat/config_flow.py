@@ -19,13 +19,13 @@ from homeassistant.helpers import (
 )
 
 from .const import (
-    CONF_ACTIVE_ZONE,
     CONF_AWAY_TEMP,
     CONF_LEARNING_ENABLED,
     CONF_LEARNING_THRESHOLD,
     CONF_MANUAL_OVERRIDE_MINUTES,
     CONF_NAME,
     CONF_OCCUPANCY_ENABLED,
+    CONF_PRESENCE_DETECTION,
     CONF_TEMP_MAX,
     CONF_TEMP_MIN,
     CONF_TEMP_UNIT,
@@ -35,10 +35,14 @@ from .const import (
     DEFAULT_LEARNING_THRESHOLD,
     DEFAULT_MANUAL_OVERRIDE_MINUTES,
     DEFAULT_NAME,
+    DEFAULT_PRESENCE_MODE,
     DEFAULT_TEMP_MAX,
     DEFAULT_TEMP_MIN,
     DEFAULT_TEMP_UNIT,
     DOMAIN,
+    PRESENCE_MODE_BOTH,
+    PRESENCE_MODE_OCCUPANCY,
+    PRESENCE_MODE_PERSON,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,7 +56,6 @@ class BetterThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._data: dict[str, Any] = {}
         self._zones: list[dict[str, Any]] = []
-        self._discovered_areas: list[dict] = []
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -61,19 +64,25 @@ class BetterThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
 
         if user_input is not None:
-            # Validate thermostat entity exists
-            state = self.hass.states.get(user_input[CONF_THERMOSTAT])
+            thermostat = user_input.get(CONF_THERMOSTAT, "")
+            state = self.hass.states.get(thermostat)
             if state is None:
                 errors[CONF_THERMOSTAT] = "thermostat_not_found"
+            elif state.state in ("unavailable", "unknown"):
+                errors[CONF_THERMOSTAT] = "thermostat_unavailable"
             else:
-                self._data.update(user_input)
-                return await self.async_step_zones()
+                # Check for duplicate entries using same thermostat
+                await self.async_set_unique_id(thermostat)
+                self._abort_if_unique_id_configured()
 
-        # Find available climate entities
-        climate_entities = [
-            state.entity_id
-            for state in self.hass.states.async_all(CLIMATE_DOMAIN)
-        ]
+                # Validate temp range
+                temp_min = float(user_input.get(CONF_TEMP_MIN, DEFAULT_TEMP_MIN))
+                temp_max = float(user_input.get(CONF_TEMP_MAX, DEFAULT_TEMP_MAX))
+                if temp_min >= temp_max:
+                    errors[CONF_TEMP_MIN] = "invalid_temp_range"
+                else:
+                    self._data.update(user_input)
+                    return await self.async_step_zones()
 
         schema = vol.Schema(
             {
@@ -105,7 +114,6 @@ class BetterThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             elif zone_method == "manual":
                 return await self.async_step_add_zone()
             else:
-                # Skip zones for now
                 return await self.async_step_features()
 
         schema = vol.Schema(
@@ -113,9 +121,16 @@ class BetterThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 vol.Required("zone_method", default="auto"): selector.SelectSelector(
                     selector.SelectSelectorConfig(
                         options=[
-                            selector.SelectOptionDict(value="auto", label="Auto-discover from Home Assistant areas"),
-                            selector.SelectOptionDict(value="manual", label="Manually add zones"),
-                            selector.SelectOptionDict(value="skip", label="Skip (configure later)"),
+                            selector.SelectOptionDict(
+                                value="auto",
+                                label="Auto-discover from Home Assistant areas",
+                            ),
+                            selector.SelectOptionDict(
+                                value="manual", label="Manually add zones"
+                            ),
+                            selector.SelectOptionDict(
+                                value="skip", label="Skip (configure later)"
+                            ),
                         ],
                         mode=selector.SelectSelectorMode.LIST,
                     )
@@ -131,51 +146,59 @@ class BetterThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         """Auto-discover zones from HA areas."""
         if user_input is not None:
             selected_areas = user_input.get("selected_areas", [])
-            area_reg = ar.async_get(self.hass)
-            ent_reg = er.async_get(self.hass)
+            try:
+                area_reg = ar.async_get(self.hass)
+                ent_reg = er.async_get(self.hass)
 
-            for area_id in selected_areas:
-                area = area_reg.async_get_area(area_id)
-                if area is None:
-                    continue
-
-                # Find temp sensors in this area
-                temp_sensors = []
-                occ_sensors = []
-                for entity in er.async_entries_for_area(ent_reg, area_id):
-                    state = self.hass.states.get(entity.entity_id)
-                    if state is None:
+                for area_id in selected_areas:
+                    area = area_reg.async_get_area(area_id)
+                    if area is None:
                         continue
-                    dc = state.attributes.get("device_class", "")
-                    if entity.domain == "sensor" and dc == "temperature":
-                        temp_sensors.append(entity.entity_id)
-                    elif entity.domain == "binary_sensor" and dc in (
-                        "occupancy", "motion", "presence",
-                    ):
-                        occ_sensors.append(entity.entity_id)
 
-                self._zones.append({
-                    "id": area_id,
-                    "name": area.name,
-                    "sensor_entities": temp_sensors,
-                    "occupancy_sensor_entities": occ_sensors,
-                    "area_id": area_id,
-                    "away_temp": None,
-                    "occupancy_override": True,
-                })
+                    temp_sensors = []
+                    occ_sensors = []
+                    for entity in er.async_entries_for_area(ent_reg, area_id):
+                        state = self.hass.states.get(entity.entity_id)
+                        if state is None:
+                            continue
+                        dc = state.attributes.get("device_class", "")
+                        if entity.domain == "sensor" and dc == "temperature":
+                            temp_sensors.append(entity.entity_id)
+                        elif entity.domain == "binary_sensor" and dc in (
+                            "occupancy",
+                            "motion",
+                            "presence",
+                        ):
+                            occ_sensors.append(entity.entity_id)
+
+                    self._zones.append(
+                        {
+                            "id": area_id,
+                            "name": area.name,
+                            "sensor_entities": temp_sensors,
+                            "occupancy_sensor_entities": occ_sensors,
+                            "area_id": area_id,
+                            "away_temp": None,
+                            "occupancy_override": True,
+                        }
+                    )
+            except Exception as err:
+                _LOGGER.error("Error discovering areas: %s", err)
 
             return await self.async_step_features()
 
         # Get available areas
-        area_reg = ar.async_get(self.hass)
-        areas = area_reg.async_list_areas()
-        area_options = [
-            selector.SelectOptionDict(value=a.id, label=a.name)
-            for a in areas
-        ]
+        try:
+            area_reg = ar.async_get(self.hass)
+            areas = area_reg.async_list_areas()
+            area_options = [
+                selector.SelectOptionDict(value=a.id, label=a.name) for a in areas
+            ]
+        except Exception as err:
+            _LOGGER.error("Error loading areas: %s", err)
+            area_options = []
 
         if not area_options:
-            # No areas configured, fall back to manual
             return await self.async_step_add_zone()
 
         schema = vol.Schema(
@@ -196,21 +219,33 @@ class BetterThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         """Manually add a zone."""
-        if user_input is not None:
-            zone_id = str(uuid.uuid4())[:8]
-            self._zones.append({
-                "id": zone_id,
-                "name": user_input["zone_name"],
-                "sensor_entities": user_input.get("temp_sensors", []),
-                "occupancy_sensor_entities": user_input.get("occupancy_sensors", []),
-                "area_id": None,
-                "away_temp": user_input.get("zone_away_temp"),
-                "occupancy_override": user_input.get("zone_occupancy_override", True),
-            })
+        errors = {}
 
-            if user_input.get("add_another", False):
-                return await self.async_step_add_zone()
-            return await self.async_step_features()
+        if user_input is not None:
+            zone_name = user_input.get("zone_name", "").strip()
+            if not zone_name:
+                errors["zone_name"] = "name_required"
+            else:
+                zone_id = str(uuid.uuid4())[:8]
+                self._zones.append(
+                    {
+                        "id": zone_id,
+                        "name": zone_name,
+                        "sensor_entities": user_input.get("temp_sensors", []),
+                        "occupancy_sensor_entities": user_input.get(
+                            "occupancy_sensors", []
+                        ),
+                        "area_id": None,
+                        "away_temp": user_input.get("zone_away_temp"),
+                        "occupancy_override": user_input.get(
+                            "zone_occupancy_override", True
+                        ),
+                    }
+                )
+
+                if user_input.get("add_another", False):
+                    return await self.async_step_add_zone()
+                return await self.async_step_features()
 
         schema = vol.Schema(
             {
@@ -235,19 +270,30 @@ class BetterThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             }
         )
 
-        return self.async_show_form(step_id="add_zone", data_schema=schema)
+        return self.async_show_form(
+            step_id="add_zone", data_schema=schema, errors=errors
+        )
 
     async def async_step_features(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         """Step 3: Feature toggles and settings."""
+        errors = {}
+
         if user_input is not None:
-            self._data.update(user_input)
-            self._data[CONF_ZONES] = self._zones
-            return self.async_create_entry(
-                title=self._data.get(CONF_NAME, DEFAULT_NAME),
-                data=self._data,
-            )
+            # Validate away temp is within configured range
+            away_temp = float(user_input.get(CONF_AWAY_TEMP, DEFAULT_AWAY_TEMP))
+            temp_min = float(self._data.get(CONF_TEMP_MIN, DEFAULT_TEMP_MIN))
+            temp_max = float(self._data.get(CONF_TEMP_MAX, DEFAULT_TEMP_MAX))
+            if not temp_min <= away_temp <= temp_max:
+                errors[CONF_AWAY_TEMP] = "away_temp_out_of_range"
+            else:
+                self._data.update(user_input)
+                self._data[CONF_ZONES] = self._zones
+                return self.async_create_entry(
+                    title=self._data.get(CONF_NAME, DEFAULT_NAME),
+                    data=self._data,
+                )
 
         schema = vol.Schema(
             {
@@ -256,23 +302,55 @@ class BetterThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     CONF_LEARNING_THRESHOLD, default=DEFAULT_LEARNING_THRESHOLD
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
-                        min=2, max=10, step=1, mode=selector.NumberSelectorMode.SLIDER
+                        min=2,
+                        max=10,
+                        step=1,
+                        mode=selector.NumberSelectorMode.SLIDER,
                     )
                 ),
                 vol.Required(CONF_OCCUPANCY_ENABLED, default=True): bool,
-                vol.Required(CONF_AWAY_TEMP, default=DEFAULT_AWAY_TEMP): vol.Coerce(float),
                 vol.Required(
-                    CONF_MANUAL_OVERRIDE_MINUTES, default=DEFAULT_MANUAL_OVERRIDE_MINUTES
+                    CONF_PRESENCE_DETECTION, default=DEFAULT_PRESENCE_MODE
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            selector.SelectOptionDict(
+                                value=PRESENCE_MODE_BOTH,
+                                label="Person entities + Occupancy sensors (Recommended)",
+                            ),
+                            selector.SelectOptionDict(
+                                value=PRESENCE_MODE_PERSON,
+                                label="Person entities only (zone.home)",
+                            ),
+                            selector.SelectOptionDict(
+                                value=PRESENCE_MODE_OCCUPANCY,
+                                label="Occupancy sensors only",
+                            ),
+                        ],
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                vol.Required(
+                    CONF_AWAY_TEMP, default=DEFAULT_AWAY_TEMP
+                ): vol.Coerce(float),
+                vol.Required(
+                    CONF_MANUAL_OVERRIDE_MINUTES,
+                    default=DEFAULT_MANUAL_OVERRIDE_MINUTES,
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
-                        min=15, max=480, step=15, mode=selector.NumberSelectorMode.SLIDER,
+                        min=15,
+                        max=480,
+                        step=15,
+                        mode=selector.NumberSelectorMode.SLIDER,
                         unit_of_measurement="min",
                     )
                 ),
             }
         )
 
-        return self.async_show_form(step_id="features", data_schema=schema)
+        return self.async_show_form(
+            step_id="features", data_schema=schema, errors=errors
+        )
 
     @staticmethod
     @callback
@@ -306,9 +384,15 @@ class BetterThermostatOptionsFlow(config_entries.OptionsFlow):
                 vol.Required("action", default="settings"): selector.SelectSelector(
                     selector.SelectSelectorConfig(
                         options=[
-                            selector.SelectOptionDict(value="settings", label="General Settings"),
-                            selector.SelectOptionDict(value="zones", label="Manage Zones"),
-                            selector.SelectOptionDict(value="schedule", label="Configure Schedule"),
+                            selector.SelectOptionDict(
+                                value="settings", label="General Settings"
+                            ),
+                            selector.SelectOptionDict(
+                                value="zones", label="Manage Zones"
+                            ),
+                            selector.SelectOptionDict(
+                                value="schedule", label="Configure Schedule"
+                            ),
                         ],
                         mode=selector.SelectSelectorMode.LIST,
                     )
@@ -322,67 +406,125 @@ class BetterThermostatOptionsFlow(config_entries.OptionsFlow):
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         """General settings."""
+        errors = {}
+
         if user_input is not None:
-            new_data = {**self._config_entry.data, **user_input}
-            self.hass.config_entries.async_update_entry(
-                self._config_entry, data=new_data
+            # Validate away temp
+            data = self._config_entry.data
+            temp_min = float(data.get(CONF_TEMP_MIN, DEFAULT_TEMP_MIN))
+            temp_max = float(data.get(CONF_TEMP_MAX, DEFAULT_TEMP_MAX))
+            away_temp = float(
+                user_input.get(CONF_AWAY_TEMP, DEFAULT_AWAY_TEMP)
             )
-            return self.async_create_entry(title="", data={})
+            if not temp_min <= away_temp <= temp_max:
+                errors[CONF_AWAY_TEMP] = "away_temp_out_of_range"
+            else:
+                new_data = {**self._config_entry.data, **user_input}
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry, data=new_data
+                )
+                return self.async_create_entry(title="", data={})
 
         data = self._config_entry.data
         schema = vol.Schema(
             {
                 vol.Required(
-                    CONF_LEARNING_ENABLED, default=data.get(CONF_LEARNING_ENABLED, True)
+                    CONF_LEARNING_ENABLED,
+                    default=data.get(CONF_LEARNING_ENABLED, True),
                 ): bool,
                 vol.Required(
                     CONF_LEARNING_THRESHOLD,
-                    default=data.get(CONF_LEARNING_THRESHOLD, DEFAULT_LEARNING_THRESHOLD),
+                    default=data.get(
+                        CONF_LEARNING_THRESHOLD, DEFAULT_LEARNING_THRESHOLD
+                    ),
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(min=2, max=10, step=1)
                 ),
                 vol.Required(
-                    CONF_OCCUPANCY_ENABLED, default=data.get(CONF_OCCUPANCY_ENABLED, True)
+                    CONF_OCCUPANCY_ENABLED,
+                    default=data.get(CONF_OCCUPANCY_ENABLED, True),
                 ): bool,
                 vol.Required(
-                    CONF_AWAY_TEMP, default=data.get(CONF_AWAY_TEMP, DEFAULT_AWAY_TEMP)
+                    CONF_PRESENCE_DETECTION,
+                    default=data.get(CONF_PRESENCE_DETECTION, DEFAULT_PRESENCE_MODE),
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            selector.SelectOptionDict(
+                                value=PRESENCE_MODE_BOTH,
+                                label="Person entities + Occupancy sensors",
+                            ),
+                            selector.SelectOptionDict(
+                                value=PRESENCE_MODE_PERSON,
+                                label="Person entities only",
+                            ),
+                            selector.SelectOptionDict(
+                                value=PRESENCE_MODE_OCCUPANCY,
+                                label="Occupancy sensors only",
+                            ),
+                        ],
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                vol.Required(
+                    CONF_AWAY_TEMP,
+                    default=data.get(CONF_AWAY_TEMP, DEFAULT_AWAY_TEMP),
                 ): vol.Coerce(float),
                 vol.Required(
                     CONF_MANUAL_OVERRIDE_MINUTES,
-                    default=data.get(CONF_MANUAL_OVERRIDE_MINUTES, DEFAULT_MANUAL_OVERRIDE_MINUTES),
+                    default=data.get(
+                        CONF_MANUAL_OVERRIDE_MINUTES,
+                        DEFAULT_MANUAL_OVERRIDE_MINUTES,
+                    ),
                 ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(min=15, max=480, step=15, unit_of_measurement="min")
+                    selector.NumberSelectorConfig(
+                        min=15, max=480, step=15, unit_of_measurement="min"
+                    )
                 ),
             }
         )
 
-        return self.async_show_form(step_id="settings", data_schema=schema)
+        return self.async_show_form(
+            step_id="settings", data_schema=schema, errors=errors
+        )
 
     async def async_step_manage_zones(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         """Add a new zone via options flow."""
+        errors = {}
+
         if user_input is not None:
-            zone_id = str(uuid.uuid4())[:8]
-            zones = list(self._config_entry.data.get(CONF_ZONES, []))
-            zones.append({
-                "id": zone_id,
-                "name": user_input["zone_name"],
-                "sensor_entities": user_input.get("temp_sensors", []),
-                "occupancy_sensor_entities": user_input.get("occupancy_sensors", []),
-                "area_id": None,
-                "away_temp": user_input.get("zone_away_temp"),
-                "occupancy_override": user_input.get("zone_occupancy_override", True),
-            })
+            zone_name = user_input.get("zone_name", "").strip()
+            if not zone_name:
+                errors["zone_name"] = "name_required"
+            else:
+                zone_id = str(uuid.uuid4())[:8]
+                zones = list(self._config_entry.data.get(CONF_ZONES, []))
+                zones.append(
+                    {
+                        "id": zone_id,
+                        "name": zone_name,
+                        "sensor_entities": user_input.get("temp_sensors", []),
+                        "occupancy_sensor_entities": user_input.get(
+                            "occupancy_sensors", []
+                        ),
+                        "area_id": None,
+                        "away_temp": user_input.get("zone_away_temp"),
+                        "occupancy_override": user_input.get(
+                            "zone_occupancy_override", True
+                        ),
+                    }
+                )
 
-            new_data = {**self._config_entry.data, CONF_ZONES: zones}
-            self.hass.config_entries.async_update_entry(
-                self._config_entry, data=new_data
-            )
+                new_data = {**self._config_entry.data, CONF_ZONES: zones}
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry, data=new_data
+                )
 
-            if user_input.get("add_another", False):
-                return await self.async_step_manage_zones()
-            return self.async_create_entry(title="", data={})
+                if user_input.get("add_another", False):
+                    return await self.async_step_manage_zones()
+                return self.async_create_entry(title="", data={})
 
         schema = vol.Schema(
             {
@@ -407,20 +549,20 @@ class BetterThermostatOptionsFlow(config_entries.OptionsFlow):
             }
         )
 
-        return self.async_show_form(step_id="manage_zones", data_schema=schema)
+        return self.async_show_form(
+            step_id="manage_zones", data_schema=schema, errors=errors
+        )
 
     async def async_step_schedule(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
-        """Schedule configuration info - points users to entities/services."""
+        """Schedule configuration info."""
         if user_input is not None:
             return self.async_create_entry(title="", data={})
 
-        # This step just informs the user about schedule configuration
-        schema = vol.Schema({})
         return self.async_show_form(
             step_id="schedule",
-            data_schema=schema,
+            data_schema=vol.Schema({}),
             description_placeholders={
                 "info": "Use the Schedule Mode select entity and the better_thermostat.set_schedule service to configure schedules. Presets can be activated via the climate entity's preset modes."
             },

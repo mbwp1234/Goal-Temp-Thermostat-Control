@@ -4,10 +4,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers import area_registry as ar, entity_registry as er
 
-from .const import DOMAIN
+from .const import DOMAIN, PRESENCE_MODE_BOTH, PRESENCE_MODE_OCCUPANCY, PRESENCE_MODE_PERSON
 from .models import Zone
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,6 +21,7 @@ class ZoneManager:
         self.config_entry_id = config_entry_id
         self.zones: dict[str, Zone] = {}
         self._active_zone_id: str | None = None
+        self.presence_mode: str = PRESENCE_MODE_BOTH
 
     @property
     def active_zone(self) -> Zone | None:
@@ -42,9 +43,12 @@ class ZoneManager:
         if zone_id in self.zones:
             self._active_zone_id = zone_id
             return True
+        _LOGGER.warning("Zone '%s' not found, cannot set as active", zone_id)
         return False
 
     def add_zone(self, zone: Zone) -> None:
+        if zone.id in self.zones:
+            _LOGGER.debug("Overwriting existing zone '%s'", zone.id)
         self.zones[zone.id] = zone
         if self._active_zone_id is None:
             self._active_zone_id = zone.id
@@ -65,35 +69,41 @@ class ZoneManager:
     def get_all_zone_names(self) -> dict[str, str]:
         return {z.id: z.name for z in self.zones.values()}
 
-    async def discover_areas(self) -> list[dict[str, str]]:
+    async def discover_areas(self) -> list[dict[str, Any]]:
         """Discover Home Assistant areas that could be zones."""
-        area_reg = ar.async_get(self.hass)
-        ent_reg = er.async_get(self.hass)
+        try:
+            area_reg = ar.async_get(self.hass)
+            ent_reg = er.async_get(self.hass)
+        except Exception as err:
+            _LOGGER.error("Failed to access registries for area discovery: %s", err)
+            return []
 
         discovered = []
         for area in area_reg.async_list_areas():
-            # Find temperature sensors in this area
             temp_sensors = []
             occupancy_sensors = []
-            for entity in er.async_entries_for_area(ent_reg, area.id):
-                state = self.hass.states.get(entity.entity_id)
-                if state is None:
-                    continue
-                device_class = state.attributes.get("device_class", "")
-                if entity.domain == "sensor" and device_class == "temperature":
-                    temp_sensors.append(entity.entity_id)
-                elif entity.domain == "binary_sensor" and device_class in (
-                    "occupancy",
-                    "motion",
-                    "presence",
-                ):
-                    occupancy_sensors.append(entity.entity_id)
+            try:
+                for entity in er.async_entries_for_area(ent_reg, area.id):
+                    state = self.hass.states.get(entity.entity_id)
+                    if state is None:
+                        continue
+                    device_class = state.attributes.get("device_class", "")
+                    if entity.domain == "sensor" and device_class == "temperature":
+                        temp_sensors.append(entity.entity_id)
+                    elif entity.domain == "binary_sensor" and device_class in (
+                        "occupancy",
+                        "motion",
+                        "presence",
+                    ):
+                        occupancy_sensors.append(entity.entity_id)
+            except Exception as err:
+                _LOGGER.warning("Error scanning area '%s': %s", area.name, err)
 
             discovered.append(
                 {
                     "area_id": area.id,
                     "name": area.name,
-                    "floor_id": area.floor_id,
+                    "floor_id": getattr(area, "floor_id", None),
                     "temp_sensors": temp_sensors,
                     "occupancy_sensors": occupancy_sensors,
                 }
@@ -109,12 +119,12 @@ class ZoneManager:
 
         temps = []
         for entity_id in zone.sensor_entities:
-            state = self.hass.states.get(entity_id)
-            if state and state.state not in ("unknown", "unavailable"):
-                try:
+            try:
+                state = self.hass.states.get(entity_id)
+                if state and state.state not in ("unknown", "unavailable"):
                     temps.append(float(state.state))
-                except (ValueError, TypeError):
-                    _LOGGER.debug("Could not parse temp from %s", entity_id)
+            except (ValueError, TypeError):
+                _LOGGER.debug("Could not parse temp from %s", entity_id)
 
         if not temps:
             zone.current_temp = None
@@ -125,57 +135,96 @@ class ZoneManager:
         return avg_temp
 
     def update_zone_occupancy(self, zone_id: str) -> bool | None:
-        """Check occupancy status for a zone."""
+        """Check occupancy status for a zone from its binary sensors."""
         zone = self.zones.get(zone_id)
         if not zone or not zone.occupancy_sensor_entities:
             zone.is_occupied = None
             return None
 
         for entity_id in zone.occupancy_sensor_entities:
-            state = self.hass.states.get(entity_id)
-            if state and state.state == "on":
-                zone.is_occupied = True
-                return True
+            try:
+                state = self.hass.states.get(entity_id)
+                if state and state.state == "on":
+                    zone.is_occupied = True
+                    return True
+            except Exception as err:
+                _LOGGER.debug("Error reading occupancy sensor %s: %s", entity_id, err)
 
         zone.is_occupied = False
         return False
 
     def update_all_zones(self) -> None:
         """Update temperatures and occupancy for all zones."""
-        for zone_id in self.zones:
-            self.update_zone_temperature(zone_id)
-            self.update_zone_occupancy(zone_id)
+        for zone_id in list(self.zones.keys()):
+            try:
+                self.update_zone_temperature(zone_id)
+                self.update_zone_occupancy(zone_id)
+            except Exception as err:
+                _LOGGER.warning("Error updating zone '%s': %s", zone_id, err)
 
     def is_anyone_home(self) -> bool:
+        """Check if anyone is home using configured presence detection method.
+
+        Uses HA person entities (zone.home detection), occupancy sensors, or both.
+        """
+        occupancy_detected = self._check_occupancy_sensors()
+        person_home = self._check_person_entities()
+
+        if self.presence_mode == PRESENCE_MODE_OCCUPANCY:
+            # Only use occupancy sensors; if none configured, assume home
+            if not self._has_any_occupancy_sensors():
+                return True
+            return occupancy_detected
+
+        if self.presence_mode == PRESENCE_MODE_PERSON:
+            return person_home
+
+        # BOTH mode: either method can confirm presence
+        if not self._has_any_occupancy_sensors():
+            # No occupancy sensors, rely on person entities
+            return person_home
+        return occupancy_detected or person_home
+
+    def _check_occupancy_sensors(self) -> bool:
         """Check if any zone has occupancy detected."""
         for zone in self.zones.values():
             if zone.occupancy_sensor_entities and zone.is_occupied:
                 return True
-        # If no occupancy sensors configured at all, assume home
-        has_any_occupancy = any(
-            z.occupancy_sensor_entities for z in self.zones.values()
-        )
-        return not has_any_occupancy
+        return False
+
+    def _has_any_occupancy_sensors(self) -> bool:
+        return any(z.occupancy_sensor_entities for z in self.zones.values())
+
+    def _check_person_entities(self) -> bool:
+        """Check if any person entity is 'home' (using HA's built-in zone.home)."""
+        try:
+            person_states = self.hass.states.async_all("person")
+            for person in person_states:
+                if person.state == "home":
+                    return True
+            # If no person entities exist, assume home
+            if not person_states:
+                return True
+            return False
+        except Exception as err:
+            _LOGGER.debug("Error checking person entities: %s", err)
+            return True  # Fail-safe: assume home
 
     def get_zone_temperatures(self) -> dict[str, float | None]:
-        """Get current temperatures for all zones."""
-        return {
-            zone.name: zone.current_temp for zone in self.zones.values()
-        }
+        return {zone.name: zone.current_temp for zone in self.zones.values()}
 
     def get_zone_occupancy(self) -> dict[str, bool | None]:
-        """Get occupancy status for all zones."""
-        return {
-            zone.name: zone.is_occupied for zone in self.zones.values()
-        }
+        return {zone.name: zone.is_occupied for zone in self.zones.values()}
 
     def load_zones(self, zone_data: list[dict[str, Any]]) -> None:
         """Load zones from stored config."""
         self.zones.clear()
         for data in zone_data:
-            zone = Zone.from_dict(data)
-            self.zones[zone.id] = zone
+            try:
+                zone = Zone.from_dict(data)
+                self.zones[zone.id] = zone
+            except Exception as err:
+                _LOGGER.warning("Skipping invalid zone data %s: %s", data, err)
 
     def save_zones(self) -> list[dict[str, Any]]:
-        """Serialize zones for storage."""
         return [zone.to_dict() for zone in self.zones.values()]

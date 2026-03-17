@@ -8,7 +8,7 @@ A smart, zone-aware thermostat integration for Home Assistant (HACS). Control yo
 - **Auto-Discovery** — Automatically finds temperature and occupancy sensors from your Home Assistant areas, or add zones manually
 - **Smart Scheduling** — Weekday/weekend schedules, per-day schedules, and built-in presets (Home, Away, Work From Home, Sleep)
 - **Pattern Learning** — Automatically detects when you make similar temperature adjustments at similar times and creates schedule entries for you (configurable threshold, default: 3 similar events)
-- **Occupancy Awareness** — Uses motion/occupancy/presence sensors to drop to away temperature when nobody is home, with per-room configuration
+- **Presence Detection** — Uses HA's built-in `person` entities (zone.home) and/or room occupancy sensors to detect if anyone is home. Three modes: Person entities only, Occupancy sensors only, or Both (recommended). Drops to away temperature when nobody is home, with per-room overrides
 - **Manual Override** — Any manual temperature change takes priority for a configurable period (default: 2 hours), then resumes automation
 - **Mirror HVAC Modes** — Exposes the same heat/cool/auto modes as your real thermostat, including heat pump and aux heat support
 - **Full Zone Control** — Select entity to pick the active target zone, plus per-zone temperature sensors
@@ -35,7 +35,7 @@ A smart, zone-aware thermostat integration for Home Assistant (HACS). Control yo
 3. Follow the setup wizard:
    - **Step 1**: Name your thermostat, select your real thermostat entity, choose temperature units and range
    - **Step 2**: Configure zones — auto-discover from HA areas or add manually with temperature/occupancy sensors
-   - **Step 3**: Enable/disable features — learning, occupancy, set away temp and override duration
+   - **Step 3**: Enable/disable features — learning, occupancy, presence detection method, away temp, override duration
 
 ## Entities Created
 
@@ -104,10 +104,16 @@ service: better_thermostat.clear_learned_schedule
 
 ### Priority System
 Temperature decisions follow this priority (highest first):
-1. **Manual Override** — Any temp change you make holds for the override duration
-2. **Occupancy** — If enabled and nobody is detected, drops to away temperature
+1. **Manual Override** — Any temp change you make holds for the override duration (default 2hr, configurable 15-480 min)
+2. **Presence/Occupancy** — If enabled and nobody is detected home, drops to away temperature. Uses HA `person` entities, room occupancy sensors, or both
 3. **Schedule** — Follows the active schedule/preset
 4. **Last Setting** — Maintains the last known target temperature
+
+### Presence Detection
+Three modes for detecting if anyone is home:
+- **Person entities + Occupancy sensors** (recommended) — Checks both HA's built-in `person.xxx` entities (which use `zone.home`) AND room-level occupancy/motion sensors. Either method confirming presence = someone is home
+- **Person entities only** — Only uses HA person tracking (phone GPS, router, etc.)
+- **Occupancy sensors only** — Only uses motion/occupancy/presence binary sensors assigned to zones
 
 ### Learning Engine
 The learning engine watches for manual temperature adjustments. When you make similar changes (within 2°F and 30 minutes) at similar times of day on 3+ occasions, it automatically creates a schedule entry for that pattern. You'll see learned patterns in the `sensor.better_thermostat_learned_patterns` entity.

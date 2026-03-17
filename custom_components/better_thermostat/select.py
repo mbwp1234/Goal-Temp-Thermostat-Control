@@ -1,6 +1,8 @@
 """Select entities for Better Thermostat."""
 from __future__ import annotations
 
+import logging
+
 from homeassistant.components.select import SelectEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -11,11 +13,14 @@ from .const import (
     CONF_NAME,
     DEFAULT_NAME,
     DOMAIN,
-    PRESETS,
     SCHEDULE_MODE_PER_DAY,
     SCHEDULE_MODE_WEEKDAY_WEEKEND,
 )
 from .coordinator import BetterThermostatCoordinator
+
+_LOGGER = logging.getLogger(__name__)
+
+_NO_ZONES = "No zones configured"
 
 
 async def async_setup_entry(
@@ -23,7 +28,6 @@ async def async_setup_entry(
     config_entry: ConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    """Set up Better Thermostat select entities."""
     coordinator: BetterThermostatCoordinator = hass.data[DOMAIN][config_entry.entry_id]
     name = config_entry.data.get(CONF_NAME, DEFAULT_NAME)
 
@@ -47,7 +51,7 @@ class ActiveZoneSelect(CoordinatorEntity, SelectEntity):
     @property
     def options(self) -> list[str]:
         zones = self.coordinator.zone_manager.get_all_zone_names()
-        return list(zones.values()) if zones else ["No zones configured"]
+        return list(zones.values()) if zones else [_NO_ZONES]
 
     @property
     def current_option(self) -> str | None:
@@ -55,12 +59,13 @@ class ActiveZoneSelect(CoordinatorEntity, SelectEntity):
         return zone.name if zone else None
 
     async def async_select_option(self, option: str) -> None:
-        """Change the active zone."""
-        # Find zone_id by name
+        if option == _NO_ZONES:
+            return
         for zone_id, zone_name in self.coordinator.zone_manager.get_all_zone_names().items():
             if zone_name == option:
                 await self.coordinator.async_set_active_zone(zone_id)
                 return
+        _LOGGER.warning("Zone not found for option: %s", option)
 
 
 class ScheduleModeSelect(CoordinatorEntity, SelectEntity):
@@ -90,3 +95,4 @@ class ScheduleModeSelect(CoordinatorEntity, SelectEntity):
             self.coordinator.scheduler.set_schedule_mode(SCHEDULE_MODE_PER_DAY)
         else:
             self.coordinator.scheduler.set_schedule_mode(SCHEDULE_MODE_WEEKDAY_WEEKEND)
+        await self.coordinator.async_save()

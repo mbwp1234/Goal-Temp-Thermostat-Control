@@ -33,7 +33,7 @@
           "zone_name": "Zone Name",
           "temp_sensors": "Temperature Sensors",
           "occupancy_sensors": "Occupancy Sensors",
-          "zone_away_temp": "Away Temperature (optional)",
+          "zone_away_temp": "Away Temperature (optional, overrides global)",
           "zone_occupancy_override": "Occupancy affects this zone",
           "add_another": "Add another zone"
         }
@@ -45,13 +45,21 @@
           "learning_enabled": "Enable Learning (auto-create schedule from patterns)",
           "learning_threshold": "Learning Threshold (adjustments before pattern)",
           "occupancy_enabled": "Enable Occupancy-based Control",
+          "presence_detection": "Presence Detection Method",
           "away_temp": "Away Temperature",
           "manual_override_minutes": "Manual Override Duration"
         }
       }
     },
     "error": {
-      "thermostat_not_found": "Thermostat entity not found"
+      "thermostat_not_found": "Thermostat entity not found",
+      "thermostat_unavailable": "Thermostat is currently unavailable",
+      "invalid_temp_range": "Minimum temperature must be less than maximum",
+      "away_temp_out_of_range": "Away temperature must be within min/max range",
+      "name_required": "Zone name is required"
+    },
+    "abort": {
+      "already_configured": "This thermostat is already configured"
     }
   },
   "options": {
@@ -69,6 +77,7 @@
           "learning_enabled": "Enable Learning",
           "learning_threshold": "Learning Threshold",
           "occupancy_enabled": "Enable Occupancy Control",
+          "presence_detection": "Presence Detection Method",
           "away_temp": "Away Temperature",
           "manual_override_minutes": "Manual Override Duration (minutes)"
         }
@@ -89,6 +98,10 @@
         "title": "Schedule Configuration",
         "description": "Use the Schedule Mode select entity and the better_thermostat.set_schedule service to configure schedules. Presets can be activated via the climate entity's preset modes."
       }
+    },
+    "error": {
+      "away_temp_out_of_range": "Away temperature must be within min/max range",
+      "name_required": "Zone name is required"
     }
   }
 }

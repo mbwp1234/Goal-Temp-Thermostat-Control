@@ -12,7 +12,7 @@ from homeassistant.components.climate import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -24,6 +24,7 @@ from .const import (
     ATTR_OCCUPANCY_STATUS,
     ATTR_OVERRIDE_ACTIVE,
     ATTR_OVERRIDE_REMAINING,
+    ATTR_PRESENCE_HOME,
     ATTR_SCHEDULE_ACTIVE,
     ATTR_ZONE_TEMPS,
     CONF_NAME,
@@ -31,15 +32,14 @@ from .const import (
     DEFAULT_NAME,
     DEFAULT_TEMP_UNIT,
     DOMAIN,
-    PRESET_AWAY,
-    PRESET_HOME,
-    PRESET_SLEEP,
-    PRESET_WORK_FROM_HOME,
+    PRESET_LABEL_TO_KEY,
     PRESETS,
 )
 from .coordinator import BetterThermostatCoordinator
 
 _LOGGER = logging.getLogger(__name__)
+
+PRESET_NONE = "None"
 
 
 async def async_setup_entry(
@@ -52,13 +52,16 @@ async def async_setup_entry(
     name = config_entry.data.get(CONF_NAME, DEFAULT_NAME)
     temp_unit = config_entry.data.get(CONF_TEMP_UNIT, DEFAULT_TEMP_UNIT)
 
-    async_add_entities([BetterThermostatClimate(coordinator, config_entry, name, temp_unit)])
+    async_add_entities(
+        [BetterThermostatClimate(coordinator, config_entry, name, temp_unit)]
+    )
 
 
 class BetterThermostatClimate(CoordinatorEntity, ClimateEntity):
     """Virtual climate entity that controls the real thermostat via zone-aware scheduling."""
 
     _attr_has_entity_name = True
+    _attr_target_temperature_step = 1.0
     _enable_turn_on_off_backwards_compat = False
 
     def __init__(
@@ -73,8 +76,12 @@ class BetterThermostatClimate(CoordinatorEntity, ClimateEntity):
         self._attr_name = name
         self._attr_unique_id = f"{DOMAIN}_{config_entry.entry_id}_climate"
         self._temp_unit = temp_unit
+        self._attr_preset_modes = list(PRESETS.values()) + [PRESET_NONE]
 
-        self._attr_preset_modes = list(PRESETS.values()) + ["None"]
+    @property
+    def available(self) -> bool:
+        """Entity is available when the real thermostat is reachable."""
+        return self.coordinator.available
 
     @property
     def temperature_unit(self) -> str:
@@ -84,13 +91,12 @@ class BetterThermostatClimate(CoordinatorEntity, ClimateEntity):
 
     @property
     def supported_features(self) -> ClimateEntityFeature:
-        features = (
+        return (
             ClimateEntityFeature.TARGET_TEMPERATURE
             | ClimateEntityFeature.PRESET_MODE
             | ClimateEntityFeature.TURN_ON
             | ClimateEntityFeature.TURN_OFF
         )
-        return features
 
     @property
     def hvac_modes(self) -> list[HVACMode]:
@@ -121,15 +127,11 @@ class BetterThermostatClimate(CoordinatorEntity, ClimateEntity):
         return self.coordinator.get_thermostat_max_temp()
 
     @property
-    def target_temperature_step(self) -> float:
-        return 1.0
-
-    @property
     def preset_mode(self) -> str | None:
         active = self.coordinator.scheduler.schedule.active_preset
         if active and active in PRESETS:
             return PRESETS[active]
-        return "None"
+        return PRESET_NONE
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -137,9 +139,11 @@ class BetterThermostatClimate(CoordinatorEntity, ClimateEntity):
         return {
             ATTR_ACTIVE_ZONE: data.get("active_zone"),
             ATTR_ZONE_TEMPS: data.get("zone_temps", {}),
-            ATTR_SCHEDULE_ACTIVE: data.get("schedule_entry") is not None,
+            ATTR_SCHEDULE_ACTIVE: data.get("schedule_enabled", False)
+            and data.get("schedule_entry") is not None,
             ATTR_CURRENT_SCHEDULE_ENTRY: data.get("schedule_entry"),
             ATTR_OCCUPANCY_STATUS: data.get("zone_occupancy", {}),
+            ATTR_PRESENCE_HOME: data.get("presence_home", True),
             ATTR_LEARNING_STATUS: data.get("learning_status", {}),
             ATTR_OVERRIDE_ACTIVE: data.get("override_active", False),
             ATTR_OVERRIDE_REMAINING: data.get("override_remaining", 0),
@@ -147,36 +151,29 @@ class BetterThermostatClimate(CoordinatorEntity, ClimateEntity):
         }
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
-        """Handle temperature set from UI."""
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is not None:
-            await self.coordinator.async_set_temperature(temp)
+            await self.coordinator.async_set_temperature(float(temp))
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
-        """Set HVAC mode on the real thermostat."""
         await self.coordinator.async_set_hvac_mode(hvac_mode)
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        """Activate a schedule preset."""
-        if preset_mode == "None":
+        if preset_mode == PRESET_NONE:
             self.coordinator.scheduler.deactivate_preset()
         else:
-            # Reverse lookup: label -> key
-            for key, label in PRESETS.items():
-                if label == preset_mode:
-                    self.coordinator.scheduler.activate_preset(key)
-                    break
+            key = PRESET_LABEL_TO_KEY.get(preset_mode)
+            if key:
+                self.coordinator.scheduler.activate_preset(key)
+            else:
+                _LOGGER.warning("Unknown preset mode: %s", preset_mode)
 
     async def async_turn_on(self) -> None:
-        """Turn on the thermostat (set to heat or auto)."""
         modes = self.hvac_modes
-        if HVACMode.AUTO in modes:
-            await self.async_set_hvac_mode(HVACMode.AUTO)
-        elif HVACMode.HEAT_COOL in modes:
-            await self.async_set_hvac_mode(HVACMode.HEAT_COOL)
-        elif HVACMode.HEAT in modes:
-            await self.async_set_hvac_mode(HVACMode.HEAT)
+        for preferred in (HVACMode.AUTO, HVACMode.HEAT_COOL, HVACMode.HEAT):
+            if preferred in modes:
+                await self.async_set_hvac_mode(preferred)
+                return
 
     async def async_turn_off(self) -> None:
-        """Turn off the thermostat."""
         await self.async_set_hvac_mode(HVACMode.OFF)

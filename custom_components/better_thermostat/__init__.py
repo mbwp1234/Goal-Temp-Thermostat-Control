@@ -35,8 +35,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Load zones from config
     zones_data = entry.data.get(CONF_ZONES, [])
     for zone_data in zones_data:
-        zone = Zone.from_dict(zone_data)
-        coordinator.zone_manager.add_zone(zone)
+        try:
+            zone = Zone.from_dict(zone_data)
+            coordinator.zone_manager.add_zone(zone)
+        except Exception as err:
+            _LOGGER.warning("Skipping invalid zone config: %s", err)
 
     # Initialize (loads stored state)
     await coordinator.async_initialize()
@@ -49,8 +52,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     # Set up platforms
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Register services
-    await _async_register_services(hass)
+    # Register services (idempotent)
+    _register_services(hass)
 
     # Listen for options updates
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -62,7 +65,18 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
     if unload_ok:
-        hass.data[DOMAIN].pop(entry.entry_id)
+        hass.data[DOMAIN].pop(entry.entry_id, None)
+
+    # Unregister services if no more entries
+    if not hass.data.get(DOMAIN):
+        for service in (
+            SERVICE_SET_ZONE_TEMP,
+            SERVICE_SET_SCHEDULE,
+            SERVICE_CLEAR_LEARNED,
+            SERVICE_SET_PRESET,
+        ):
+            hass.services.async_remove(DOMAIN, service)
+
     return unload_ok
 
 
@@ -73,67 +87,81 @@ async def _async_update_listener(
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-async def _async_register_services(hass: HomeAssistant) -> None:
-    """Register custom services."""
+def _get_coordinator(
+    hass: HomeAssistant, entry_id: str | None = None
+) -> BetterThermostatCoordinator | None:
+    """Safely get a coordinator instance."""
+    entries = hass.data.get(DOMAIN, {})
+    if not entries:
+        return None
+
+    if entry_id:
+        coordinator = entries.get(entry_id)
+        if isinstance(coordinator, BetterThermostatCoordinator):
+            return coordinator
+        return None
+
+    # Return the first coordinator found
+    for coordinator in entries.values():
+        if isinstance(coordinator, BetterThermostatCoordinator):
+            return coordinator
+    return None
+
+
+def _register_services(hass: HomeAssistant) -> None:
+    """Register custom services (idempotent)."""
     if hass.services.has_service(DOMAIN, SERVICE_SET_ZONE_TEMP):
-        return  # Already registered
+        return
 
     async def handle_set_zone_temp(call: ServiceCall) -> None:
-        """Set target temperature for a specific zone."""
         zone_id = call.data["zone_id"]
         temperature = call.data[ATTR_TEMPERATURE]
-        entry_id = call.data.get("entry_id")
-
-        for eid, coordinator in hass.data[DOMAIN].items():
-            if entry_id and eid != entry_id:
-                continue
-            if isinstance(coordinator, BetterThermostatCoordinator):
-                zone = coordinator.zone_manager.get_zone(zone_id)
-                if zone:
-                    await coordinator.async_set_active_zone(zone_id)
-                    await coordinator.async_set_temperature(temperature)
-                    return
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No Better Thermostat instance found")
+            return
+        zone = coordinator.zone_manager.get_zone(zone_id)
+        if zone is None:
+            _LOGGER.error("Zone '%s' not found", zone_id)
+            return
+        await coordinator.async_set_active_zone(zone_id)
+        await coordinator.async_set_temperature(temperature)
 
     async def handle_set_schedule(call: ServiceCall) -> None:
-        """Set schedule entries for a day."""
         day = call.data["day"]
         entries = call.data["entries"]
-        entry_id = call.data.get("entry_id")
-
-        for eid, coordinator in hass.data[DOMAIN].items():
-            if entry_id and eid != entry_id:
-                continue
-            if isinstance(coordinator, BetterThermostatCoordinator):
-                if day == "weekday":
-                    coordinator.scheduler.set_weekday_schedule(entries)
-                elif day == "weekend":
-                    coordinator.scheduler.set_weekend_schedule(entries)
-                else:
-                    coordinator.scheduler.set_day_schedule(day, entries)
-                return
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No Better Thermostat instance found")
+            return
+        if not entries:
+            _LOGGER.warning("Empty schedule entries for day '%s'", day)
+            return
+        if day == "weekday":
+            coordinator.scheduler.set_weekday_schedule(entries)
+        elif day == "weekend":
+            coordinator.scheduler.set_weekend_schedule(entries)
+        else:
+            coordinator.scheduler.set_day_schedule(day, entries)
+        await coordinator.async_save()
 
     async def handle_clear_learned(call: ServiceCall) -> None:
-        """Clear learned schedule patterns."""
-        entry_id = call.data.get("entry_id")
-
-        for eid, coordinator in hass.data[DOMAIN].items():
-            if entry_id and eid != entry_id:
-                continue
-            if isinstance(coordinator, BetterThermostatCoordinator):
-                coordinator.learning.clear_learned()
-                return
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No Better Thermostat instance found")
+            return
+        coordinator.learning.clear_learned()
+        await coordinator.async_save()
 
     async def handle_set_preset(call: ServiceCall) -> None:
-        """Activate a schedule preset."""
         preset = call.data["preset"]
-        entry_id = call.data.get("entry_id")
-
-        for eid, coordinator in hass.data[DOMAIN].items():
-            if entry_id and eid != entry_id:
-                continue
-            if isinstance(coordinator, BetterThermostatCoordinator):
-                coordinator.scheduler.activate_preset(preset)
-                return
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No Better Thermostat instance found")
+            return
+        if not coordinator.scheduler.activate_preset(preset):
+            _LOGGER.error("Unknown preset '%s'", preset)
+        await coordinator.async_save()
 
     hass.services.async_register(
         DOMAIN,
