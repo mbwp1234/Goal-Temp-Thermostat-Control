@@ -44,6 +44,7 @@ _LOGGER = logging.getLogger(__name__)
 
 UPDATE_INTERVAL = timedelta(seconds=30)
 TEMP_HYSTERESIS = 0.5  # Minimum change (degrees) before updating thermostat
+MAX_COMPENSATION = 8.0  # Maximum degrees the setpoint can be boosted/lowered to reach goal
 
 
 class GTTCCoordinator(DataUpdateCoordinator):
@@ -100,6 +101,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self.hvac_mode: HVACMode | None = None
         self.hvac_action: HVACAction | None = None
         self._last_thermostat_temp: float | None = None
+        self._compensated_setpoint: float | None = None
+        self._compensation_offset: float = 0.0
         self._initialized = False
         self._available = False
 
@@ -198,30 +201,51 @@ class GTTCCoordinator(DataUpdateCoordinator):
             # Read real thermostat state
             self._read_thermostat_state()
 
-            # Get current temp from active zone
+            # Get current temp from active zone (this is what the user cares about)
             active_zone = self.zone_manager.active_zone
-            if active_zone and active_zone.current_temp is not None:
-                self.current_temp = active_zone.current_temp
+            zone_temp = active_zone.current_temp if active_zone else None
+            thermostat_temp = self._get_thermostat_current_temp()
+
+            if zone_temp is not None:
+                self.current_temp = zone_temp
             else:
-                self.current_temp = self._get_thermostat_current_temp()
+                self.current_temp = thermostat_temp
 
             # Clear expired override
             if self.manual_override and self.manual_override.is_expired:
                 _LOGGER.debug("Manual override expired, resuming automation")
                 self.manual_override = None
 
-            # Determine target temperature
-            desired_temp = self._calculate_desired_temp()
+            # Determine the goal temperature (what the user wants the zone to be)
+            goal_temp = self._calculate_desired_temp()
 
-            # Apply to thermostat if changed beyond hysteresis threshold
-            if desired_temp is not None:
+            # Calculate compensated setpoint for the physical thermostat.
+            # The thermostat has its own sensor that may read differently from
+            # the zone sensor. We offset the setpoint so the thermostat keeps
+            # heating/cooling until the ZONE reaches the goal.
+            compensated = self._calculate_compensated_setpoint(
+                goal_temp, zone_temp, thermostat_temp
+            )
+
+            # Apply compensated setpoint to thermostat if changed
+            if compensated is not None:
                 if self._last_thermostat_temp is None or abs(
-                    desired_temp - self._last_thermostat_temp
+                    compensated - self._last_thermostat_temp
                 ) >= TEMP_HYSTERESIS:
-                    await self._set_thermostat_temp(desired_temp)
-                    self._last_thermostat_temp = desired_temp
+                    _LOGGER.debug(
+                        "Goal: %.1f, Zone: %s, Thermostat: %s, Offset: %+.1f, "
+                        "Sending setpoint: %.1f",
+                        goal_temp,
+                        f"{zone_temp:.1f}" if zone_temp else "N/A",
+                        f"{thermostat_temp:.1f}" if thermostat_temp else "N/A",
+                        self._compensation_offset,
+                        compensated,
+                    )
+                    await self._set_thermostat_temp(compensated)
+                    self._last_thermostat_temp = compensated
 
-            self.target_temp = desired_temp
+            self.target_temp = goal_temp
+            self._compensated_setpoint = compensated
 
             # Save state periodically
             await self.async_save()
@@ -261,6 +285,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 "events_recorded": len(self.learning.events),
                 "patterns_learned": len(self.learning.learned_entries),
             },
+            "compensated_setpoint": self._compensated_setpoint,
+            "compensation_offset": self._compensation_offset,
+            "thermostat_current_temp": self._get_thermostat_current_temp(),
         }
 
     def _read_thermostat_state(self) -> None:
@@ -337,6 +364,43 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 pass
         return self.temp_max
 
+    def _calculate_compensated_setpoint(
+        self,
+        goal_temp: float,
+        zone_temp: float | None,
+        thermostat_temp: float | None,
+    ) -> float:
+        """Calculate the setpoint to send to the physical thermostat.
+
+        If the zone sensor reads lower than the thermostat sensor, the
+        thermostat will stop heating before the zone reaches the goal.
+        We compensate by raising (or lowering for cooling) the setpoint
+        by the difference between the two sensors.
+
+        Example: goal=71, zone=68, thermostat=71
+          offset = 71 - 68 = +3  (thermostat runs 3° hotter than zone)
+          compensated = 71 + 3 = 74  (tell thermostat to aim for 74)
+          thermostat keeps heating until zone reaches ~71
+        """
+        if zone_temp is None or thermostat_temp is None:
+            # No zone sensor data - send goal directly (no compensation)
+            self._compensation_offset = 0.0
+            return goal_temp
+
+        # How much hotter/cooler is the thermostat location vs the zone?
+        sensor_offset = thermostat_temp - zone_temp
+
+        # Clamp the offset to prevent runaway heating/cooling
+        clamped_offset = max(-MAX_COMPENSATION, min(MAX_COMPENSATION, sensor_offset))
+        self._compensation_offset = round(clamped_offset, 1)
+
+        compensated = goal_temp + clamped_offset
+
+        # Clamp to thermostat's valid range
+        compensated = max(self.temp_min, min(self.temp_max, compensated))
+
+        return round(compensated, 1)
+
     def _calculate_desired_temp(self) -> float:
         """Determine target temp: manual > occupancy > schedule > last setting > comfort default."""
         # 1. Manual override (highest priority)
@@ -412,9 +476,19 @@ class GTTCCoordinator(DataUpdateCoordinator):
             except Exception as err:
                 _LOGGER.warning("Error in learning engine: %s", err)
 
-        # Apply immediately
-        await self._set_thermostat_temp(temperature)
-        self._last_thermostat_temp = temperature
+        # Apply immediately with compensation
+        zone_temp = (
+            self.zone_manager.active_zone.current_temp
+            if self.zone_manager.active_zone
+            else None
+        )
+        thermostat_temp = self._get_thermostat_current_temp()
+        compensated = self._calculate_compensated_setpoint(
+            temperature, zone_temp, thermostat_temp
+        )
+        self._compensated_setpoint = compensated
+        await self._set_thermostat_temp(compensated)
+        self._last_thermostat_temp = compensated
         await self.async_save()
 
         self.async_set_updated_data(self._build_state_dict())

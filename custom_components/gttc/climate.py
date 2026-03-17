@@ -19,6 +19,8 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from .const import (
     ATTR_ACTIVE_ZONE,
     ATTR_ALL_ZONES,
+    ATTR_COMPENSATED_SETPOINT,
+    ATTR_COMPENSATION_OFFSET,
     ATTR_CURRENT_SCHEDULE_ENTRY,
     ATTR_LEARNING_STATUS,
     ATTR_OCCUPANCY_STATUS,
@@ -26,6 +28,7 @@ from .const import (
     ATTR_OVERRIDE_REMAINING,
     ATTR_PRESENCE_HOME,
     ATTR_SCHEDULE_ACTIVE,
+    ATTR_THERMOSTAT_TEMP,
     ATTR_ZONE_DETAILS,
     ATTR_ZONE_TEMPS,
     CONF_NAME,
@@ -150,6 +153,9 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
             ATTR_OVERRIDE_REMAINING: data.get("override_remaining", 0),
             ATTR_ALL_ZONES: self.coordinator.zone_manager.get_all_zone_names(),
             ATTR_ZONE_DETAILS: self.coordinator.zone_manager.get_zone_details(),
+            ATTR_COMPENSATED_SETPOINT: data.get("compensated_setpoint"),
+            ATTR_COMPENSATION_OFFSET: data.get("compensation_offset", 0),
+            ATTR_THERMOSTAT_TEMP: data.get("thermostat_current_temp"),
         }
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
