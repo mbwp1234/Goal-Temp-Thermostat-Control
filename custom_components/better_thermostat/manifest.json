@@ -1,0 +1,13 @@
+{
+  "domain": "better_thermostat",
+  "name": "Better Thermostat",
+  "codeowners": ["@mbwp1234"],
+  "config_flow": true,
+  "dependencies": [],
+  "documentation": "https://github.com/mbwp1234/BetterThermostat",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/mbwp1234/BetterThermostat/issues",
+  "requirements": [],
+  "version": "1.0.0",
+  "integration_type": "device"
+}
