@@ -31,6 +31,7 @@
         "description": "Manually add a floor or room zone.",
         "data": {
           "zone_name": "Zone Name",
+          "floor_id": "Floor (optional, e.g. upstairs, downstairs, main)",
           "temp_sensors": "Temperature Sensors",
           "occupancy_sensors": "Occupancy Sensors",
           "zone_away_temp": "Away Temperature (optional, overrides global)",
@@ -83,15 +84,50 @@
         }
       },
       "manage_zones": {
+        "title": "Manage Zones",
+        "description": "Current zones: {zones}",
+        "data": {
+          "zone_action": "What would you like to do?"
+        }
+      },
+      "add_zone": {
         "title": "Add Zone",
         "description": "Add a new floor or room zone.",
         "data": {
           "zone_name": "Zone Name",
+          "floor_id": "Floor (optional, e.g. upstairs, downstairs, main)",
           "temp_sensors": "Temperature Sensors",
           "occupancy_sensors": "Occupancy Sensors",
           "zone_away_temp": "Away Temperature (optional)",
           "zone_occupancy_override": "Occupancy affects this zone",
           "add_another": "Add another zone"
+        }
+      },
+      "select_zone_to_edit": {
+        "title": "Select Zone to Edit",
+        "description": "Choose a zone to edit its name, sensors, or settings.",
+        "data": {
+          "zone_id": "Zone"
+        }
+      },
+      "edit_zone": {
+        "title": "Edit Zone: {zone_name}",
+        "description": "Update zone settings and reassign sensors.",
+        "data": {
+          "zone_name": "Zone Name",
+          "floor_id": "Floor (optional)",
+          "temp_sensors": "Temperature Sensors",
+          "occupancy_sensors": "Occupancy Sensors",
+          "zone_away_temp": "Away Temperature (optional)",
+          "zone_occupancy_override": "Occupancy affects this zone"
+        }
+      },
+      "delete_zone": {
+        "title": "Delete Zone",
+        "description": "Select a zone to delete. This cannot be undone.",
+        "data": {
+          "zone_id": "Zone to Delete",
+          "confirm_delete": "I confirm I want to delete this zone"
         }
       },
       "schedule": {

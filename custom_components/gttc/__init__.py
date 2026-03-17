@@ -15,7 +15,9 @@ from .const import (
     CONF_ZONES,
     DOMAIN,
     PLATFORMS,
+    SERVICE_ASSIGN_SENSOR,
     SERVICE_CLEAR_LEARNED,
+    SERVICE_REMOVE_SENSOR,
     SERVICE_SET_PRESET,
     SERVICE_SET_SCHEDULE,
     SERVICE_SET_ZONE_TEMP,
@@ -74,6 +76,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             SERVICE_SET_SCHEDULE,
             SERVICE_CLEAR_LEARNED,
             SERVICE_SET_PRESET,
+            SERVICE_ASSIGN_SENSOR,
+            SERVICE_REMOVE_SENSOR,
         ):
             hass.services.async_remove(DOMAIN, service)
 
@@ -219,6 +223,70 @@ def _register_services(hass: HomeAssistant) -> None:
         schema=vol.Schema(
             {
                 vol.Required("preset"): cv.string,
+                vol.Optional("entry_id"): cv.string,
+            }
+        ),
+    )
+
+    async def handle_assign_sensor(call: ServiceCall) -> None:
+        zone_id = call.data["zone_id"]
+        sensor_entity = call.data["sensor_entity"]
+        sensor_type = call.data.get("sensor_type", "temperature")
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No GTTC instance found")
+            return
+        if coordinator.zone_manager.assign_sensor_to_zone(
+            zone_id, sensor_entity, sensor_type
+        ):
+            await coordinator.async_save()
+            coordinator.async_set_updated_data(coordinator._build_state_dict())
+        else:
+            _LOGGER.error("Failed to assign sensor '%s' to zone '%s'", sensor_entity, zone_id)
+
+    async def handle_remove_sensor(call: ServiceCall) -> None:
+        zone_id = call.data["zone_id"]
+        sensor_entity = call.data["sensor_entity"]
+        sensor_type = call.data.get("sensor_type", "temperature")
+        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
+        if coordinator is None:
+            _LOGGER.error("No GTTC instance found")
+            return
+        if coordinator.zone_manager.remove_sensor_from_zone(
+            zone_id, sensor_entity, sensor_type
+        ):
+            await coordinator.async_save()
+            coordinator.async_set_updated_data(coordinator._build_state_dict())
+        else:
+            _LOGGER.error("Sensor '%s' not found in zone '%s'", sensor_entity, zone_id)
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_ASSIGN_SENSOR,
+        handle_assign_sensor,
+        schema=vol.Schema(
+            {
+                vol.Required("zone_id"): cv.string,
+                vol.Required("sensor_entity"): cv.string,
+                vol.Optional("sensor_type", default="temperature"): vol.In(
+                    ["temperature", "occupancy"]
+                ),
+                vol.Optional("entry_id"): cv.string,
+            }
+        ),
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_REMOVE_SENSOR,
+        handle_remove_sensor,
+        schema=vol.Schema(
+            {
+                vol.Required("zone_id"): cv.string,
+                vol.Required("sensor_entity"): cv.string,
+                vol.Optional("sensor_type", default="temperature"): vol.In(
+                    ["temperature", "occupancy"]
+                ),
                 vol.Optional("entry_id"): cv.string,
             }
         ),

@@ -26,6 +26,7 @@ from .const import (
     ATTR_OVERRIDE_REMAINING,
     ATTR_PRESENCE_HOME,
     ATTR_SCHEDULE_ACTIVE,
+    ATTR_ZONE_DETAILS,
     ATTR_ZONE_TEMPS,
     CONF_NAME,
     CONF_TEMP_UNIT,
@@ -148,6 +149,7 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
             ATTR_OVERRIDE_ACTIVE: data.get("override_active", False),
             ATTR_OVERRIDE_REMAINING: data.get("override_remaining", 0),
             ATTR_ALL_ZONES: self.coordinator.zone_manager.get_all_zone_names(),
+            ATTR_ZONE_DETAILS: self.coordinator.zone_manager.get_zone_details(),
         }
 
     async def async_set_temperature(self, **kwargs: Any) -> None:

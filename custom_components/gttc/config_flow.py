@@ -171,6 +171,7 @@ class GTTCConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         ):
                             occ_sensors.append(entity.entity_id)
 
+                    floor_id = getattr(area, "floor_id", None)
                     self._zones.append(
                         {
                             "id": area_id,
@@ -178,6 +179,7 @@ class GTTCConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             "sensor_entities": temp_sensors,
                             "occupancy_sensor_entities": occ_sensors,
                             "area_id": area_id,
+                            "floor_id": floor_id,
                             "away_temp": None,
                             "occupancy_override": True,
                         }
@@ -236,6 +238,7 @@ class GTTCConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                             "occupancy_sensors", []
                         ),
                         "area_id": None,
+                        "floor_id": user_input.get("floor_id"),
                         "away_temp": user_input.get("zone_away_temp"),
                         "occupancy_override": user_input.get(
                             "zone_occupancy_override", True
@@ -250,6 +253,7 @@ class GTTCConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         schema = vol.Schema(
             {
                 vol.Required("zone_name"): str,
+                vol.Optional("floor_id"): str,
                 vol.Optional("temp_sensors"): selector.EntitySelector(
                     selector.EntitySelectorConfig(
                         domain=SENSOR_DOMAIN,
@@ -365,6 +369,7 @@ class GTTCOptionsFlow(config_entries.OptionsFlow):
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         self._config_entry = config_entry
+        self._selected_zone_id: str | None = None
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -491,6 +496,50 @@ class GTTCOptionsFlow(config_entries.OptionsFlow):
     async def async_step_manage_zones(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
+        """Zone management menu: add, edit, or delete zones."""
+        if user_input is not None:
+            action = user_input.get("zone_action", "add")
+            if action == "add":
+                return await self.async_step_add_zone()
+            elif action == "edit":
+                return await self.async_step_select_zone_to_edit()
+            elif action == "delete":
+                return await self.async_step_delete_zone()
+
+        zones = self._config_entry.data.get(CONF_ZONES, [])
+        zone_summary = ", ".join(z.get("name", "?") for z in zones) if zones else "None"
+
+        options = [
+            selector.SelectOptionDict(value="add", label="Add a new zone"),
+        ]
+        if zones:
+            options.append(
+                selector.SelectOptionDict(value="edit", label="Edit an existing zone")
+            )
+            options.append(
+                selector.SelectOptionDict(value="delete", label="Delete a zone")
+            )
+
+        schema = vol.Schema(
+            {
+                vol.Required("zone_action", default="add"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=options,
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+            }
+        )
+
+        return self.async_show_form(
+            step_id="manage_zones",
+            data_schema=schema,
+            description_placeholders={"zones": zone_summary},
+        )
+
+    async def async_step_add_zone(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
         """Add a new zone via options flow."""
         errors = {}
 
@@ -510,6 +559,7 @@ class GTTCOptionsFlow(config_entries.OptionsFlow):
                             "occupancy_sensors", []
                         ),
                         "area_id": None,
+                        "floor_id": user_input.get("floor_id"),
                         "away_temp": user_input.get("zone_away_temp"),
                         "occupancy_override": user_input.get(
                             "zone_occupancy_override", True
@@ -523,12 +573,13 @@ class GTTCOptionsFlow(config_entries.OptionsFlow):
                 )
 
                 if user_input.get("add_another", False):
-                    return await self.async_step_manage_zones()
+                    return await self.async_step_add_zone()
                 return self.async_create_entry(title="", data={})
 
         schema = vol.Schema(
             {
                 vol.Required("zone_name"): str,
+                vol.Optional("floor_id"): str,
                 vol.Optional("temp_sensors"): selector.EntitySelector(
                     selector.EntitySelectorConfig(
                         domain=SENSOR_DOMAIN,
@@ -550,8 +601,159 @@ class GTTCOptionsFlow(config_entries.OptionsFlow):
         )
 
         return self.async_show_form(
-            step_id="manage_zones", data_schema=schema, errors=errors
+            step_id="add_zone", data_schema=schema, errors=errors
         )
+
+    async def async_step_select_zone_to_edit(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Select which zone to edit."""
+        zones = self._config_entry.data.get(CONF_ZONES, [])
+        if not zones:
+            return await self.async_step_manage_zones()
+
+        if user_input is not None:
+            self._selected_zone_id = user_input.get("zone_id")
+            return await self.async_step_edit_zone()
+
+        zone_options = [
+            selector.SelectOptionDict(
+                value=z["id"],
+                label=f"{z.get('name', 'Unknown')} ({len(z.get('sensor_entities', []))} sensors)",
+            )
+            for z in zones
+        ]
+
+        schema = vol.Schema(
+            {
+                vol.Required("zone_id"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=zone_options,
+                        mode=selector.SelectSelectorMode.LIST,
+                    )
+                ),
+            }
+        )
+
+        return self.async_show_form(step_id="select_zone_to_edit", data_schema=schema)
+
+    async def async_step_edit_zone(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Edit an existing zone: rename, reassign sensors, change settings."""
+        errors = {}
+        zones = list(self._config_entry.data.get(CONF_ZONES, []))
+        zone = next((z for z in zones if z["id"] == self._selected_zone_id), None)
+        if not zone:
+            return await self.async_step_manage_zones()
+
+        if user_input is not None:
+            zone_name = user_input.get("zone_name", "").strip()
+            if not zone_name:
+                errors["zone_name"] = "name_required"
+            else:
+                # Update the zone in place
+                zone["name"] = zone_name
+                zone["sensor_entities"] = user_input.get(
+                    "temp_sensors", zone.get("sensor_entities", [])
+                )
+                zone["occupancy_sensor_entities"] = user_input.get(
+                    "occupancy_sensors", zone.get("occupancy_sensor_entities", [])
+                )
+                zone["floor_id"] = user_input.get("floor_id", zone.get("floor_id"))
+                zone["away_temp"] = user_input.get("zone_away_temp")
+                zone["occupancy_override"] = user_input.get(
+                    "zone_occupancy_override", True
+                )
+
+                new_data = {**self._config_entry.data, CONF_ZONES: zones}
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry, data=new_data
+                )
+                return self.async_create_entry(title="", data={})
+
+        schema = vol.Schema(
+            {
+                vol.Required(
+                    "zone_name", default=zone.get("name", "")
+                ): str,
+                vol.Optional(
+                    "floor_id", default=zone.get("floor_id") or vol.UNDEFINED
+                ): str,
+                vol.Optional(
+                    "temp_sensors",
+                    default=zone.get("sensor_entities", []),
+                ): selector.EntitySelector(
+                    selector.EntitySelectorConfig(
+                        domain=SENSOR_DOMAIN,
+                        device_class="temperature",
+                        multiple=True,
+                    )
+                ),
+                vol.Optional(
+                    "occupancy_sensors",
+                    default=zone.get("occupancy_sensor_entities", []),
+                ): selector.EntitySelector(
+                    selector.EntitySelectorConfig(
+                        domain=BINARY_SENSOR_DOMAIN,
+                        device_class="occupancy",
+                        multiple=True,
+                    )
+                ),
+                vol.Optional(
+                    "zone_away_temp",
+                    default=zone.get("away_temp") or vol.UNDEFINED,
+                ): vol.Coerce(float),
+                vol.Optional(
+                    "zone_occupancy_override",
+                    default=zone.get("occupancy_override", True),
+                ): bool,
+            }
+        )
+
+        return self.async_show_form(
+            step_id="edit_zone",
+            data_schema=schema,
+            errors=errors,
+            description_placeholders={"zone_name": zone.get("name", "")},
+        )
+
+    async def async_step_delete_zone(
+        self, user_input: dict[str, Any] | None = None
+    ) -> config_entries.ConfigFlowResult:
+        """Delete a zone."""
+        zones = list(self._config_entry.data.get(CONF_ZONES, []))
+        if not zones:
+            return await self.async_step_manage_zones()
+
+        if user_input is not None:
+            zone_id = user_input.get("zone_id")
+            if user_input.get("confirm_delete", False) and zone_id:
+                zones = [z for z in zones if z["id"] != zone_id]
+                new_data = {**self._config_entry.data, CONF_ZONES: zones}
+                self.hass.config_entries.async_update_entry(
+                    self._config_entry, data=new_data
+                )
+            return self.async_create_entry(title="", data={})
+
+        zone_options = [
+            selector.SelectOptionDict(value=z["id"], label=z.get("name", "Unknown"))
+            for z in zones
+        ]
+
+        schema = vol.Schema(
+            {
+                vol.Required("zone_id"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=zone_options,
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                vol.Required("confirm_delete", default=False): bool,
+            }
+        )
+
+        return self.async_show_form(step_id="delete_zone", data_schema=schema)
 
     async def async_step_schedule(
         self, user_input: dict[str, Any] | None = None

@@ -63,6 +63,72 @@ class ZoneManager:
             return True
         return False
 
+    def assign_sensor_to_zone(
+        self, zone_id: str, sensor_entity: str, sensor_type: str = "temperature"
+    ) -> bool:
+        """Assign a sensor to a zone. sensor_type is 'temperature' or 'occupancy'."""
+        zone = self.zones.get(zone_id)
+        if not zone:
+            _LOGGER.warning("Zone '%s' not found for sensor assignment", zone_id)
+            return False
+
+        if sensor_type == "occupancy":
+            if sensor_entity not in zone.occupancy_sensor_entities:
+                zone.occupancy_sensor_entities.append(sensor_entity)
+            return True
+
+        # Default: temperature sensor
+        if sensor_entity not in zone.sensor_entities:
+            zone.sensor_entities.append(sensor_entity)
+        return True
+
+    def remove_sensor_from_zone(
+        self, zone_id: str, sensor_entity: str, sensor_type: str = "temperature"
+    ) -> bool:
+        """Remove a sensor from a zone."""
+        zone = self.zones.get(zone_id)
+        if not zone:
+            _LOGGER.warning("Zone '%s' not found for sensor removal", zone_id)
+            return False
+
+        if sensor_type == "occupancy":
+            if sensor_entity in zone.occupancy_sensor_entities:
+                zone.occupancy_sensor_entities.remove(sensor_entity)
+                return True
+            return False
+
+        if sensor_entity in zone.sensor_entities:
+            zone.sensor_entities.remove(sensor_entity)
+            return True
+        return False
+
+    def move_sensor_between_zones(
+        self, from_zone_id: str, to_zone_id: str, sensor_entity: str,
+        sensor_type: str = "temperature",
+    ) -> bool:
+        """Move a sensor from one zone to another."""
+        if self.remove_sensor_from_zone(from_zone_id, sensor_entity, sensor_type):
+            return self.assign_sensor_to_zone(to_zone_id, sensor_entity, sensor_type)
+        return False
+
+    def get_zone_details(self) -> dict[str, dict[str, Any]]:
+        """Get detailed zone info including sensor lists, for dashboard attributes."""
+        details = {}
+        for zone in self.zones.values():
+            details[zone.id] = {
+                "name": zone.name,
+                "floor_id": zone.floor_id,
+                "area_id": zone.area_id,
+                "current_temp": zone.current_temp,
+                "is_occupied": zone.is_occupied,
+                "sensor_count": len(zone.sensor_entities),
+                "temp_sensors": zone.sensor_entities,
+                "occupancy_sensors": zone.occupancy_sensor_entities,
+                "away_temp": zone.away_temp,
+                "occupancy_override": zone.occupancy_override,
+            }
+        return details
+
     def get_zone(self, zone_id: str) -> Zone | None:
         return self.zones.get(zone_id)
 
@@ -99,11 +165,12 @@ class ZoneManager:
             except Exception as err:
                 _LOGGER.warning("Error scanning area '%s': %s", area.name, err)
 
+            floor_id = getattr(area, "floor_id", None)
             discovered.append(
                 {
                     "area_id": area.id,
                     "name": area.name,
-                    "floor_id": getattr(area, "floor_id", None),
+                    "floor_id": floor_id,
                     "temp_sensors": temp_sensors,
                     "occupancy_sensors": occupancy_sensors,
                 }
