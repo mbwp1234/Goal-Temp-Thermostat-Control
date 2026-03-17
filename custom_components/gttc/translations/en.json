@@ -2,7 +2,7 @@
   "config": {
     "step": {
       "user": {
-        "title": "Better Thermostat Setup",
+        "title": "GTTC Setup",
         "description": "Set up your smart thermostat with zone-aware scheduling and learning.",
         "data": {
           "name": "Name",
@@ -65,7 +65,7 @@
   "options": {
     "step": {
       "init": {
-        "title": "Better Thermostat Options",
+        "title": "GTTC Options",
         "description": "Choose what to configure.",
         "data": {
           "action": "Action"
@@ -96,7 +96,7 @@
       },
       "schedule": {
         "title": "Schedule Configuration",
-        "description": "Use the Schedule Mode select entity and the better_thermostat.set_schedule service to configure schedules. Presets can be activated via the climate entity's preset modes."
+        "description": "Use the Schedule Mode select entity and the gttc.set_schedule service to configure schedules. Presets can be activated via the climate entity's preset modes."
       }
     },
     "error": {

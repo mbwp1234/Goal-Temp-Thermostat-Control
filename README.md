@@ -20,18 +20,18 @@ A smart, zone-aware thermostat integration for Home Assistant (HACS). Control yo
 1. Open HACS in your Home Assistant instance
 2. Click the three dots menu → **Custom repositories**
 3. Add this repository URL and select **Integration** as the category
-4. Search for "Better Thermostat" and install
+4. Search for "Goal Temp Thermostat Control" and install
 5. Restart Home Assistant
 
 ### Manual
 
-1. Copy the `custom_components/better_thermostat` folder to your Home Assistant `config/custom_components/` directory
+1. Copy the `custom_components/gttc` folder to your Home Assistant `config/custom_components/` directory
 2. Restart Home Assistant
 
 ## Setup
 
 1. Go to **Settings → Devices & Services → Add Integration**
-2. Search for **Better Thermostat**
+2. Search for **Goal Temp Thermostat Control**
 3. Follow the setup wizard:
    - **Step 1**: Name your thermostat, select your real thermostat entity, choose temperature units and range
    - **Step 2**: Configure zones — auto-discover from HA areas or add manually with temperature/occupancy sensors
@@ -41,34 +41,34 @@ A smart, zone-aware thermostat integration for Home Assistant (HACS). Control yo
 
 | Entity | Type | Description |
 |--------|------|-------------|
-| `climate.better_thermostat` | Climate | Main virtual thermostat — set temp, change modes, activate presets |
-| `select.better_thermostat_active_zone` | Select | Pick which floor/room zone to target |
-| `select.better_thermostat_schedule_mode` | Select | Switch between Weekday/Weekend and Per Day scheduling |
-| `switch.better_thermostat_learning` | Switch | Toggle the pattern learning engine |
-| `switch.better_thermostat_occupancy_mode` | Switch | Toggle occupancy-based temperature control |
-| `switch.better_thermostat_schedule` | Switch | Toggle the schedule on/off |
-| `number.better_thermostat_away_temperature` | Number | Set the away/eco temperature |
-| `number.better_thermostat_override_duration` | Number | Set how long manual overrides last (minutes) |
-| `sensor.better_thermostat_active_zone_temperature` | Sensor | Current averaged temp of the active zone |
-| `sensor.better_thermostat_*_temperature` | Sensor | Per-zone averaged temperature sensors |
-| `sensor.better_thermostat_override_remaining` | Sensor | Minutes remaining on manual override |
-| `sensor.better_thermostat_learned_patterns` | Sensor | Count of learned schedule patterns |
+| `climate.gttc` | Climate | Main virtual thermostat — set temp, change modes, activate presets |
+| `select.gttc_active_zone` | Select | Pick which floor/room zone to target |
+| `select.gttc_schedule_mode` | Select | Switch between Weekday/Weekend and Per Day scheduling |
+| `switch.gttc_learning` | Switch | Toggle the pattern learning engine |
+| `switch.gttc_occupancy_mode` | Switch | Toggle occupancy-based temperature control |
+| `switch.gttc_schedule` | Switch | Toggle the schedule on/off |
+| `number.gttc_away_temperature` | Number | Set the away/eco temperature |
+| `number.gttc_override_duration` | Number | Set how long manual overrides last (minutes) |
+| `sensor.gttc_active_zone_temperature` | Sensor | Current averaged temp of the active zone |
+| `sensor.gttc_*_temperature` | Sensor | Per-zone averaged temperature sensors |
+| `sensor.gttc_override_remaining` | Sensor | Minutes remaining on manual override |
+| `sensor.gttc_learned_patterns` | Sensor | Count of learned schedule patterns |
 
 ## Services
 
-### `better_thermostat.set_zone_temperature`
+### `gttc.set_zone_temperature`
 Set temperature for a specific zone.
 ```yaml
-service: better_thermostat.set_zone_temperature
+service: gttc.set_zone_temperature
 data:
   zone_id: "living_room"
   temperature: 72
 ```
 
-### `better_thermostat.set_schedule`
+### `gttc.set_schedule`
 Set schedule entries for a day or day group.
 ```yaml
-service: better_thermostat.set_schedule
+service: gttc.set_schedule
 data:
   day: weekday
   entries:
@@ -86,18 +86,18 @@ data:
       target_temp: 65
 ```
 
-### `better_thermostat.set_preset`
+### `gttc.set_preset`
 Activate a schedule preset.
 ```yaml
-service: better_thermostat.set_preset
+service: gttc.set_preset
 data:
   preset: work_from_home  # home, away, work_from_home, sleep
 ```
 
-### `better_thermostat.clear_learned_schedule`
+### `gttc.clear_learned_schedule`
 Clear all learned patterns from the learning engine.
 ```yaml
-service: better_thermostat.clear_learned_schedule
+service: gttc.clear_learned_schedule
 ```
 
 ## How It Works
@@ -116,7 +116,7 @@ Three modes for detecting if anyone is home:
 - **Occupancy sensors only** — Only uses motion/occupancy/presence binary sensors assigned to zones
 
 ### Learning Engine
-The learning engine watches for manual temperature adjustments. When you make similar changes (within 2°F and 30 minutes) at similar times of day on 3+ occasions, it automatically creates a schedule entry for that pattern. You'll see learned patterns in the `sensor.better_thermostat_learned_patterns` entity.
+The learning engine watches for manual temperature adjustments. When you make similar changes (within 2°F and 30 minutes) at similar times of day on 3+ occasions, it automatically creates a schedule entry for that pattern. You'll see learned patterns in the `sensor.gttc_learned_patterns` entity.
 
 ### Zone Averaging
 Each zone can have multiple temperature sensors. The integration averages all available readings to get a single zone temperature. If a sensor becomes unavailable, it's excluded from the average.

@@ -1,4 +1,4 @@
-"""Better Thermostat - Smart zone-aware thermostat with learning and scheduling."""
+"""Goal Temp Thermostat Control (GTTC) - Smart zone-aware thermostat with learning and scheduling."""
 from __future__ import annotations
 
 import logging
@@ -20,17 +20,17 @@ from .const import (
     SERVICE_SET_SCHEDULE,
     SERVICE_SET_ZONE_TEMP,
 )
-from .coordinator import BetterThermostatCoordinator
+from .coordinator import GTTCCoordinator
 from .models import Zone
 
 _LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up Better Thermostat from a config entry."""
+    """Set up GTTC from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    coordinator = BetterThermostatCoordinator(hass, entry)
+    coordinator = GTTCCoordinator(hass, entry)
 
     # Load zones from config
     zones_data = entry.data.get(CONF_ZONES, [])
@@ -89,7 +89,7 @@ async def _async_update_listener(
 
 def _get_coordinator(
     hass: HomeAssistant, entry_id: str | None = None
-) -> BetterThermostatCoordinator | None:
+) -> GTTCCoordinator | None:
     """Safely get a coordinator instance."""
     entries = hass.data.get(DOMAIN, {})
     if not entries:
@@ -97,13 +97,13 @@ def _get_coordinator(
 
     if entry_id:
         coordinator = entries.get(entry_id)
-        if isinstance(coordinator, BetterThermostatCoordinator):
+        if isinstance(coordinator, GTTCCoordinator):
             return coordinator
         return None
 
     # Return the first coordinator found
     for coordinator in entries.values():
-        if isinstance(coordinator, BetterThermostatCoordinator):
+        if isinstance(coordinator, GTTCCoordinator):
             return coordinator
     return None
 
@@ -118,7 +118,7 @@ def _register_services(hass: HomeAssistant) -> None:
         temperature = call.data[ATTR_TEMPERATURE]
         coordinator = _get_coordinator(hass, call.data.get("entry_id"))
         if coordinator is None:
-            _LOGGER.error("No Better Thermostat instance found")
+            _LOGGER.error("No GTTC instance found")
             return
         zone = coordinator.zone_manager.get_zone(zone_id)
         if zone is None:
@@ -132,7 +132,7 @@ def _register_services(hass: HomeAssistant) -> None:
         entries = call.data["entries"]
         coordinator = _get_coordinator(hass, call.data.get("entry_id"))
         if coordinator is None:
-            _LOGGER.error("No Better Thermostat instance found")
+            _LOGGER.error("No GTTC instance found")
             return
         if not entries:
             _LOGGER.warning("Empty schedule entries for day '%s'", day)
@@ -148,7 +148,7 @@ def _register_services(hass: HomeAssistant) -> None:
     async def handle_clear_learned(call: ServiceCall) -> None:
         coordinator = _get_coordinator(hass, call.data.get("entry_id"))
         if coordinator is None:
-            _LOGGER.error("No Better Thermostat instance found")
+            _LOGGER.error("No GTTC instance found")
             return
         coordinator.learning.clear_learned()
         await coordinator.async_save()
@@ -157,7 +157,7 @@ def _register_services(hass: HomeAssistant) -> None:
         preset = call.data["preset"]
         coordinator = _get_coordinator(hass, call.data.get("entry_id"))
         if coordinator is None:
-            _LOGGER.error("No Better Thermostat instance found")
+            _LOGGER.error("No GTTC instance found")
             return
         if not coordinator.scheduler.activate_preset(preset):
             _LOGGER.error("Unknown preset '%s'", preset)

@@ -1,4 +1,4 @@
-"""Config flow for Better Thermostat."""
+"""Config flow for GTTC."""
 from __future__ import annotations
 
 import logging
@@ -48,8 +48,8 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
-class BetterThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
-    """Handle a config flow for Better Thermostat."""
+class GTTCConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+    """Handle a config flow for GTTC."""
 
     VERSION = 1
 
@@ -356,12 +356,12 @@ class BetterThermostatConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     @callback
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
-    ) -> BetterThermostatOptionsFlow:
-        return BetterThermostatOptionsFlow(config_entry)
+    ) -> GTTCOptionsFlow:
+        return GTTCOptionsFlow(config_entry)
 
 
-class BetterThermostatOptionsFlow(config_entries.OptionsFlow):
-    """Options flow for reconfiguring Better Thermostat."""
+class GTTCOptionsFlow(config_entries.OptionsFlow):
+    """Options flow for reconfiguring GTTC."""
 
     def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
         self._config_entry = config_entry
@@ -564,6 +564,6 @@ class BetterThermostatOptionsFlow(config_entries.OptionsFlow):
             step_id="schedule",
             data_schema=vol.Schema({}),
             description_placeholders={
-                "info": "Use the Schedule Mode select entity and the better_thermostat.set_schedule service to configure schedules. Presets can be activated via the climate entity's preset modes."
+                "info": "Use the Schedule Mode select entity and the gttc.set_schedule service to configure schedules. Presets can be activated via the climate entity's preset modes."
             },
         )

@@ -1,5 +1,5 @@
 {
-  "name": "Better Thermostat",
+  "name": "Goal Temp Thermostat Control",
   "render_readme": true,
   "domains": ["climate", "sensor", "select", "switch", "number"]
 }

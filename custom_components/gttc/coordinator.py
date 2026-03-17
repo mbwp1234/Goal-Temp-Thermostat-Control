@@ -1,4 +1,4 @@
-"""Data coordinator for Better Thermostat."""
+"""Data coordinator for GTTC."""
 from __future__ import annotations
 
 import logging
@@ -45,7 +45,7 @@ _LOGGER = logging.getLogger(__name__)
 UPDATE_INTERVAL = timedelta(seconds=30)
 
 
-class BetterThermostatCoordinator(DataUpdateCoordinator):
+class GTTCCoordinator(DataUpdateCoordinator):
     """Central coordinator that ties together zones, schedule, learning, and thermostat control."""
 
     def __init__(
@@ -114,7 +114,7 @@ class BetterThermostatCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Error loading stored data, starting fresh: %s", err)
 
         self._initialized = True
-        _LOGGER.info("Better Thermostat coordinator initialized")
+        _LOGGER.info("GTTC coordinator initialized")
 
     def _load_stored_data(self, data: dict[str, Any]) -> None:
         """Restore state from storage with validation."""
