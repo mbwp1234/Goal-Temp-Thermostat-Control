@@ -218,6 +218,27 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Manual override expired, resuming automation")
                 self.manual_override = None
 
+            # Auto-switch active zone when the current schedule entry
+            # specifies a zone_id (e.g. "1st floor" during the day,
+            # "2nd floor" at night).
+            if self.schedule_enabled and self.manual_override is None:
+                entry = self.scheduler.get_current_entry()
+                if (
+                    entry
+                    and entry.zone_id
+                    and entry.zone_id != self.zone_manager.active_zone_id
+                    and entry.zone_id in self.zone_manager.zones
+                ):
+                    _LOGGER.info(
+                        "Schedule entry specifies zone '%s', switching active zone",
+                        entry.zone_id,
+                    )
+                    self.zone_manager.set_active_zone(entry.zone_id)
+                    # Re-read active zone so offset calculation uses the new zone
+                    active_zone = self.zone_manager.active_zone
+                    if active_zone and active_zone.current_temp is not None:
+                        self.current_temp = active_zone.current_temp
+
             # Determine target temperature
             desired_temp = self._calculate_desired_temp()
 
