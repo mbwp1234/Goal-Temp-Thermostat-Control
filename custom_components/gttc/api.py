@@ -767,11 +767,11 @@ async def ws_get_diagnostics(
     zones = []
     for zone in coordinator.zone_manager.zones.values():
         zones.append({
-            "id": zone.zone_id,
+            "id": zone.id,
             "name": zone.name,
             "current_temp": zone.current_temp,
             "is_occupied": zone.is_occupied,
-            "is_active": zone.zone_id == coordinator.zone_manager.active_zone_id,
+            "is_active": zone.id == coordinator.zone_manager.active_zone_id,
             "sensor_count": len(zone.temp_sensors),
         })
 
