@@ -58,6 +58,7 @@ def async_register_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_import_schedule)
     websocket_api.async_register_command(hass, ws_undo_schedule)
     websocket_api.async_register_command(hass, ws_redo_schedule)
+    websocket_api.async_register_command(hass, ws_get_diagnostics)
 
 
 def _get_coordinator(hass: HomeAssistant, entry_id: str | None = None):
@@ -718,6 +719,113 @@ async def ws_redo_schedule(
     coordinator.scheduler.load(next_state)
     await coordinator.async_save()
     connection.send_result(msg["id"], {"success": True})
+
+
+# ── Get diagnostics ───────────────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/get_diagnostics",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_get_diagnostics(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Return comprehensive GTTC diagnostics for the status panel."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    # Look up entity IDs via entity registry
+    from homeassistant.helpers import entity_registry as er
+    ent_reg = er.async_get(hass)
+    reg_entries = er.async_entries_for_config_entry(ent_reg, coordinator.config_entry.entry_id)
+    climate_entity_id = None
+    active_zone_temp_entity_id = None
+    for reg_entry in reg_entries:
+        if reg_entry.domain == "climate":
+            climate_entity_id = reg_entry.entity_id
+        if reg_entry.domain == "sensor" and "active_zone_temp" in reg_entry.unique_id:
+            active_zone_temp_entity_id = reg_entry.entity_id
+
+    # Thermostat state
+    thermostat_state = hass.states.get(coordinator.thermostat_entity)
+    thermostat_temp = None
+    thermostat_setpoint = None
+    thermostat_action = None
+    if thermostat_state:
+        attrs = thermostat_state.attributes
+        thermostat_temp = attrs.get("current_temperature")
+        thermostat_setpoint = attrs.get("temperature")
+        raw_action = attrs.get("hvac_action")
+        thermostat_action = str(raw_action) if raw_action else None
+
+    # Zone details
+    zones = []
+    for zone in coordinator.zone_manager.zones.values():
+        zones.append({
+            "id": zone.zone_id,
+            "name": zone.name,
+            "current_temp": zone.current_temp,
+            "is_occupied": zone.is_occupied,
+            "is_active": zone.zone_id == coordinator.zone_manager.active_zone_id,
+            "sensor_count": len(zone.temp_sensors),
+        })
+
+    override = coordinator.manual_override
+    override_active = override is not None and not override.is_expired
+    current_entry = coordinator.scheduler.get_current_entry()
+
+    result = {
+        "current_temp": coordinator.current_temp,
+        "target_temp": coordinator.target_temp,
+        "hvac_mode": coordinator.hvac_mode.value if coordinator.hvac_mode else None,
+        "hvac_action": coordinator.hvac_action.value if coordinator.hvac_action else None,
+        "override_active": override_active,
+        "override_remaining_minutes": override.remaining_minutes if override_active else 0,
+        "override_target_temp": override.target_temp if override_active else None,
+        "override_started_at": override.started_at if override_active else None,
+        "schedule_enabled": coordinator.schedule_enabled,
+        "current_entry": current_entry.to_dict() if current_entry else None,
+        "active_zone_name": coordinator.zone_manager.active_zone.name if coordinator.zone_manager.active_zone else None,
+        "zones": zones,
+        "learning": {
+            "enabled": coordinator.learning_enabled,
+            "events_recorded": len(coordinator.learning.events),
+            "patterns_learned": len(coordinator.learning.learned_entries),
+        },
+        "features": {
+            "tou_enabled": coordinator.tou_enabled,
+            "tou_rate": (
+                coordinator.tou_provider.get_rate_period().value
+                if coordinator.tou_enabled else None
+            ),
+            "precondition_enabled": coordinator.precondition_enabled,
+            "precondition_active": coordinator._is_preconditioning(),
+            "occupancy_enabled": coordinator.occupancy_enabled,
+            "heat_pump_detected": coordinator.is_heat_pump,
+            "outdoor_temp": coordinator._outdoor_temp,
+            "presence_home": coordinator.zone_manager.is_anyone_home(),
+        },
+        "thermostat_entity": coordinator.thermostat_entity,
+        "thermostat_temp": thermostat_temp,
+        "thermostat_setpoint": thermostat_setpoint,
+        "thermostat_action": thermostat_action,
+        "config": {
+            "temp_min": coordinator.temp_min,
+            "temp_max": coordinator.temp_max,
+            "away_temp": coordinator.away_temp,
+            "override_minutes": coordinator.manual_override_minutes,
+        },
+        "entity_ids": {
+            "climate": climate_entity_id,
+            "active_zone_temp": active_zone_temp_entity_id,
+        },
+    }
+    connection.send_result(msg["id"], result)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

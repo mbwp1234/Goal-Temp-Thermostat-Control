@@ -87,6 +87,12 @@ class GttcPanel extends HTMLElement {
     this._showImportModal = false;
     // Drag state
     this._dragging = null;
+    // Status tab
+    this._activeMainTab = "schedule";
+    this._diagData = null;
+    this._historyData = null;
+    this._statusLoading = false;
+    this._debugExpanded = false;
   }
 
   set hass(hass) {
@@ -148,31 +154,34 @@ class GttcPanel extends HTMLElement {
         <header class="header">
           <div class="header-left">
             <ha-icon icon="mdi:calendar-clock" class="header-icon"></ha-icon>
-            <h1>GTTC Schedule</h1>
+            <h1>GTTC</h1>
           </div>
           <div class="header-right">
             ${this._renderStatus()}
-            ${this._renderUndoRedo()}
-            ${this._renderScheduleMode()}
-            ${this._renderPresetSelector()}
-            ${this._renderToolbar()}
+            ${this._activeMainTab === "schedule" ? this._renderUndoRedo() : ""}
+            ${this._activeMainTab === "schedule" ? this._renderScheduleMode() : ""}
+            ${this._activeMainTab === "schedule" ? this._renderPresetSelector() : ""}
+            ${this._activeMainTab === "schedule" ? this._renderToolbar() : ""}
           </div>
         </header>
 
-        <div class="content">
-          <div class="day-tabs">
-            ${DAYS_ORDERED.map(d => `
-              <button class="day-tab ${d === this._selectedDay ? "active" : ""}"
-                      data-day="${d}">
-                <span class="day-short">${DAY_LABELS[d]}</span>
-              </button>
-            `).join("")}
-          </div>
+        ${this._renderMainTabBar()}
 
-          <div class="schedule-view">
-            ${this._renderWeekOverview()}
-            ${this._renderDayDetail()}
-          </div>
+        <div class="content">
+          ${this._activeMainTab === "schedule" ? `
+            <div class="day-tabs">
+              ${DAYS_ORDERED.map(d => `
+                <button class="day-tab ${d === this._selectedDay ? "active" : ""}"
+                        data-day="${d}">
+                  <span class="day-short">${DAY_LABELS[d]}</span>
+                </button>
+              `).join("")}
+            </div>
+            <div class="schedule-view">
+              ${this._renderWeekOverview()}
+              ${this._renderDayDetail()}
+            </div>
+          ` : this._renderStatusTab()}
         </div>
 
         ${this._editingEntry ? this._renderEditModal() : ""}
@@ -620,6 +629,27 @@ class GttcPanel extends HTMLElement {
 
   _attachListeners() {
     const root = this.shadowRoot;
+
+    // Main tab bar
+    root.querySelectorAll(".main-tab").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const tab = btn.dataset.mainTab;
+        if (tab === this._activeMainTab) return;
+        this._activeMainTab = tab;
+        if (tab === "status") {
+          this._loadStatusData();
+        } else {
+          this._render();
+        }
+      });
+    });
+
+    // Status tab buttons
+    this._addClick("statusRefreshBtn", () => this._loadStatusData());
+    this._addClick("debugToggleBtn", () => {
+      this._debugExpanded = !this._debugExpanded;
+      this._render();
+    });
 
     // Day tabs
     root.querySelectorAll(".day-tab").forEach(btn => {
@@ -1302,6 +1332,334 @@ class GttcPanel extends HTMLElement {
     return "rgba(255,255,255,0.95)";
   }
 
+  // ── Main tab bar ──────────────────────────────────────────────────────────
+
+  _renderMainTabBar() {
+    return `
+      <div class="main-tab-bar">
+        <button class="main-tab ${this._activeMainTab === "schedule" ? "active" : ""}" data-main-tab="schedule">
+          <ha-icon icon="mdi:calendar-clock"></ha-icon> Schedule
+        </button>
+        <button class="main-tab ${this._activeMainTab === "status" ? "active" : ""}" data-main-tab="status">
+          <ha-icon icon="mdi:chart-line"></ha-icon> Status
+        </button>
+      </div>
+    `;
+  }
+
+  // ── Status tab ────────────────────────────────────────────────────────────
+
+  _renderStatusTab() {
+    if (this._statusLoading) {
+      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading...</div>`;
+    }
+    if (!this._diagData) {
+      return `<div class="status-loading">No data. <button class="btn btn-outline" id="statusRefreshBtn">Refresh</button></div>`;
+    }
+    const d = this._diagData;
+    return `
+      <div class="status-tab">
+        ${this._renderStatCards(d)}
+        ${this._renderTempChart()}
+        <div class="status-row-2">
+          ${this._renderZonesCard(d)}
+          ${this._renderSystemCard(d)}
+        </div>
+        ${this._renderDebugCard(d)}
+        <div class="status-footer">
+          <button class="btn btn-outline" id="statusRefreshBtn">
+            <ha-icon icon="mdi:refresh"></ha-icon> Refresh
+          </button>
+          <span class="status-updated">Updated ${new Date().toLocaleTimeString()}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderStatCards(d) {
+    const hvacIcon = d.hvac_action === "heating" ? "mdi:fire" : d.hvac_action === "cooling" ? "mdi:snowflake" : "mdi:thermometer-check";
+    const hvacLabel = d.hvac_action ? (d.hvac_action.charAt(0).toUpperCase() + d.hvac_action.slice(1)) : "—";
+    const hvacClass = d.hvac_action === "heating" ? "heating" : d.hvac_action === "cooling" ? "cooling" : "";
+
+    const schedEntry = d.current_entry;
+    const entryLabel = schedEntry
+      ? `${this._fmt12(schedEntry.time_start)}–${this._fmt12(schedEntry.time_end)} @ ${schedEntry.target_temp}°`
+      : "No active entry";
+
+    return `
+      <div class="stat-cards">
+        <div class="stat-card">
+          <div class="stat-icon"><ha-icon icon="mdi:thermometer"></ha-icon></div>
+          <div class="stat-body">
+            <div class="stat-label">Zone Temp</div>
+            <div class="stat-value">${d.current_temp != null ? d.current_temp.toFixed(1) + "°" : "—"}</div>
+            <div class="stat-sub">${d.active_zone_name || "—"}</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon"><ha-icon icon="mdi:target"></ha-icon></div>
+          <div class="stat-body">
+            <div class="stat-label">Goal</div>
+            <div class="stat-value">${d.target_temp != null ? d.target_temp.toFixed(1) + "°" : "—"}</div>
+            <div class="stat-sub">${d.override_active ? `Override · ${d.override_remaining_minutes}m left` : (d.schedule_enabled ? "Schedule" : "Manual")}</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon ${hvacClass}"><ha-icon icon="${hvacIcon}"></ha-icon></div>
+          <div class="stat-body">
+            <div class="stat-label">HVAC</div>
+            <div class="stat-value stat-value-md ${hvacClass}">${hvacLabel}</div>
+            <div class="stat-sub">${d.thermostat_action ? "T-stat: " + d.thermostat_action : ""}</div>
+          </div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-icon"><ha-icon icon="mdi:calendar-check"></ha-icon></div>
+          <div class="stat-body">
+            <div class="stat-label">Schedule</div>
+            <div class="stat-value stat-value-sm">${entryLabel}</div>
+            <div class="stat-sub">${d.schedule_enabled ? "Active" : "Disabled"}</div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderTempChart() {
+    const hist = this._historyData;
+    const diag = this._diagData;
+
+    if (!hist || hist.length === 0) {
+      return `
+        <div class="chart-card">
+          <div class="chart-title">Temperature — last 24h</div>
+          <div class="chart-empty">No history data available</div>
+        </div>
+      `;
+    }
+
+    const points = hist
+      .filter(p => p.state !== "unavailable" && p.state !== "unknown" && !isNaN(parseFloat(p.state)))
+      .map(p => ({ t: new Date(p.last_changed).getTime(), v: parseFloat(p.state) }))
+      .sort((a, b) => a.t - b.t);
+
+    if (points.length < 2) {
+      return `<div class="chart-card"><div class="chart-title">Temperature — last 24h</div><div class="chart-empty">Not enough data</div></div>`;
+    }
+
+    const W = 800, H = 180, PAD = { top: 12, right: 16, bottom: 28, left: 40 };
+    const innerW = W - PAD.left - PAD.right;
+    const innerH = H - PAD.top - PAD.bottom;
+
+    const tMin = points[0].t, tMax = points[points.length - 1].t;
+    const temps = points.map(p => p.v);
+    const vMin = Math.floor(Math.min(...temps) - 1);
+    const vMax = Math.ceil(Math.max(...temps) + 1);
+
+    const xScale = t => PAD.left + ((t - tMin) / (tMax - tMin)) * innerW;
+    const yScale = v => PAD.top + (1 - (v - vMin) / (vMax - vMin)) * innerH;
+
+    // Line path
+    const pathD = points.map((p, i) => `${i === 0 ? "M" : "L"}${xScale(p.t).toFixed(1)},${yScale(p.v).toFixed(1)}`).join(" ");
+
+    // Area fill
+    const areaD = pathD + ` L${xScale(tMax).toFixed(1)},${(PAD.top + innerH).toFixed(1)} L${xScale(tMin).toFixed(1)},${(PAD.top + innerH).toFixed(1)} Z`;
+
+    // Goal line
+    const goalTemp = diag && diag.target_temp != null ? diag.target_temp : null;
+    const goalY = goalTemp != null ? yScale(goalTemp) : null;
+
+    // Y-axis ticks
+    const yTicks = [];
+    const step = (vMax - vMin) <= 6 ? 1 : 2;
+    for (let v = Math.ceil(vMin / step) * step; v <= vMax; v += step) {
+      yTicks.push(v);
+    }
+
+    // X-axis ticks (every 4h)
+    const xTicks = [];
+    const startHour = new Date(tMin);
+    startHour.setMinutes(0, 0, 0);
+    startHour.setHours(startHour.getHours() + (startHour.getTime() < tMin ? 1 : 0));
+    for (let t = startHour.getTime(); t <= tMax; t += 4 * 3600 * 1000) {
+      if (t >= tMin && t <= tMax) xTicks.push(t);
+    }
+
+    return `
+      <div class="chart-card">
+        <div class="chart-title">
+          Zone Temperature — last 24h
+          ${goalTemp != null ? `<span class="chart-legend"><span class="legend-dot goal"></span> Goal ${goalTemp}°</span>` : ""}
+        </div>
+        <svg class="temp-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+          <defs>
+            <linearGradient id="areaGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="var(--primary-color,#03a9f4)" stop-opacity="0.25"/>
+              <stop offset="100%" stop-color="var(--primary-color,#03a9f4)" stop-opacity="0.02"/>
+            </linearGradient>
+          </defs>
+          <!-- Grid lines -->
+          ${yTicks.map(v => `
+            <line x1="${PAD.left}" y1="${yScale(v).toFixed(1)}" x2="${PAD.left + innerW}" y2="${yScale(v).toFixed(1)}"
+                  stroke="var(--divider-color,#e0e0e0)" stroke-width="1"/>
+            <text x="${PAD.left - 6}" y="${(yScale(v) + 4).toFixed(1)}" text-anchor="end" font-size="10" fill="var(--secondary-text-color,#727272)">${v}°</text>
+          `).join("")}
+          <!-- Area fill -->
+          <path d="${areaD}" fill="url(#areaGrad)"/>
+          <!-- Zone temp line -->
+          <path d="${pathD}" fill="none" stroke="var(--primary-color,#03a9f4)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
+          <!-- Goal line -->
+          ${goalY != null ? `
+            <line x1="${PAD.left}" y1="${goalY.toFixed(1)}" x2="${PAD.left + innerW}" y2="${goalY.toFixed(1)}"
+                  stroke="var(--success-color,#43a047)" stroke-width="1.5" stroke-dasharray="5,4" opacity="0.8"/>
+          ` : ""}
+          <!-- X-axis ticks -->
+          ${xTicks.map(t => {
+            const x = xScale(t).toFixed(1);
+            const d = new Date(t);
+            const h = d.getHours();
+            const label = h === 0 ? "12a" : h === 12 ? "12p" : h < 12 ? h + "a" : (h - 12) + "p";
+            return `
+              <line x1="${x}" y1="${PAD.top}" x2="${x}" y2="${PAD.top + innerH}" stroke="var(--divider-color,#e0e0e0)" stroke-width="0.5" opacity="0.5"/>
+              <text x="${x}" y="${H - 4}" text-anchor="middle" font-size="10" fill="var(--secondary-text-color,#727272)">${label}</text>
+            `;
+          }).join("")}
+          <!-- Border -->
+          <rect x="${PAD.left}" y="${PAD.top}" width="${innerW}" height="${innerH}" fill="none" stroke="var(--divider-color,#e0e0e0)" stroke-width="1"/>
+        </svg>
+      </div>
+    `;
+  }
+
+  _renderZonesCard(d) {
+    return `
+      <div class="status-card">
+        <div class="status-card-title"><ha-icon icon="mdi:home-thermometer"></ha-icon> Zones</div>
+        ${d.zones.map(z => `
+          <div class="zone-row ${z.is_active ? "zone-active" : ""}">
+            <span class="zone-indicator">${z.is_active ? "●" : "○"}</span>
+            <span class="zone-name">${z.name}</span>
+            <span class="zone-temp">${z.current_temp != null ? z.current_temp.toFixed(1) + "°" : "—"}</span>
+            ${z.is_occupied != null ? `<span class="zone-occ">${z.is_occupied ? "occupied" : "vacant"}</span>` : ""}
+          </div>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  _renderSystemCard(d) {
+    const f = d.features;
+    const rows = [
+      ["Learning", d.learning.enabled ? `${d.learning.events_recorded} events · ${d.learning.patterns_learned} patterns` : "Disabled"],
+      ["Presence", f.presence_home != null ? (f.presence_home ? "Home" : "Away") : "—"],
+      ["Outdoor", f.outdoor_temp != null ? f.outdoor_temp.toFixed(1) + "°" : "—"],
+      ["TOU", f.tou_enabled ? (f.tou_rate || "on") : "Disabled"],
+      ["Pre-cond", f.precondition_enabled ? (f.precondition_active ? "Active" : "Standby") : "Disabled"],
+      ["Heat pump", f.heat_pump_detected ? "Yes" : "No"],
+    ];
+    return `
+      <div class="status-card">
+        <div class="status-card-title"><ha-icon icon="mdi:cog"></ha-icon> System</div>
+        <table class="sys-table">
+          ${rows.map(([label, val]) => `
+            <tr><td class="sys-label">${label}</td><td class="sys-val">${val}</td></tr>
+          `).join("")}
+        </table>
+      </div>
+    `;
+  }
+
+  _renderDebugCard(d) {
+    const exp = this._debugExpanded;
+    return `
+      <div class="debug-card">
+        <button class="debug-toggle" id="debugToggleBtn">
+          <ha-icon icon="mdi:${exp ? "chevron-down" : "chevron-right"}"></ha-icon>
+          Debug Info
+        </button>
+        ${exp ? `
+          <div class="debug-body">
+            <div class="debug-grid">
+              <div class="debug-section">
+                <div class="debug-section-title">Thermostat</div>
+                <div class="debug-row"><span>Entity</span><span class="debug-val mono">${d.thermostat_entity}</span></div>
+                <div class="debug-row"><span>T-stat reads</span><span class="debug-val">${d.thermostat_temp != null ? d.thermostat_temp.toFixed(1) + "°" : "—"}</span></div>
+                <div class="debug-row"><span>Setpoint sent</span><span class="debug-val">${d.thermostat_setpoint != null ? d.thermostat_setpoint + "°" : "—"}</span></div>
+                <div class="debug-row"><span>T-stat action</span><span class="debug-val">${d.thermostat_action || "—"}</span></div>
+              </div>
+              <div class="debug-section">
+                <div class="debug-section-title">Override</div>
+                <div class="debug-row"><span>Active</span><span class="debug-val">${d.override_active ? "Yes" : "No"}</span></div>
+                ${d.override_active ? `
+                  <div class="debug-row"><span>Target</span><span class="debug-val">${d.override_target_temp}°</span></div>
+                  <div class="debug-row"><span>Remaining</span><span class="debug-val">${d.override_remaining_minutes} min</span></div>
+                ` : ""}
+              </div>
+              <div class="debug-section">
+                <div class="debug-section-title">Schedule</div>
+                <div class="debug-row"><span>Enabled</span><span class="debug-val">${d.schedule_enabled ? "Yes" : "No"}</span></div>
+                ${d.current_entry ? `
+                  <div class="debug-row"><span>Entry</span><span class="debug-val">${d.current_entry.time_start}–${d.current_entry.time_end}</span></div>
+                  <div class="debug-row"><span>Entry goal</span><span class="debug-val">${d.current_entry.target_temp}°</span></div>
+                ` : `<div class="debug-row"><span>Entry</span><span class="debug-val">None</span></div>`}
+              </div>
+              <div class="debug-section">
+                <div class="debug-section-title">Config</div>
+                <div class="debug-row"><span>Temp range</span><span class="debug-val">${d.config.temp_min}° – ${d.config.temp_max}°</span></div>
+                <div class="debug-row"><span>Away temp</span><span class="debug-val">${d.config.away_temp}°</span></div>
+                <div class="debug-row"><span>Override dur.</span><span class="debug-val">${d.config.override_minutes} min</span></div>
+              </div>
+            </div>
+            <div class="debug-entities">
+              <div class="debug-section-title">Entity IDs</div>
+              <div class="debug-row"><span>Climate</span><span class="debug-val mono">${d.entity_ids.climate || "—"}</span></div>
+              <div class="debug-row"><span>Zone temp</span><span class="debug-val mono">${d.entity_ids.active_zone_temp || "—"}</span></div>
+            </div>
+          </div>
+        ` : ""}
+      </div>
+    `;
+  }
+
+  _fmt12(timeStr) {
+    const [h, m] = timeStr.split(":").map(Number);
+    const ampm = h >= 12 ? "PM" : "AM";
+    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    return `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
+  }
+
+  async _loadStatusData() {
+    if (this._statusLoading) return;
+    this._statusLoading = true;
+    this._render();
+    try {
+      this._diagData = await this._hass.callWS({ type: "gttc/get_diagnostics" });
+      // Fetch temperature history if we have the entity ID
+      const entityId = this._diagData.entity_ids && this._diagData.entity_ids.active_zone_temp;
+      if (entityId) {
+        try {
+          const start = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+          const histResult = await this._hass.callApi(
+            "GET",
+            `history/period/${start}?filter_entity_id=${entityId}&minimal_response=true&no_attributes=true`
+          );
+          this._historyData = (histResult && histResult[0]) ? histResult[0] : [];
+        } catch (histErr) {
+          console.warn("GTTC: Could not fetch history", histErr);
+          this._historyData = [];
+        }
+      } else {
+        this._historyData = [];
+      }
+    } catch (err) {
+      console.error("GTTC: Failed to load diagnostics", err);
+      this._diagData = null;
+      this._historyData = [];
+    } finally {
+      this._statusLoading = false;
+      this._render();
+    }
+  }
+
   // ── Styles ────────────────────────────────────────────────────────────────
 
   _styles() {
@@ -1525,6 +1883,124 @@ class GttcPanel extends HTMLElement {
         border-radius: 8px; font-family: monospace; font-size: 12px; resize: vertical;
         background: var(--bg); color: var(--primary-text); box-sizing: border-box;
       }
+
+      /* Main tab bar */
+      .main-tab-bar {
+        display: flex; gap: 4px; margin-bottom: 16px;
+        border-bottom: 2px solid var(--divider);
+        padding-bottom: 0;
+      }
+      .main-tab {
+        padding: 8px 20px; border: none; border-radius: 8px 8px 0 0;
+        background: transparent; color: var(--secondary-text); cursor: pointer;
+        font-size: 14px; font-weight: 500; transition: all 0.15s;
+        display: flex; align-items: center; gap: 6px;
+        margin-bottom: -2px; border-bottom: 2px solid transparent;
+      }
+      .main-tab ha-icon { --mdc-icon-size: 16px; }
+      .main-tab:hover { color: var(--primary); background: rgba(3,169,244,0.06); }
+      .main-tab.active { color: var(--primary); border-bottom-color: var(--primary); background: transparent; }
+
+      /* Status tab */
+      .status-tab { display: flex; flex-direction: column; gap: 16px; }
+      .status-loading { padding: 40px; text-align: center; color: var(--secondary-text); font-size: 15px; }
+
+      /* Stat cards */
+      .stat-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+      @media (max-width: 700px) { .stat-cards { grid-template-columns: repeat(2, 1fr); } }
+      .stat-card {
+        background: var(--card-bg); border-radius: 12px; border: 1px solid var(--divider);
+        padding: 14px 16px; display: flex; align-items: center; gap: 12px;
+      }
+      .stat-icon { color: var(--primary); flex-shrink: 0; }
+      .stat-icon ha-icon { --mdc-icon-size: 28px; }
+      .stat-icon.heating { color: #f57c00; }
+      .stat-icon.cooling { color: #0288d1; }
+      .stat-body { min-width: 0; }
+      .stat-label { font-size: 11px; color: var(--secondary-text); font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+      .stat-value { font-size: 22px; font-weight: 600; line-height: 1.1; }
+      .stat-value.heating { color: #f57c00; }
+      .stat-value.cooling { color: #0288d1; }
+      .stat-value-md { font-size: 18px; }
+      .stat-value-sm { font-size: 13px; font-weight: 500; }
+      .stat-sub { font-size: 11px; color: var(--secondary-text); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+      /* Chart */
+      .chart-card {
+        background: var(--card-bg); border-radius: 12px; border: 1px solid var(--divider);
+        padding: 16px;
+      }
+      .chart-title {
+        font-size: 14px; font-weight: 500; margin-bottom: 12px;
+        display: flex; align-items: center; gap: 12px; color: var(--primary-text);
+      }
+      .chart-legend { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--secondary-text); font-weight: 400; }
+      .legend-dot { width: 12px; height: 2px; display: inline-block; border-radius: 1px; }
+      .legend-dot.goal { background: var(--success-color, #43a047); }
+      .chart-empty { padding: 40px 0; text-align: center; color: var(--secondary-text); font-size: 13px; }
+      .temp-chart { width: 100%; height: auto; display: block; overflow: visible; }
+
+      /* Status row 2 (zones + system side by side) */
+      .status-row-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+      @media (max-width: 700px) { .status-row-2 { grid-template-columns: 1fr; } }
+
+      /* Status cards (zones / system) */
+      .status-card {
+        background: var(--card-bg); border-radius: 12px; border: 1px solid var(--divider);
+        padding: 14px 16px;
+      }
+      .status-card-title {
+        font-size: 13px; font-weight: 600; color: var(--secondary-text); text-transform: uppercase;
+        letter-spacing: 0.5px; margin-bottom: 10px; display: flex; align-items: center; gap: 6px;
+      }
+      .status-card-title ha-icon { --mdc-icon-size: 16px; }
+
+      /* Zone rows */
+      .zone-row {
+        display: flex; align-items: center; gap: 8px; padding: 6px 0;
+        border-bottom: 1px solid var(--divider); font-size: 14px;
+      }
+      .zone-row:last-child { border-bottom: none; }
+      .zone-row.zone-active .zone-name { font-weight: 600; }
+      .zone-indicator { font-size: 12px; color: var(--secondary-text); flex-shrink: 0; }
+      .zone-row.zone-active .zone-indicator { color: var(--primary); }
+      .zone-name { flex: 1; }
+      .zone-temp { font-weight: 600; font-size: 15px; }
+      .zone-occ { font-size: 11px; color: var(--secondary-text); background: var(--bg); padding: 1px 6px; border-radius: 8px; border: 1px solid var(--divider); }
+
+      /* System table */
+      .sys-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .sys-table tr { border-bottom: 1px solid var(--divider); }
+      .sys-table tr:last-child { border-bottom: none; }
+      .sys-label { padding: 5px 0; color: var(--secondary-text); width: 45%; }
+      .sys-val { padding: 5px 0; font-weight: 500; text-align: right; }
+
+      /* Debug card */
+      .debug-card {
+        background: var(--card-bg); border-radius: 12px; border: 1px solid var(--divider);
+        overflow: hidden;
+      }
+      .debug-toggle {
+        width: 100%; padding: 12px 16px; background: none; border: none; cursor: pointer;
+        color: var(--secondary-text); font-size: 13px; font-weight: 500; text-align: left;
+        display: flex; align-items: center; gap: 8px;
+      }
+      .debug-toggle:hover { background: var(--bg); color: var(--primary-text); }
+      .debug-toggle ha-icon { --mdc-icon-size: 18px; }
+      .debug-body { padding: 0 16px 16px; }
+      .debug-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; margin-bottom: 12px; }
+      @media (max-width: 700px) { .debug-grid { grid-template-columns: 1fr; } }
+      .debug-section { }
+      .debug-section-title { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: var(--secondary-text); margin-bottom: 6px; padding-bottom: 4px; border-bottom: 1px solid var(--divider); }
+      .debug-row { display: flex; justify-content: space-between; align-items: center; font-size: 12px; padding: 3px 0; gap: 8px; }
+      .debug-row span:first-child { color: var(--secondary-text); flex-shrink: 0; }
+      .debug-val { font-weight: 500; text-align: right; word-break: break-all; }
+      .debug-entities { border-top: 1px solid var(--divider); padding-top: 12px; }
+      .mono { font-family: monospace; font-size: 11px; }
+
+      /* Status footer */
+      .status-footer { display: flex; align-items: center; gap: 12px; padding-top: 4px; }
+      .status-updated { font-size: 12px; color: var(--secondary-text); }
 
       /* Responsive */
       @media (max-width: 600px) {
