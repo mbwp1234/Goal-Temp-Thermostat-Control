@@ -3,7 +3,7 @@
   "name": "Goal Temp Thermostat Control",
   "codeowners": ["@mbwp1234"],
   "config_flow": true,
-  "dependencies": [],
+  "dependencies": ["frontend", "http"],
   "documentation": "https://github.com/mbwp1234/Goal-Temp-Thermostat-Control",
   "homeassistant": "2024.1.0",
   "iot_class": "local_polling",

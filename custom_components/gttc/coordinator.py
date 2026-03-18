@@ -32,6 +32,7 @@ from .const import (
     DEFAULT_TEMP_MAX,
     DEFAULT_TEMP_MIN,
     DOMAIN,
+    LEARNING_TEMP_TOLERANCE,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
@@ -103,6 +104,12 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self._last_thermostat_temp: float | None = None
         self._initialized = False
         self._available = False
+
+        # Track repeated overrides of the same schedule entry so we can
+        # update the schedule when the user keeps fighting it.
+        self._override_schedule_key: str | None = None  # "time_start-time_end"
+        self._override_target_temp: float | None = None
+        self._override_repeat_count: int = 0
 
     @property
     def available(self) -> bool:
@@ -445,13 +452,21 @@ class GTTCCoordinator(DataUpdateCoordinator):
         old_temp = self.target_temp
         self.target_temp = temperature
 
-        # Set manual override
-        self.manual_override = ManualOverride(
-            target_temp=temperature,
-            started_at=datetime.now(timezone.utc).isoformat(),
-            duration_minutes=self.manual_override_minutes,
-            zone_id=self.zone_manager.active_zone_id,
-        )
+        # Track repeated overrides of the same schedule entry.
+        # When the user keeps fighting a schedule entry (override expires,
+        # they set it back), update the schedule entry directly so the
+        # override cycle stops.  Returns True if the schedule was updated.
+        schedule_updated = await self._track_schedule_override(temperature)
+
+        # Set manual override — but skip if we just updated the schedule
+        # to match, since there's nothing to override anymore.
+        if not schedule_updated:
+            self.manual_override = ManualOverride(
+                target_temp=temperature,
+                started_at=datetime.now(timezone.utc).isoformat(),
+                duration_minutes=self.manual_override_minutes,
+                zone_id=self.zone_manager.active_zone_id,
+            )
 
         # Record for learning
         if self.learning_enabled:
@@ -473,6 +488,84 @@ class GTTCCoordinator(DataUpdateCoordinator):
         await self.async_save()
 
         self.async_set_updated_data(self._build_state_dict())
+
+    async def _track_schedule_override(self, temperature: float) -> bool:
+        """Detect when the user repeatedly overrides the same schedule entry.
+
+        If the user keeps setting the same temperature while a schedule entry
+        is active (i.e. override expires → schedule resumes → user overrides
+        again), update the schedule entry to match after ``threshold`` repeats.
+        This breaks the frustrating override-expiry cycle.
+
+        Returns True if the schedule was updated (no override needed).
+        """
+        if not self.schedule_enabled:
+            return False
+
+        entry = self.scheduler.get_current_entry()
+        if entry is None:
+            self._override_schedule_key = None
+            self._override_repeat_count = 0
+            return False
+
+        entry_key = f"{entry.time_start}-{entry.time_end}"
+
+        # Same schedule block and similar override temperature?
+        if (
+            entry_key == self._override_schedule_key
+            and self._override_target_temp is not None
+            and abs(temperature - self._override_target_temp) <= LEARNING_TEMP_TOLERANCE
+        ):
+            self._override_repeat_count += 1
+        else:
+            # New schedule entry or different temperature — reset tracking
+            self._override_schedule_key = entry_key
+            self._override_target_temp = temperature
+            self._override_repeat_count = 1
+
+        threshold = max(2, self.learning.threshold if self.learning_enabled else 3)
+
+        if self._override_repeat_count >= threshold:
+            # User has overridden this entry enough times — adopt their preference
+            if abs(entry.target_temp - temperature) >= 1.0:
+                old_target = entry.target_temp
+                active_preset = self.scheduler.schedule.active_preset
+                if active_preset and active_preset in self.scheduler.presets:
+                    self._update_preset_learned_temp(
+                        active_preset,
+                        self._entry_midpoint_minutes(entry),
+                        temperature,
+                    )
+                else:
+                    entry.target_temp = temperature
+                _LOGGER.info(
+                    "Schedule entry %s updated from %.1f° to %.1f° "
+                    "after %d repeated overrides",
+                    entry_key,
+                    old_target,
+                    temperature,
+                    self._override_repeat_count,
+                )
+                # Cancel the override since the schedule now matches
+                self.manual_override = None
+                # Reset counter so we don't keep logging
+                self._override_repeat_count = 0
+                return True
+            # Reset counter so we don't keep logging
+            self._override_repeat_count = 0
+
+        return False
+
+    @staticmethod
+    def _entry_midpoint_minutes(entry: ScheduleEntry) -> int:
+        """Get the midpoint of a schedule entry in minutes since midnight."""
+        start = entry.start_time
+        end = entry.end_time
+        start_min = start.hour * 60 + start.minute
+        end_min = end.hour * 60 + end.minute
+        if end_min <= start_min:
+            end_min += 1440  # overnight
+        return (start_min + end_min) // 2 % 1440
 
     async def _apply_learned_entry(self, learned: dict[str, Any]) -> None:
         """Add a learned pattern to the schedule.
