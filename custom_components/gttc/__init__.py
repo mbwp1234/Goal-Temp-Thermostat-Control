@@ -7,6 +7,7 @@ from typing import Any
 
 import voluptuous as vol
 
+from homeassistant.components.http import StaticPathConfig
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.core import HomeAssistant, ServiceCall
@@ -67,7 +68,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     _register_services(hass)
 
     # Register WebSocket API and sidebar panel (idempotent)
-    _register_panel(hass)
+    await _async_register_panel(hass)
 
     # Listen for options updates
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -126,14 +127,14 @@ def _get_coordinator(
     return None
 
 
-def _register_panel(hass: HomeAssistant) -> None:
+async def _async_register_panel(hass: HomeAssistant) -> None:
     """Register the sidebar panel and WebSocket API (idempotent)."""
     # Register WebSocket commands
     async_register_api(hass)
 
     # Serve the frontend JS file
-    hass.http.register_static_path(
-        PANEL_URL, str(FRONTEND_DIR / "gttc-panel.js"), cache_headers=False
+    await hass.http.async_register_static_paths(
+        [StaticPathConfig(PANEL_URL, str(FRONTEND_DIR / "gttc-panel.js"), False)]
     )
 
     # Register the sidebar panel
