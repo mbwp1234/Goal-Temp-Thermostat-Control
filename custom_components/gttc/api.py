@@ -59,6 +59,15 @@ def async_register_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_undo_schedule)
     websocket_api.async_register_command(hass, ws_redo_schedule)
     websocket_api.async_register_command(hass, ws_get_diagnostics)
+    websocket_api.async_register_command(hass, ws_add_window_sensor)
+    websocket_api.async_register_command(hass, ws_remove_window_sensor)
+    websocket_api.async_register_command(hass, ws_list_window_sensors)
+    websocket_api.async_register_command(hass, ws_get_config)
+    websocket_api.async_register_command(hass, ws_set_config)
+    websocket_api.async_register_command(hass, ws_list_zones)
+    websocket_api.async_register_command(hass, ws_save_zone)
+    websocket_api.async_register_command(hass, ws_delete_zone)
+    websocket_api.async_register_command(hass, ws_set_active_zone)
 
 
 def _get_coordinator(hass: HomeAssistant, entry_id: str | None = None):
@@ -299,6 +308,7 @@ async def ws_get_status(
         ),
         "current_entry": current_entry.to_dict() if current_entry else None,
         "schedule_enabled": coordinator.schedule_enabled,
+        "windows_open": coordinator._are_windows_open(),
     }
     connection.send_result(msg["id"], result)
 
@@ -824,8 +834,383 @@ async def ws_get_diagnostics(
             "climate": climate_entity_id,
             "active_zone_temp": active_zone_temp_entity_id,
         },
+        "windows": {
+            "open": coordinator._are_windows_open(),
+            "sensors": list(coordinator.window_sensors),
+            "open_sensors": coordinator.get_open_window_sensors(),
+            "manual_override": coordinator.windows_open_override,
+        },
     }
     connection.send_result(msg["id"], result)
+
+
+# ── Window sensor management ──────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/add_window_sensor",
+        vol.Required("entity_id"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_add_window_sensor(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Add a binary sensor entity to the window sensor list."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    entity_id = msg["entity_id"]
+    if entity_id not in coordinator.window_sensors:
+        coordinator.window_sensors.append(entity_id)
+        await coordinator.async_save()
+    connection.send_result(
+        msg["id"],
+        {"success": True, "window_sensors": list(coordinator.window_sensors)},
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/remove_window_sensor",
+        vol.Required("entity_id"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_remove_window_sensor(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Remove a binary sensor entity from the window sensor list."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    entity_id = msg["entity_id"]
+    try:
+        coordinator.window_sensors.remove(entity_id)
+        await coordinator.async_save()
+    except ValueError:
+        pass  # Already not in the list
+    connection.send_result(
+        msg["id"],
+        {"success": True, "window_sensors": list(coordinator.window_sensors)},
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/list_window_sensors",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_list_window_sensors(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Return window sensors and their current open/closed state."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    sensors = []
+    for entity_id in coordinator.window_sensors:
+        state = hass.states.get(entity_id)
+        sensors.append({
+            "entity_id": entity_id,
+            "state": state.state if state else "unavailable",
+            "friendly_name": (
+                state.attributes.get("friendly_name", entity_id) if state else entity_id
+            ),
+            "is_open": state.state == "on" if state else False,
+        })
+
+    connection.send_result(
+        msg["id"],
+        {
+            "sensors": sensors,
+            "any_open": coordinator._are_windows_open(),
+            "manual_override": coordinator.windows_open_override,
+        },
+    )
+
+
+# ── Get / Set configuration ────────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/get_config",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_get_config(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Return the full live coordinator configuration."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    connection.send_result(
+        msg["id"],
+        {
+            "temp_min": coordinator.temp_min,
+            "temp_max": coordinator.temp_max,
+            "away_temp": coordinator.away_temp,
+            "manual_override_minutes": coordinator.manual_override_minutes,
+            "learning_enabled": coordinator.learning_enabled,
+            "learning_threshold": coordinator.learning.threshold,
+            "occupancy_enabled": coordinator.occupancy_enabled,
+            "presence_detection": coordinator.zone_manager.presence_mode,
+            "precondition_enabled": coordinator.precondition_enabled,
+            "tou_enabled": coordinator.tou_enabled,
+            "tou_provider": (
+                coordinator.tou_provider.name
+                if hasattr(coordinator.tou_provider, "name")
+                else "none"
+            ),
+            "outdoor_temp_sensor": coordinator.outdoor_temp_sensor or "",
+            "window_sensors": list(coordinator.window_sensors),
+            "windows_open_override": coordinator.windows_open_override,
+        },
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/set_config",
+        vol.Optional("entry_id"): str,
+        vol.Optional("temp_min"): vol.Coerce(float),
+        vol.Optional("temp_max"): vol.Coerce(float),
+        vol.Optional("away_temp"): vol.Coerce(float),
+        vol.Optional("manual_override_minutes"): vol.All(
+            vol.Coerce(int), vol.Range(min=15, max=480)
+        ),
+        vol.Optional("learning_enabled"): bool,
+        vol.Optional("learning_threshold"): vol.All(
+            vol.Coerce(int), vol.Range(min=2, max=10)
+        ),
+        vol.Optional("occupancy_enabled"): bool,
+        vol.Optional("presence_detection"): vol.In(
+            ["both", "occupancy_sensors", "person_entities"]
+        ),
+        vol.Optional("precondition_enabled"): bool,
+        vol.Optional("tou_enabled"): bool,
+        vol.Optional("tou_provider"): vol.In(["none", "dominion_virginia"]),
+        vol.Optional("outdoor_temp_sensor"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_config(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Update one or more coordinator configuration values."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    skip = {"type", "id", "entry_id"}
+    updates = {k: v for k, v in msg.items() if k not in skip}
+
+    # Cross-field validation
+    temp_min = float(updates.get("temp_min", coordinator.temp_min))
+    temp_max = float(updates.get("temp_max", coordinator.temp_max))
+    if temp_min >= temp_max:
+        connection.send_error(
+            msg["id"], "validation_error", "temp_min must be less than temp_max"
+        )
+        return
+
+    if "away_temp" in updates:
+        away = float(updates["away_temp"])
+        if not temp_min <= away <= temp_max:
+            connection.send_error(
+                msg["id"], "validation_error",
+                f"away_temp ({away}) must be within temp range ({temp_min}–{temp_max})",
+            )
+            return
+
+    await coordinator.async_update_config(updates)
+
+    # Persist applicable keys to config_entry.data
+    config_keys = {
+        "temp_min", "temp_max", "away_temp", "manual_override_minutes",
+        "learning_enabled", "learning_threshold", "occupancy_enabled",
+        "presence_detection", "outdoor_temp_sensor", "tou_enabled",
+        "tou_provider", "precondition_enabled",
+    }
+    entry_updates = {k: v for k, v in updates.items() if k in config_keys}
+    if entry_updates:
+        new_data = {**coordinator.config_entry.data, **entry_updates}
+        hass.config_entries.async_update_entry(coordinator.config_entry, data=new_data)
+
+    connection.send_result(msg["id"], {"success": True})
+
+
+# ── Zone management ────────────────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/list_zones",
+        vol.Optional("entry_id"): str,
+        vol.Optional("include_areas"): bool,
+    }
+)
+@websocket_api.async_response
+async def ws_list_zones(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Return all zones with full details, optionally including HA area discovery."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    active_id = coordinator.zone_manager.active_zone_id
+    zones = []
+    for zone in coordinator.zone_manager.zones.values():
+        zones.append({
+            "id": zone.id,
+            "name": zone.name,
+            "sensor_entities": zone.sensor_entities,
+            "occupancy_sensor_entities": zone.occupancy_sensor_entities,
+            "area_id": zone.area_id,
+            "floor_id": zone.floor_id,
+            "away_temp": zone.away_temp,
+            "occupancy_override": zone.occupancy_override,
+            "current_temp": zone.current_temp,
+            "is_occupied": zone.is_occupied,
+            "is_active": zone.id == active_id,
+        })
+
+    areas = []
+    if msg.get("include_areas"):
+        areas = await coordinator.zone_manager.discover_areas()
+
+    connection.send_result(
+        msg["id"],
+        {
+            "zones": zones,
+            "active_zone_id": active_id,
+            "areas": areas,
+        },
+    )
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/save_zone",
+        vol.Required("name"): str,
+        vol.Optional("entry_id"): str,
+        vol.Optional("zone_id"): str,
+        vol.Optional("sensor_entities"): [str],
+        vol.Optional("occupancy_sensor_entities"): [str],
+        vol.Optional("area_id"): vol.Any(str, None),
+        vol.Optional("floor_id"): vol.Any(str, None),
+        vol.Optional("away_temp"): vol.Any(vol.Coerce(float), None),
+        vol.Optional("occupancy_override"): bool,
+        vol.Optional("set_active"): bool,
+    }
+)
+@websocket_api.async_response
+async def ws_save_zone(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Create or update a zone (upsert by zone_id)."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    name = msg["name"].strip()
+    if not name:
+        connection.send_error(msg["id"], "invalid", "Zone name cannot be empty")
+        return
+
+    from .models import Zone
+    import uuid
+
+    zone_id = msg.get("zone_id") or str(uuid.uuid4())[:8]
+    zone = Zone(
+        id=zone_id,
+        name=name,
+        sensor_entities=msg.get("sensor_entities", []),
+        occupancy_sensor_entities=msg.get("occupancy_sensor_entities", []),
+        area_id=msg.get("area_id"),
+        floor_id=msg.get("floor_id"),
+        away_temp=msg.get("away_temp"),
+        occupancy_override=msg.get("occupancy_override", True),
+    )
+    coordinator.zone_manager.add_zone(zone)
+    if msg.get("set_active"):
+        coordinator.zone_manager.set_active_zone(zone_id)
+
+    await coordinator.async_save()
+    new_data = {**coordinator.config_entry.data, "zones": coordinator.zone_manager.save_zones()}
+    hass.config_entries.async_update_entry(coordinator.config_entry, data=new_data)
+
+    connection.send_result(msg["id"], {"success": True, "zone_id": zone_id})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/delete_zone",
+        vol.Required("zone_id"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_delete_zone(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Delete a zone by ID."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    if not coordinator.zone_manager.remove_zone(msg["zone_id"]):
+        connection.send_error(msg["id"], "not_found", f"Zone '{msg['zone_id']}' not found")
+        return
+
+    await coordinator.async_save()
+    new_data = {**coordinator.config_entry.data, "zones": coordinator.zone_manager.save_zones()}
+    hass.config_entries.async_update_entry(coordinator.config_entry, data=new_data)
+
+    connection.send_result(msg["id"], {"success": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/set_active_zone",
+        vol.Required("zone_id"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_active_zone(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Set the active zone for temperature control."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    if not coordinator.zone_manager.set_active_zone(msg["zone_id"]):
+        connection.send_error(msg["id"], "not_found", f"Zone '{msg['zone_id']}' not found")
+        return
+
+    await coordinator.async_save()
+    connection.send_result(msg["id"], {"success": True})
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────

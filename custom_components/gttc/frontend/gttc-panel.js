@@ -94,6 +94,15 @@ class GttcPanel extends HTMLElement {
     this._statusLoading = false;
     this._debugExpanded = false;
     this._statusError = null;
+    // Settings tab
+    this._settingsData = null;
+    this._settingsLoading = false;
+    this._settingsError = null;
+    this._toast = null;
+    this._toastTimer = null;
+    // Zone management
+    this._editingZoneId = null;
+    this._zoneFormData = null;
   }
 
   set hass(hass) {
@@ -182,7 +191,10 @@ class GttcPanel extends HTMLElement {
               ${this._renderWeekOverview()}
               ${this._renderDayDetail()}
             </div>
-          ` : this._renderStatusTab()}
+          ` : this._activeMainTab === "status"
+              ? this._renderStatusTab()
+              : this._renderSettingsTab()
+          }
         </div>
 
         ${this._editingEntry ? this._renderEditModal() : ""}
@@ -191,6 +203,7 @@ class GttcPanel extends HTMLElement {
         ${this._showPresetModal ? this._renderPresetModal() : ""}
         ${this._showExportModal ? this._renderExportModal() : ""}
         ${this._showImportModal ? this._renderImportModal() : ""}
+        ${this._toast ? this._renderToast() : ""}
       </div>
     `;
     this._attachListeners();
@@ -209,6 +222,9 @@ class GttcPanel extends HTMLElement {
       parts.push(`<span class="status-item override">Override: ${st.override_remaining}m
         <button class="btn-cancel-override" id="cancelOverrideBtn" title="Cancel Override">\u2715</button>
       </span>`);
+    }
+    if (st.windows_open) {
+      parts.push(`<span class="status-item windows-open"><ha-icon icon="mdi:window-open-variant"></ha-icon> Windows open</span>`);
     }
     return `<div class="status-bar">${parts.join("")}</div>`;
   }
@@ -637,8 +653,15 @@ class GttcPanel extends HTMLElement {
         const tab = btn.dataset.mainTab;
         if (tab === this._activeMainTab) return;
         this._activeMainTab = tab;
+        // Reset zone edit state when leaving settings
+        if (tab !== "settings") {
+          this._editingZoneId = null;
+          this._zoneFormData = null;
+        }
         if (tab === "status") {
           this._loadStatusData();
+        } else if (tab === "settings") {
+          this._loadSettingsData();
         } else {
           this._render();
         }
@@ -651,6 +674,14 @@ class GttcPanel extends HTMLElement {
       this._debugExpanded = !this._debugExpanded;
       this._render();
     });
+
+    // "Manage in Settings" link on the Status window card
+    this._addClick("goToWindowSettings", () => {
+      this._activeMainTab = "settings";
+      this._loadSettingsData();
+    });
+
+    this._attachSettingsListeners();
 
     // Day tabs
     root.querySelectorAll(".day-tab").forEach(btn => {
@@ -1344,6 +1375,9 @@ class GttcPanel extends HTMLElement {
         <button class="main-tab ${this._activeMainTab === "status" ? "active" : ""}" data-main-tab="status">
           <ha-icon icon="mdi:chart-line"></ha-icon> Status
         </button>
+        <button class="main-tab ${this._activeMainTab === "settings" ? "active" : ""}" data-main-tab="settings">
+          <ha-icon icon="mdi:cog"></ha-icon> Settings
+        </button>
       </div>
     `;
   }
@@ -1375,6 +1409,7 @@ class GttcPanel extends HTMLElement {
           ${this._renderZonesCard(d)}
           ${this._renderSystemCard(d)}
         </div>
+        ${this._renderWindowCard(d)}
         ${this._renderDebugCard(d)}
         <div class="status-footer">
           <button class="btn btn-outline" id="statusRefreshBtn">
@@ -1626,6 +1661,766 @@ class GttcPanel extends HTMLElement {
             </div>
           </div>
         ` : ""}
+      </div>
+    `;
+  }
+
+  // ── Settings tab ──────────────────────────────────────────────────────────
+
+  async _loadSettingsData() {
+    if (this._settingsLoading) return;
+    this._settingsLoading = true;
+    this._render();
+    try {
+      this._settingsError = null;
+      const [cfg, zonesResult] = await Promise.all([
+        this._hass.callWS({ type: "gttc/get_config" }),
+        this._hass.callWS({ type: "gttc/list_zones" }),
+      ]);
+      this._settingsData = { ...cfg, zones: zonesResult.zones || [] };
+    } catch (err) {
+      this._settingsData = null;
+      this._settingsError = err.message || err.code || String(err);
+    } finally {
+      this._settingsLoading = false;
+      this._render();
+    }
+  }
+
+  _showToast(message, type = "success") {
+    if (this._toastTimer) clearTimeout(this._toastTimer);
+    this._toast = { message, type };
+    this._render();
+    this._toastTimer = setTimeout(() => {
+      this._toast = null;
+      this._toastTimer = null;
+      this._render();
+    }, 3000);
+  }
+
+  _renderToast() {
+    const { message, type } = this._toast;
+    return `<div class="toast toast-${type}">${message}</div>`;
+  }
+
+  _renderSettingsTab() {
+    if (this._settingsLoading) {
+      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading...</div>`;
+    }
+    if (!this._settingsData) {
+      return `
+        <div class="status-error-box">
+          <div class="status-error-msg">
+            <ha-icon icon="mdi:alert-circle-outline"></ha-icon>
+            ${this._settingsError
+              ? `Failed to load: <code>${this._settingsError}</code>`
+              : "No config data available."}
+          </div>
+          <button class="btn btn-outline" id="settingsRetryBtn">Retry</button>
+        </div>`;
+    }
+    const d = this._settingsData;
+    return `
+      <div class="settings-tab">
+        <div class="settings-sections">
+          ${this._renderSettingsTemperatureCard(d)}
+          ${this._renderSettingsLearningCard(d)}
+          ${this._renderSettingsOccupancyCard(d)}
+          ${this._renderSettingsEnergyCard(d)}
+          ${this._renderSettingsWindowsCard(d)}
+          ${this._renderSettingsZonesCard(d)}
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSettingsTemperatureCard(d) {
+    return `
+      <div class="settings-card">
+        <div class="settings-card-title">
+          <ha-icon icon="mdi:thermometer-lines"></ha-icon> Temperature &amp; Override
+        </div>
+        <div class="settings-card-body">
+          <div class="settings-row">
+            <div class="settings-field">
+              <label>Minimum temperature (°F)</label>
+              <input type="number" id="cfg-temp-min" value="${d.temp_min}" min="32" max="99" step="0.5" />
+            </div>
+            <div class="settings-field">
+              <label>Maximum temperature (°F)</label>
+              <input type="number" id="cfg-temp-max" value="${d.temp_max}" min="33" max="100" step="0.5" />
+            </div>
+            <div class="settings-field">
+              <label>Away temperature (°F)</label>
+              <input type="number" id="cfg-away-temp" value="${d.away_temp}" min="32" max="100" step="0.5" />
+              <div class="settings-hint">Must be within the min/max range.</div>
+            </div>
+          </div>
+          <div class="settings-field">
+            <label>Manual override duration — <strong id="cfg-override-label">${d.manual_override_minutes} min</strong></label>
+            <input type="range" id="cfg-override-range" min="15" max="480" step="15" value="${d.manual_override_minutes}" />
+          </div>
+        </div>
+        <div class="settings-card-footer">
+          <button class="btn btn-primary" id="saveTemperatureBtn">Save</button>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSettingsLearningCard(d) {
+    return `
+      <div class="settings-card">
+        <div class="settings-card-title">
+          <ha-icon icon="mdi:brain"></ha-icon> Learning
+        </div>
+        <div class="settings-card-body">
+          <div class="settings-field settings-field-toggle">
+            <div>
+              <label>Enable learning engine</label>
+              <div class="settings-hint">Automatically adapts the schedule based on repeated manual overrides.</div>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="cfg-learning-enabled" ${d.learning_enabled ? "checked" : ""} />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="settings-field ${d.learning_enabled ? "" : "settings-field-disabled"}">
+            <label>Threshold — <strong id="cfg-learning-label">${d.learning_threshold}</strong> override${d.learning_threshold !== 1 ? "s" : ""} before schedule adapts</label>
+            <input type="range" id="cfg-learning-range" min="2" max="10" step="1" value="${d.learning_threshold}" ${d.learning_enabled ? "" : "disabled"} />
+          </div>
+        </div>
+        <div class="settings-card-footer">
+          <button class="btn btn-primary" id="saveLearningBtn">Save</button>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSettingsOccupancyCard(d) {
+    return `
+      <div class="settings-card">
+        <div class="settings-card-title">
+          <ha-icon icon="mdi:account-check"></ha-icon> Occupancy
+        </div>
+        <div class="settings-card-body">
+          <div class="settings-field settings-field-toggle">
+            <div>
+              <label>Enable occupancy-based control</label>
+              <div class="settings-hint">Sets away temperature when nobody is home.</div>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="cfg-occupancy-enabled" ${d.occupancy_enabled ? "checked" : ""} />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="settings-field ${d.occupancy_enabled ? "" : "settings-field-disabled"}">
+            <label>Presence detection mode</label>
+            <select id="cfg-presence-detection" ${d.occupancy_enabled ? "" : "disabled"}>
+              <option value="both" ${d.presence_detection === "both" ? "selected" : ""}>Person entities + Occupancy sensors (Recommended)</option>
+              <option value="person_entities" ${d.presence_detection === "person_entities" ? "selected" : ""}>Person entities only</option>
+              <option value="occupancy_sensors" ${d.presence_detection === "occupancy_sensors" ? "selected" : ""}>Occupancy sensors only</option>
+            </select>
+          </div>
+        </div>
+        <div class="settings-card-footer">
+          <button class="btn btn-primary" id="saveOccupancyBtn">Save</button>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSettingsEnergyCard(d) {
+    return `
+      <div class="settings-card">
+        <div class="settings-card-title">
+          <ha-icon icon="mdi:lightning-bolt-circle"></ha-icon> Energy &amp; Efficiency
+        </div>
+        <div class="settings-card-body">
+          <div class="settings-field settings-field-toggle">
+            <div>
+              <label>Enable pre-conditioning</label>
+              <div class="settings-hint">Starts ramping toward the next schedule entry before it begins.</div>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="cfg-precondition-enabled" ${d.precondition_enabled ? "checked" : ""} />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="settings-field settings-field-toggle">
+            <div>
+              <label>Enable TOU rate optimization</label>
+              <div class="settings-hint">Adjusts setpoint during on-peak electricity hours to reduce cost.</div>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="cfg-tou-enabled" ${d.tou_enabled ? "checked" : ""} />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="settings-field ${d.tou_enabled ? "" : "settings-field-disabled"}">
+            <label>TOU provider</label>
+            <select id="cfg-tou-provider" ${d.tou_enabled ? "" : "disabled"}>
+              <option value="none" ${d.tou_provider === "none" ? "selected" : ""}>None (disabled)</option>
+              <option value="dominion_virginia" ${d.tou_provider === "dominion_virginia" ? "selected" : ""}>Dominion Energy Virginia</option>
+            </select>
+          </div>
+          <div class="settings-field">
+            <label>Outdoor temperature sensor</label>
+            <input type="text" id="cfg-outdoor-sensor" value="${d.outdoor_temp_sensor || ""}"
+              placeholder="sensor.openweathermap_temperature" spellcheck="false" autocomplete="off" />
+            <div class="settings-hint">Used for heat pump setback optimization. Leave blank to disable.</div>
+          </div>
+        </div>
+        <div class="settings-card-footer">
+          <button class="btn btn-primary" id="saveEnergyBtn">Save</button>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSettingsWindowsCard(d) {
+    const sensors = d.window_sensors || [];
+    const openSensors = [];
+    // We don't have live sensor states in settings data; Status tab shows live state
+    return `
+      <div class="settings-card win-card">
+        <div class="settings-card-title">
+          <ha-icon icon="mdi:window-open-variant"></ha-icon> Window Sensors
+        </div>
+        <div class="settings-card-body">
+          <div class="settings-field settings-field-toggle">
+            <div>
+              <label>Manually suspend thermostat</label>
+              <div class="settings-hint">Pauses heating/cooling without needing a physical sensor.</div>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="winManualChk" ${d.windows_open_override ? "checked" : ""} />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="settings-field">
+            <label>Window / door contact sensors</label>
+            <div class="win-sensor-list">
+              ${sensors.length === 0
+                ? `<div class="win-empty">No sensors added yet.</div>`
+                : sensors.map(entityId => `
+                    <div class="win-sensor-row">
+                      <ha-icon icon="mdi:window-closed"></ha-icon>
+                      <span class="win-sensor-id">${entityId}</span>
+                      <button class="win-remove-btn" data-sensor="${entityId}" title="Remove">
+                        <ha-icon icon="mdi:close"></ha-icon>
+                      </button>
+                    </div>
+                  `).join("")}
+            </div>
+            <div class="win-add-row">
+              <input class="win-input" id="winSensorInput" type="text"
+                placeholder="binary_sensor.bedroom_window" spellcheck="false" autocomplete="off" />
+              <button class="btn btn-sm" id="winAddBtn">Add Sensor</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSettingsZonesCard(d) {
+    const zones = d.zones || [];
+    if (this._editingZoneId) {
+      return this._renderZoneForm(zones);
+    }
+    return `
+      <div class="settings-card">
+        <div class="settings-card-title">
+          <ha-icon icon="mdi:map-marker-radius"></ha-icon> Zones
+        </div>
+        <div class="settings-card-body">
+          ${zones.length === 0
+            ? `<div class="settings-hint">No zones configured yet. Add a zone or discover from HA areas.</div>`
+            : `<div class="zone-list">
+                ${zones.map(z => `
+                  <div class="zone-row ${z.is_active ? "zone-active" : ""}">
+                    <div class="zone-info">
+                      <div class="zone-name">
+                        ${z.is_active ? `<ha-icon icon="mdi:star" class="zone-active-icon"></ha-icon>` : ""}
+                        ${z.name}
+                      </div>
+                      <div class="zone-meta">
+                        ${z.sensor_entities.length} temp sensor${z.sensor_entities.length !== 1 ? "s" : ""}
+                        ${z.occupancy_sensor_entities.length > 0
+                          ? ` &middot; ${z.occupancy_sensor_entities.length} occupancy`
+                          : ""}
+                        ${z.current_temp != null ? ` &middot; ${z.current_temp.toFixed(1)}&deg;` : ""}
+                        ${z.away_temp != null ? ` &middot; away ${z.away_temp}&deg;` : ""}
+                      </div>
+                    </div>
+                    <div class="zone-actions">
+                      ${!z.is_active
+                        ? `<button class="btn btn-sm" data-zone-activate="${z.id}">Set Active</button>`
+                        : ""}
+                      <button class="btn btn-sm btn-icon" data-zone-edit="${z.id}" title="Edit zone">
+                        <ha-icon icon="mdi:pencil"></ha-icon>
+                      </button>
+                      <button class="btn btn-sm btn-icon btn-danger" data-zone-delete="${z.id}" title="Delete zone">
+                        <ha-icon icon="mdi:delete"></ha-icon>
+                      </button>
+                    </div>
+                  </div>
+                `).join("")}
+              </div>`}
+        </div>
+        <div class="settings-card-footer zone-card-footer">
+          <button class="btn btn-outline" id="discoverAreasBtn">
+            <ha-icon icon="mdi:magnify"></ha-icon> Discover HA Areas
+          </button>
+          <button class="btn btn-primary" id="addZoneBtn">
+            <ha-icon icon="mdi:plus"></ha-icon> Add Zone
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderZoneForm(zones) {
+    const isNew = this._editingZoneId === "new";
+    const existing = isNew ? null : zones.find(z => z.id === this._editingZoneId);
+    const fd = this._zoneFormData || {};
+    const name = fd.name !== undefined ? fd.name : (existing?.name || "");
+    const sensors = fd.sensor_entities !== undefined ? fd.sensor_entities : (existing?.sensor_entities || []);
+    const occSensors = fd.occupancy_sensor_entities !== undefined
+      ? fd.occupancy_sensor_entities
+      : (existing?.occupancy_sensor_entities || []);
+    const awayTemp = fd.away_temp !== undefined ? fd.away_temp : (existing?.away_temp ?? "");
+
+    return `
+      <div class="settings-card">
+        <div class="settings-card-title">
+          <ha-icon icon="mdi:map-marker-radius"></ha-icon>
+          ${isNew ? "Add Zone" : `Edit Zone: ${existing?.name || ""}`}
+        </div>
+        <div class="settings-card-body">
+          <div class="settings-field">
+            <label>Zone name</label>
+            <input type="text" id="zone-form-name" value="${name}" placeholder="Living Room" />
+          </div>
+          <div class="settings-field">
+            <label>Temperature sensors</label>
+            <div class="win-sensor-list">
+              ${sensors.length === 0
+                ? `<div class="win-empty">No sensors added yet.</div>`
+                : sensors.map(s => `
+                    <div class="win-sensor-row">
+                      <ha-icon icon="mdi:thermometer"></ha-icon>
+                      <span class="win-sensor-id">${s}</span>
+                      <button class="zone-remove-temp-sensor win-remove-btn" data-sensor="${s}" title="Remove">
+                        <ha-icon icon="mdi:close"></ha-icon>
+                      </button>
+                    </div>
+                  `).join("")}
+            </div>
+            <div class="win-add-row">
+              <input type="text" id="zone-temp-sensor-input" class="win-input"
+                placeholder="sensor.living_room_temp" spellcheck="false" autocomplete="off" />
+              <button class="btn btn-sm" id="zone-add-temp-sensor">Add</button>
+            </div>
+          </div>
+          <div class="settings-field">
+            <label>Occupancy sensors <span class="settings-hint-inline">(optional)</span></label>
+            <div class="win-sensor-list">
+              ${occSensors.length === 0
+                ? `<div class="win-empty">None added.</div>`
+                : occSensors.map(s => `
+                    <div class="win-sensor-row">
+                      <ha-icon icon="mdi:motion-sensor"></ha-icon>
+                      <span class="win-sensor-id">${s}</span>
+                      <button class="zone-remove-occ-sensor win-remove-btn" data-sensor="${s}" title="Remove">
+                        <ha-icon icon="mdi:close"></ha-icon>
+                      </button>
+                    </div>
+                  `).join("")}
+            </div>
+            <div class="win-add-row">
+              <input type="text" id="zone-occ-sensor-input" class="win-input"
+                placeholder="binary_sensor.living_room_motion" spellcheck="false" autocomplete="off" />
+              <button class="btn btn-sm" id="zone-add-occ-sensor">Add</button>
+            </div>
+          </div>
+          <div class="settings-field">
+            <label>Away temperature override (°F) <span class="settings-hint-inline">(optional)</span></label>
+            <input type="number" id="zone-form-away-temp" value="${awayTemp}"
+              min="32" max="100" step="0.5" placeholder="Uses global away temp if blank" />
+            <div class="settings-hint">Leave blank to use the global away temperature.</div>
+          </div>
+        </div>
+        <div class="settings-card-footer">
+          <button class="btn btn-outline" id="cancelZoneBtn">Cancel</button>
+          <button class="btn btn-primary" id="saveZoneBtn">${isNew ? "Create Zone" : "Save Changes"}</button>
+        </div>
+      </div>
+    `;
+  }
+
+  _attachSettingsListeners() {
+    const root = this.shadowRoot;
+
+    this._addClick("settingsRetryBtn", () => this._loadSettingsData());
+
+    // Temperature section
+    const overrideRange = root.getElementById("cfg-override-range");
+    const overrideLabel = root.getElementById("cfg-override-label");
+    if (overrideRange && overrideLabel) {
+      overrideRange.addEventListener("input", () => {
+        overrideLabel.textContent = overrideRange.value + " min";
+      });
+    }
+    this._addClick("saveTemperatureBtn", async () => {
+      const tempMin = parseFloat(root.getElementById("cfg-temp-min")?.value);
+      const tempMax = parseFloat(root.getElementById("cfg-temp-max")?.value);
+      const awayTemp = parseFloat(root.getElementById("cfg-away-temp")?.value);
+      const overrideMins = parseInt(root.getElementById("cfg-override-range")?.value);
+      if (isNaN(tempMin) || isNaN(tempMax) || isNaN(awayTemp) || isNaN(overrideMins)) return;
+      if (tempMin >= tempMax) {
+        this._showToast("Min temperature must be less than max.", "error"); return;
+      }
+      if (awayTemp < tempMin || awayTemp > tempMax) {
+        this._showToast("Away temperature must be within min/max range.", "error"); return;
+      }
+      try {
+        await this._hass.callWS({ type: "gttc/set_config",
+          temp_min: tempMin, temp_max: tempMax, away_temp: awayTemp,
+          manual_override_minutes: overrideMins });
+        this._settingsData = { ...this._settingsData,
+          temp_min: tempMin, temp_max: tempMax, away_temp: awayTemp,
+          manual_override_minutes: overrideMins };
+        this._showToast("Temperature settings saved.");
+      } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
+    });
+
+    // Learning section
+    const learningRange = root.getElementById("cfg-learning-range");
+    const learningLabel = root.getElementById("cfg-learning-label");
+    if (learningRange && learningLabel) {
+      learningRange.addEventListener("input", () => {
+        const v = parseInt(learningRange.value);
+        learningLabel.textContent = String(v);
+        // update the suffix text — easier to just update the label
+      });
+    }
+    const learningChk = root.getElementById("cfg-learning-enabled");
+    if (learningChk) {
+      learningChk.addEventListener("change", () => {
+        const field = root.getElementById("cfg-learning-range")?.closest(".settings-field");
+        if (field) field.classList.toggle("settings-field-disabled", !learningChk.checked);
+        if (learningRange) learningRange.disabled = !learningChk.checked;
+      });
+    }
+    this._addClick("saveLearningBtn", async () => {
+      const enabled = root.getElementById("cfg-learning-enabled")?.checked ?? true;
+      const threshold = parseInt(root.getElementById("cfg-learning-range")?.value);
+      if (isNaN(threshold)) return;
+      try {
+        await this._hass.callWS({ type: "gttc/set_config",
+          learning_enabled: enabled, learning_threshold: threshold });
+        this._settingsData = { ...this._settingsData,
+          learning_enabled: enabled, learning_threshold: threshold };
+        this._showToast("Learning settings saved.");
+      } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
+    });
+
+    // Occupancy section
+    const occChk = root.getElementById("cfg-occupancy-enabled");
+    if (occChk) {
+      occChk.addEventListener("change", () => {
+        const presenceField = root.getElementById("cfg-presence-detection");
+        if (presenceField) {
+          presenceField.disabled = !occChk.checked;
+          presenceField.closest(".settings-field")?.classList.toggle("settings-field-disabled", !occChk.checked);
+        }
+      });
+    }
+    this._addClick("saveOccupancyBtn", async () => {
+      const enabled = root.getElementById("cfg-occupancy-enabled")?.checked ?? false;
+      const mode = root.getElementById("cfg-presence-detection")?.value || "both";
+      try {
+        await this._hass.callWS({ type: "gttc/set_config",
+          occupancy_enabled: enabled, presence_detection: mode });
+        this._settingsData = { ...this._settingsData,
+          occupancy_enabled: enabled, presence_detection: mode };
+        this._showToast("Occupancy settings saved.");
+      } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
+    });
+
+    // Energy section
+    const touChk = root.getElementById("cfg-tou-enabled");
+    if (touChk) {
+      touChk.addEventListener("change", () => {
+        const providerField = root.getElementById("cfg-tou-provider");
+        if (providerField) {
+          providerField.disabled = !touChk.checked;
+          providerField.closest(".settings-field")?.classList.toggle("settings-field-disabled", !touChk.checked);
+        }
+      });
+    }
+    this._addClick("saveEnergyBtn", async () => {
+      const precondition = root.getElementById("cfg-precondition-enabled")?.checked ?? true;
+      const touEnabled = root.getElementById("cfg-tou-enabled")?.checked ?? false;
+      const touProvider = root.getElementById("cfg-tou-provider")?.value || "none";
+      const outdoorSensor = root.getElementById("cfg-outdoor-sensor")?.value.trim() || "";
+      try {
+        await this._hass.callWS({ type: "gttc/set_config",
+          precondition_enabled: precondition, tou_enabled: touEnabled,
+          tou_provider: touProvider, outdoor_temp_sensor: outdoorSensor });
+        this._settingsData = { ...this._settingsData,
+          precondition_enabled: precondition, tou_enabled: touEnabled,
+          tou_provider: touProvider, outdoor_temp_sensor: outdoorSensor };
+        this._showToast("Energy settings saved.");
+      } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
+    });
+
+    // Windows section
+    this._addClick("winAddBtn", async () => {
+      const input = root.getElementById("winSensorInput");
+      const entityId = input ? input.value.trim() : "";
+      if (!entityId) return;
+      try {
+        await this._hass.callWS({ type: "gttc/add_window_sensor", entity_id: entityId });
+        await this._loadSettingsData();
+        this._showToast("Sensor added.");
+      } catch (err) { this._showToast(err.message || "Failed to add sensor.", "error"); }
+    });
+    root.querySelectorAll(".win-remove-btn").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const entityId = btn.dataset.sensor;
+        if (!entityId) return;
+        try {
+          await this._hass.callWS({ type: "gttc/remove_window_sensor", entity_id: entityId });
+          await this._loadSettingsData();
+          this._showToast("Sensor removed.");
+        } catch (err) { this._showToast(err.message || "Failed to remove sensor.", "error"); }
+      });
+    });
+    const winChk = root.getElementById("winManualChk");
+    if (winChk) {
+      winChk.addEventListener("change", async () => {
+        try {
+          await this._hass.callService("switch", winChk.checked ? "turn_on" : "turn_off", {
+            entity_id: "switch.gttc_windows_open",
+          });
+          if (this._settingsData) {
+            this._settingsData = { ...this._settingsData, windows_open_override: winChk.checked };
+          }
+          this._showToast(winChk.checked ? "Thermostat suspended." : "Suspension lifted.");
+        } catch (err) { this._showToast(err.message || "Failed.", "error"); }
+      });
+    }
+
+    // ── Zones section ──────────────────────────────────────────────────────
+    this._addClick("addZoneBtn", () => {
+      this._editingZoneId = "new";
+      this._zoneFormData = { name: "", sensor_entities: [], occupancy_sensor_entities: [], away_temp: "" };
+      this._render();
+    });
+
+    this._addClick("discoverAreasBtn", async () => {
+      try {
+        const result = await this._hass.callWS({ type: "gttc/list_zones", include_areas: true });
+        const areas = result.areas || [];
+        if (areas.length === 0) {
+          this._showToast("No HA areas found with temperature sensors.", "error");
+          return;
+        }
+        const existingAreaIds = new Set((this._settingsData?.zones || []).map(z => z.area_id).filter(Boolean));
+        let added = 0;
+        for (const area of areas) {
+          if (existingAreaIds.has(area.area_id)) continue;
+          await this._hass.callWS({
+            type: "gttc/save_zone",
+            name: area.name,
+            sensor_entities: area.temp_sensors,
+            occupancy_sensor_entities: area.occupancy_sensors,
+            area_id: area.area_id,
+            floor_id: area.floor_id || null,
+          });
+          added++;
+        }
+        if (added > 0) {
+          await this._loadSettingsData();
+          this._showToast(`${added} zone${added !== 1 ? "s" : ""} discovered and added.`);
+        } else {
+          this._showToast("All discovered areas are already configured as zones.");
+        }
+      } catch (err) { this._showToast(err.message || "Failed to discover areas.", "error"); }
+    });
+
+    root.querySelectorAll("[data-zone-edit]").forEach(btn => {
+      btn.addEventListener("click", () => {
+        this._editingZoneId = btn.dataset.zoneEdit;
+        this._zoneFormData = null;
+        this._render();
+      });
+    });
+
+    root.querySelectorAll("[data-zone-delete]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const zoneId = btn.dataset.zoneDelete;
+        const zone = (this._settingsData?.zones || []).find(z => z.id === zoneId);
+        if (!confirm(`Delete zone "${zone?.name || zoneId}"?`)) return;
+        try {
+          await this._hass.callWS({ type: "gttc/delete_zone", zone_id: zoneId });
+          await this._loadSettingsData();
+          this._showToast("Zone deleted.");
+        } catch (err) { this._showToast(err.message || "Failed to delete zone.", "error"); }
+      });
+    });
+
+    root.querySelectorAll("[data-zone-activate]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const zoneId = btn.dataset.zoneActivate;
+        try {
+          await this._hass.callWS({ type: "gttc/set_active_zone", zone_id: zoneId });
+          if (this._settingsData?.zones) {
+            this._settingsData = {
+              ...this._settingsData,
+              zones: this._settingsData.zones.map(z => ({ ...z, is_active: z.id === zoneId })),
+            };
+          }
+          this._render();
+          this._showToast("Active zone updated.");
+        } catch (err) { this._showToast(err.message || "Failed.", "error"); }
+      });
+    });
+
+    // Zone form interactions
+    this._addClick("cancelZoneBtn", () => {
+      this._editingZoneId = null;
+      this._zoneFormData = null;
+      this._render();
+    });
+
+    this._addClick("zone-add-temp-sensor", () => {
+      const input = root.getElementById("zone-temp-sensor-input");
+      const val = input?.value.trim();
+      if (!val) return;
+      this._syncZoneFormFromDOM();
+      if (!this._zoneFormData.sensor_entities.includes(val)) {
+        this._zoneFormData.sensor_entities = [...this._zoneFormData.sensor_entities, val];
+      }
+      this._render();
+    });
+
+    root.querySelectorAll(".zone-remove-temp-sensor").forEach(btn => {
+      btn.addEventListener("click", () => {
+        this._syncZoneFormFromDOM();
+        this._zoneFormData.sensor_entities = this._zoneFormData.sensor_entities.filter(
+          s => s !== btn.dataset.sensor
+        );
+        this._render();
+      });
+    });
+
+    this._addClick("zone-add-occ-sensor", () => {
+      const input = root.getElementById("zone-occ-sensor-input");
+      const val = input?.value.trim();
+      if (!val) return;
+      this._syncZoneFormFromDOM();
+      if (!this._zoneFormData.occupancy_sensor_entities.includes(val)) {
+        this._zoneFormData.occupancy_sensor_entities = [...this._zoneFormData.occupancy_sensor_entities, val];
+      }
+      this._render();
+    });
+
+    root.querySelectorAll(".zone-remove-occ-sensor").forEach(btn => {
+      btn.addEventListener("click", () => {
+        this._syncZoneFormFromDOM();
+        this._zoneFormData.occupancy_sensor_entities = this._zoneFormData.occupancy_sensor_entities.filter(
+          s => s !== btn.dataset.sensor
+        );
+        this._render();
+      });
+    });
+
+    this._addClick("saveZoneBtn", async () => {
+      this._syncZoneFormFromDOM();
+      const name = this._zoneFormData?.name?.trim();
+      if (!name) { this._showToast("Zone name is required.", "error"); return; }
+      const awayTempStr = this._zoneFormData?.away_temp;
+      const awayTemp = awayTempStr !== "" && awayTempStr != null ? parseFloat(awayTempStr) : null;
+      const payload = {
+        type: "gttc/save_zone",
+        name,
+        sensor_entities: this._zoneFormData?.sensor_entities || [],
+        occupancy_sensor_entities: this._zoneFormData?.occupancy_sensor_entities || [],
+        away_temp: (awayTemp != null && !isNaN(awayTemp)) ? awayTemp : null,
+      };
+      if (this._editingZoneId !== "new") {
+        payload.zone_id = this._editingZoneId;
+      }
+      try {
+        await this._hass.callWS(payload);
+        this._editingZoneId = null;
+        this._zoneFormData = null;
+        await this._loadSettingsData();
+        this._showToast("Zone saved.");
+      } catch (err) { this._showToast(err.message || "Failed to save zone.", "error"); }
+    });
+  }
+
+  _syncZoneFormFromDOM() {
+    const root = this.shadowRoot;
+    const zones = this._settingsData?.zones || [];
+    const existing = this._editingZoneId === "new" ? null : zones.find(z => z.id === this._editingZoneId);
+    if (!this._zoneFormData) {
+      this._zoneFormData = {
+        sensor_entities: [...(existing?.sensor_entities || [])],
+        occupancy_sensor_entities: [...(existing?.occupancy_sensor_entities || [])],
+      };
+    }
+    const nameEl = root.getElementById("zone-form-name");
+    if (nameEl) this._zoneFormData.name = nameEl.value;
+    const awayEl = root.getElementById("zone-form-away-temp");
+    if (awayEl) this._zoneFormData.away_temp = awayEl.value;
+  }
+
+  _renderWindowCard(d) {
+    const win = (d && d.windows) || { open: false, sensors: [], open_sensors: [], manual_override: false };
+    const isOpen = win.open;
+    const statusLabel = win.manual_override
+      ? "Paused (manual)"
+      : isOpen
+        ? `Paused — ${win.open_sensors.length} window${win.open_sensors.length !== 1 ? "s" : ""} open`
+        : win.sensors.length > 0
+          ? `All closed (${win.sensors.length} sensor${win.sensors.length !== 1 ? "s" : ""})`
+          : "No sensors configured";
+    const statusClass = isOpen ? "win-open" : "win-closed";
+    const statusIcon = isOpen ? "mdi:window-open-variant" : "mdi:window-closed-variant";
+
+    return `
+      <div class="status-card win-card">
+        <div class="status-card-title"><ha-icon icon="mdi:window-open-variant"></ha-icon> Windows</div>
+        <div class="win-status ${statusClass}">
+          <ha-icon icon="${statusIcon}"></ha-icon>
+          <span>${statusLabel}</span>
+          ${isOpen ? '<span class="win-badge">HVAC suspended</span>' : ""}
+        </div>
+        ${win.sensors.length > 0 ? `
+          <div class="win-sensor-list" style="margin-top:8px">
+            ${win.sensors.map(entityId => {
+              const isThisOpen = win.open_sensors.includes(entityId);
+              return `
+                <div class="win-sensor-row ${isThisOpen ? "win-sensor-open" : ""}">
+                  <ha-icon icon="${isThisOpen ? "mdi:window-open" : "mdi:window-closed"}"></ha-icon>
+                  <span class="win-sensor-id">${entityId}</span>
+                  <span class="win-sensor-state">${isThisOpen ? "open" : "closed"}</span>
+                </div>
+              `;
+            }).join("")}
+          </div>
+        ` : ""}
+        <div style="margin-top:10px">
+          <button class="btn btn-outline btn-sm" id="goToWindowSettings">
+            <ha-icon icon="mdi:cog"></ha-icon> Manage in Settings
+          </button>
+        </div>
       </div>
     `;
   }
@@ -2017,6 +2812,161 @@ class GttcPanel extends HTMLElement {
       /* Status footer */
       .status-footer { display: flex; align-items: center; gap: 12px; padding-top: 4px; }
       .status-updated { font-size: 12px; color: var(--secondary-text); }
+
+      /* Windows open badge in header */
+      .status-item.windows-open {
+        background: #e3f2fd; border-color: #1976d2; color: #0d47a1;
+      }
+      .status-item.windows-open ha-icon { --mdc-icon-size: 16px; }
+
+      /* Window card */
+      .win-card { display: flex; flex-direction: column; gap: 12px; }
+      .win-status {
+        display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+        border-radius: 8px; font-size: 14px; font-weight: 500;
+      }
+      .win-status ha-icon { --mdc-icon-size: 20px; }
+      .win-status.win-open { background: #fff8e1; color: #e65100; }
+      .win-status.win-closed { background: #e8f5e9; color: #2e7d32; }
+      .win-badge {
+        margin-left: auto; font-size: 11px; font-weight: 600; letter-spacing: 0.5px;
+        background: #ff6f00; color: #fff; padding: 2px 8px; border-radius: 10px;
+        text-transform: uppercase;
+      }
+      .win-sensor-list { display: flex; flex-direction: column; gap: 4px; }
+      .win-empty { font-size: 13px; color: var(--secondary-text); padding: 4px 0; }
+      .win-sensor-row {
+        display: flex; align-items: center; gap: 8px; font-size: 13px;
+        padding: 6px 8px; border-radius: 6px; background: var(--bg);
+      }
+      .win-sensor-row ha-icon { --mdc-icon-size: 16px; color: var(--secondary-text); flex-shrink: 0; }
+      .win-sensor-row.win-sensor-open ha-icon { color: #e65100; }
+      .win-sensor-id { flex: 1; font-family: monospace; font-size: 12px; word-break: break-all; }
+      .win-sensor-state {
+        font-size: 11px; font-weight: 600; padding: 1px 6px; border-radius: 8px;
+        background: var(--divider); color: var(--secondary-text); flex-shrink: 0;
+      }
+      .win-sensor-row.win-sensor-open .win-sensor-state { background: #ffe0b2; color: #bf360c; }
+      .win-remove-btn {
+        background: none; border: none; cursor: pointer; padding: 2px;
+        color: var(--secondary-text); border-radius: 4px; display: flex; align-items: center;
+        flex-shrink: 0;
+      }
+      .win-remove-btn:hover { color: var(--error); background: rgba(0,0,0,0.06); }
+      .win-remove-btn ha-icon { --mdc-icon-size: 16px; }
+      .win-add-row { display: flex; gap: 8px; align-items: center; }
+      .win-input {
+        flex: 1; padding: 7px 10px; border: 1px solid var(--divider); border-radius: 6px;
+        font-size: 13px; font-family: monospace; background: var(--bg);
+        color: var(--primary-text); min-width: 0;
+      }
+      .win-input:focus { outline: none; border-color: var(--primary); }
+      .win-manual-row { padding-top: 4px; }
+      .win-manual-label {
+        display: flex; align-items: center; gap: 8px; font-size: 13px;
+        color: var(--secondary-text); cursor: pointer;
+      }
+      .win-manual-label input[type=checkbox] { width: 16px; height: 16px; cursor: pointer; }
+
+      /* Settings tab */
+      .settings-tab { display: flex; flex-direction: column; gap: 4px; padding: 4px 0; }
+      .settings-sections { display: flex; flex-direction: column; gap: 16px; }
+      .settings-card {
+        background: var(--card-bg); border-radius: 12px; border: 1px solid var(--divider); overflow: hidden;
+      }
+      .settings-card-title {
+        display: flex; align-items: center; gap: 8px;
+        padding: 14px 16px; font-size: 15px; font-weight: 600;
+        border-bottom: 1px solid var(--divider); background: var(--bg);
+      }
+      .settings-card-title ha-icon { --mdc-icon-size: 20px; color: var(--primary); }
+      .settings-card-body { padding: 16px; display: flex; flex-direction: column; gap: 16px; }
+      .settings-card-footer {
+        padding: 12px 16px; border-top: 1px solid var(--divider);
+        display: flex; justify-content: flex-end; background: var(--bg);
+      }
+      .settings-row { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+      @media (max-width: 700px) { .settings-row { grid-template-columns: 1fr; } }
+
+      .settings-field { display: flex; flex-direction: column; gap: 6px; }
+      .settings-field label { font-size: 13px; font-weight: 500; color: var(--primary-text); }
+      .settings-hint { font-size: 12px; color: var(--secondary-text); }
+      .settings-field-toggle {
+        flex-direction: row; align-items: flex-start; justify-content: space-between; gap: 16px;
+      }
+      .settings-field-toggle > div { flex: 1; }
+      .settings-field-toggle label:not(.toggle-switch) { font-size: 14px; }
+      .settings-field-disabled { opacity: 0.45; pointer-events: none; }
+
+      .settings-field input[type="number"],
+      .settings-field input[type="text"],
+      .settings-field select {
+        padding: 8px 12px; border-radius: 8px; border: 1px solid var(--divider);
+        background: var(--card-bg); color: var(--primary-text); font-size: 14px; width: 100%;
+        box-sizing: border-box;
+      }
+      .settings-field input[type="number"]:focus,
+      .settings-field input[type="text"]:focus,
+      .settings-field select:focus { outline: none; border-color: var(--primary); }
+      .settings-field input[type="range"] {
+        width: 100%; max-width: 300px; accent-color: var(--primary);
+      }
+
+      /* Toggle switch */
+      .toggle-switch { position: relative; display: inline-block; width: 44px; height: 24px; flex-shrink: 0; margin-top: 2px; }
+      .toggle-switch input { opacity: 0; width: 0; height: 0; }
+      .toggle-slider {
+        position: absolute; cursor: pointer; inset: 0; background: var(--divider);
+        border-radius: 24px; transition: 0.2s;
+      }
+      .toggle-slider::before {
+        content: ""; position: absolute; width: 18px; height: 18px; left: 3px; bottom: 3px;
+        background: #fff; border-radius: 50%; transition: 0.2s;
+      }
+      .toggle-switch input:checked + .toggle-slider { background: var(--primary); }
+      .toggle-switch input:checked + .toggle-slider::before { transform: translateX(20px); }
+
+      /* Primary save button */
+      .btn-primary {
+        background: var(--primary); color: #fff; border: none;
+        padding: 8px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer;
+      }
+      .btn-primary:hover { filter: brightness(1.1); }
+
+      /* Toast */
+      .toast {
+        position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+        padding: 12px 24px; border-radius: 8px; font-size: 14px; font-weight: 500;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.25); z-index: 9999; white-space: nowrap;
+        animation: toast-in 0.2s ease;
+      }
+      .toast-success { background: var(--success-color, #43a047); color: #fff; }
+      .toast-error { background: var(--error-color, #db4437); color: #fff; }
+      @keyframes toast-in {
+        from { opacity: 0; transform: translateX(-50%) translateY(8px); }
+        to   { opacity: 1; transform: translateX(-50%) translateY(0); }
+      }
+
+      /* Zone list */
+      .zone-list { display: flex; flex-direction: column; gap: 8px; }
+      .zone-row {
+        display: flex; align-items: center; gap: 12px;
+        padding: 10px 12px; border-radius: 8px;
+        background: var(--bg); border: 1px solid var(--divider);
+      }
+      .zone-row.zone-active { border-color: var(--primary); background: rgba(var(--primary-rgb, 3,169,244), 0.06); }
+      .zone-info { flex: 1; min-width: 0; }
+      .zone-name {
+        display: flex; align-items: center; gap: 6px;
+        font-size: 14px; font-weight: 500; color: var(--primary-text);
+      }
+      .zone-active-icon { --mdc-icon-size: 14px; color: var(--primary); }
+      .zone-meta { font-size: 12px; color: var(--secondary-text); margin-top: 2px; }
+      .zone-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
+      .zone-card-footer { justify-content: space-between; }
+      .settings-hint-inline { font-size: 12px; color: var(--secondary-text); font-weight: 400; }
+      .btn-danger { color: var(--error-color, #db4437) !important; }
+      .btn-danger:hover { background: rgba(219,68,55,0.08) !important; }
 
       /* Responsive */
       @media (max-width: 600px) {

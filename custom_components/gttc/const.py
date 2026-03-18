@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 DOMAIN = "gttc"
-PLATFORMS = ["climate", "sensor", "select", "switch", "number"]
+PLATFORMS = ["climate", "sensor", "select", "switch", "number", "binary_sensor"]
 
 # Config keys
 CONF_THERMOSTAT = "thermostat_entity"
@@ -25,6 +25,7 @@ CONF_OUTDOOR_TEMP_SENSOR = "outdoor_temp_sensor"
 CONF_TOU_PROVIDER = "tou_provider"
 CONF_TOU_ENABLED = "tou_enabled"
 CONF_PRECONDITION_ENABLED = "precondition_enabled"
+CONF_WINDOW_SENSORS = "window_sensors"
 
 # Zone config keys
 CONF_ZONE_NAME = "zone_name"
@@ -125,3 +126,4 @@ ATTR_OVERRIDE_ACTIVE = "override_active"
 ATTR_OVERRIDE_REMAINING = "override_remaining_minutes"
 ATTR_ALL_ZONES = "all_zones"
 ATTR_ZONE_DETAILS = "zone_details"
+ATTR_WINDOWS_OPEN = "windows_open"

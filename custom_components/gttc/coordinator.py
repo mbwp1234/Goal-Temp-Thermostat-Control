@@ -29,6 +29,7 @@ from .const import (
     CONF_THERMOSTAT,
     CONF_TOU_ENABLED,
     CONF_TOU_PROVIDER,
+    CONF_WINDOW_SENSORS,
     DEFAULT_AWAY_TEMP,
     DEFAULT_LEARNING_THRESHOLD,
     DEFAULT_MANUAL_OVERRIDE_MINUTES,
@@ -145,6 +146,12 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self._override_target_temp: float | None = None
         self._override_repeat_count: int = 0
 
+        # Window open detection: list of binary_sensor entity IDs to monitor.
+        # When any sensor reports "on" (open), thermostat control is suspended.
+        # windows_open_override is a manual flag for homes without sensors.
+        self.window_sensors: list[str] = []
+        self.windows_open_override: bool = False
+
     @property
     def available(self) -> bool:
         """Whether the real thermostat is reachable."""
@@ -200,6 +207,10 @@ class GTTCCoordinator(DataUpdateCoordinator):
                         _LOGGER.debug("Discarding expired manual override from storage")
                 except Exception:
                     pass  # Invalid override data
+            if "window_sensors" in data and isinstance(data["window_sensors"], list):
+                self.window_sensors = data["window_sensors"]
+            if "windows_open_override" in data:
+                self.windows_open_override = bool(data["windows_open_override"])
         except Exception as err:
             _LOGGER.error("Error restoring state: %s", err)
 
@@ -216,6 +227,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 "manual_override": (
                     self.manual_override.to_dict() if self.manual_override else None
                 ),
+                "window_sensors": self.window_sensors,
+                "windows_open_override": self.windows_open_override,
             }
             await self._store.async_save(data)
         except Exception as err:
@@ -251,6 +264,14 @@ class GTTCCoordinator(DataUpdateCoordinator):
             if self.manual_override and self.manual_override.is_expired:
                 _LOGGER.debug("Manual override expired, resuming automation")
                 self.manual_override = None
+
+            # Suspend thermostat control when a window is open — running
+            # heating/cooling against an open window wastes energy.
+            if self._are_windows_open():
+                _LOGGER.debug(
+                    "Window open detected — suspending thermostat control"
+                )
+                return self._build_state_dict()
 
             # Auto-switch active zone when the current schedule entry
             # specifies a zone_id (e.g. "1st floor" during the day,
@@ -362,6 +383,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 else None
             ),
             "precondition_active": self._is_preconditioning(),
+            "windows_open": self._are_windows_open(),
+            "window_sensors": list(self.window_sensors),
+            "windows_open_override": self.windows_open_override,
             "learning_status": {
                 "enabled": self.learning_enabled,
                 "events_recorded": len(self.learning.events),
@@ -1113,3 +1137,75 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self.scheduler.enabled = enabled
         if not enabled:
             self.scheduler.deactivate_preset()
+
+    # ------------------------------------------------------------------
+    # Live configuration updates
+    # ------------------------------------------------------------------
+
+    async def async_update_config(self, updates: dict) -> None:
+        """Apply a partial configuration dict to live coordinator state.
+
+        Callers are responsible for persisting the changes to
+        config_entry.data via hass.config_entries.async_update_entry.
+        """
+        if "temp_min" in updates:
+            self.temp_min = float(updates["temp_min"])
+            self.scheduler.temp_min = self.temp_min
+        if "temp_max" in updates:
+            self.temp_max = float(updates["temp_max"])
+            self.scheduler.temp_max = self.temp_max
+        if "away_temp" in updates:
+            self.away_temp = float(updates["away_temp"])
+        if "manual_override_minutes" in updates:
+            self.manual_override_minutes = int(updates["manual_override_minutes"])
+        if "learning_enabled" in updates:
+            self.learning_enabled = bool(updates["learning_enabled"])
+        if "learning_threshold" in updates:
+            self.learning.threshold = int(updates["learning_threshold"])
+        if "occupancy_enabled" in updates:
+            self.occupancy_enabled = bool(updates["occupancy_enabled"])
+        if "presence_detection" in updates:
+            self.zone_manager.presence_mode = updates["presence_detection"]
+        if "outdoor_temp_sensor" in updates:
+            self.outdoor_temp_sensor = updates["outdoor_temp_sensor"] or ""
+        if "tou_enabled" in updates:
+            self.tou_enabled = bool(updates["tou_enabled"])
+        if "tou_provider" in updates:
+            provider_cls = TOU_PROVIDERS.get(updates["tou_provider"], TOUProvider)
+            self.tou_provider = provider_cls()
+        if "precondition_enabled" in updates:
+            self.precondition_enabled = bool(updates["precondition_enabled"])
+
+        await self.async_save()
+        self.async_set_updated_data(self._build_state_dict())
+
+    # ------------------------------------------------------------------
+    # Window open detection
+    # ------------------------------------------------------------------
+
+    def _are_windows_open(self) -> bool:
+        """Return True if the manual override flag is set OR any configured
+        window/contact sensor reports open (state == 'on').
+
+        Contact sensors in HA use binary_sensor with device_class=window or
+        door; their state is 'on' when open and 'off' when closed.
+        """
+        if self.windows_open_override:
+            return True
+        for entity_id in self.window_sensors:
+            try:
+                state = self.hass.states.get(entity_id)
+                if state and state.state == "on":
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def get_open_window_sensors(self) -> list[str]:
+        """Return the entity IDs of sensors currently reporting open."""
+        return [
+            entity_id
+            for entity_id in self.window_sensors
+            if self.hass.states.get(entity_id) is not None
+            and self.hass.states.get(entity_id).state == "on"
+        ]
