@@ -23,6 +23,8 @@ async def async_setup_entry(
         LearningSwitch(coordinator, config_entry, name),
         OccupancySwitch(coordinator, config_entry, name),
         ScheduleSwitch(coordinator, config_entry, name),
+        TOUSwitch(coordinator, config_entry, name),
+        PreconditionSwitch(coordinator, config_entry, name),
     ])
 
 
@@ -100,5 +102,70 @@ class ScheduleSwitch(CoordinatorEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs) -> None:
         self.coordinator.set_schedule_enabled(False)
+        await self.coordinator.async_save()
+        self.async_write_ha_state()
+
+
+class TOUSwitch(CoordinatorEntity, SwitchEntity):
+    """Toggle time-of-use rate optimization on/off."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:lightning-bolt-circle"
+
+    def __init__(self, coordinator, config_entry, name):
+        super().__init__(coordinator)
+        self._attr_name = f"{name} TOU Optimization"
+        self._attr_unique_id = f"{DOMAIN}_{config_entry.entry_id}_tou"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.tou_enabled
+
+    @property
+    def extra_state_attributes(self):
+        data = self.coordinator.data or {}
+        return {
+            "rate_period": data.get("tou_rate_period"),
+            "provider": self.coordinator.tou_provider.name,
+        }
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.tou_enabled = True
+        await self.coordinator.async_save()
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.tou_enabled = False
+        await self.coordinator.async_save()
+        self.async_write_ha_state()
+
+
+class PreconditionSwitch(CoordinatorEntity, SwitchEntity):
+    """Toggle pre-conditioning (early temperature ramp before schedule changes)."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:thermometer-chevron-up"
+
+    def __init__(self, coordinator, config_entry, name):
+        super().__init__(coordinator)
+        self._attr_name = f"{name} Pre-conditioning"
+        self._attr_unique_id = f"{DOMAIN}_{config_entry.entry_id}_precondition"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.precondition_enabled
+
+    @property
+    def extra_state_attributes(self):
+        data = self.coordinator.data or {}
+        return {"precondition_active": data.get("precondition_active", False)}
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.precondition_enabled = True
+        await self.coordinator.async_save()
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.precondition_enabled = False
         await self.coordinator.async_save()
         self.async_write_ha_state()

@@ -29,6 +29,8 @@ async def async_setup_entry(
         ActiveZoneTempSensor(coordinator, config_entry, name, temp_unit),
         OverrideRemainingSensor(coordinator, config_entry, name),
         LearnedPatternsSensor(coordinator, config_entry, name),
+        OutdoorTempSensor(coordinator, config_entry, name, temp_unit),
+        TOURateSensor(coordinator, config_entry, name),
     ]
 
     # Create a temperature sensor per zone
@@ -124,4 +126,77 @@ class LearnedPatternsSensor(CoordinatorEntity, SensorEntity):
         return {
             "patterns": self.coordinator.learning.learned_entries,
             "total_events": len(self.coordinator.learning.events),
+        }
+
+
+class OutdoorTempSensor(CoordinatorEntity, SensorEntity):
+    """Shows the outdoor temperature used for heat pump optimization."""
+
+    _attr_has_entity_name = True
+    _attr_device_class = SensorDeviceClass.TEMPERATURE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:thermometer"
+
+    def __init__(self, coordinator, config_entry, name, temp_unit):
+        super().__init__(coordinator)
+        self._attr_name = f"{name} Outdoor Temperature"
+        self._attr_unique_id = f"{DOMAIN}_{config_entry.entry_id}_outdoor_temp"
+        self._attr_native_unit_of_measurement = (
+            UnitOfTemperature.CELSIUS if temp_unit == "°C" else UnitOfTemperature.FAHRENHEIT
+        )
+
+    @property
+    def available(self) -> bool:
+        return self.coordinator._outdoor_temp is not None
+
+    @property
+    def native_value(self) -> float | None:
+        return self.coordinator._outdoor_temp
+
+    @property
+    def extra_state_attributes(self):
+        from .const import OUTDOOR_COLD_THRESHOLD, OUTDOOR_MILD_THRESHOLD
+        outdoor = self.coordinator._outdoor_temp
+        if outdoor is None:
+            status = "unavailable"
+        elif outdoor < OUTDOOR_COLD_THRESHOLD:
+            status = "cold (setbacks minimized)"
+        elif outdoor > OUTDOOR_MILD_THRESHOLD:
+            status = "mild (full setbacks allowed)"
+        else:
+            status = "moderate"
+        return {
+            "optimization_status": status,
+            "cold_threshold": OUTDOOR_COLD_THRESHOLD,
+            "mild_threshold": OUTDOOR_MILD_THRESHOLD,
+            "sensor_entity": self.coordinator.outdoor_temp_sensor,
+        }
+
+
+class TOURateSensor(CoordinatorEntity, SensorEntity):
+    """Shows the current TOU rate period."""
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:cash-clock"
+
+    def __init__(self, coordinator, config_entry, name):
+        super().__init__(coordinator)
+        self._attr_name = f"{name} TOU Rate Period"
+        self._attr_unique_id = f"{DOMAIN}_{config_entry.entry_id}_tou_rate"
+
+    @property
+    def native_value(self) -> str | None:
+        data = self.coordinator.data or {}
+        return data.get("tou_rate_period")
+
+    @property
+    def extra_state_attributes(self):
+        provider = self.coordinator.tou_provider
+        minutes_to_peak = provider.minutes_until_on_peak()
+        minutes_to_off = provider.minutes_until_off_peak()
+        return {
+            "provider": provider.name,
+            "enabled": self.coordinator.tou_enabled,
+            "minutes_until_on_peak": minutes_to_peak,
+            "minutes_until_off_peak": minutes_to_off,
         }

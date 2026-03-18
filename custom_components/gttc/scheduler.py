@@ -22,10 +22,24 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _default_presets(temp_min: float, temp_max: float) -> dict[str, PresetSchedule]:
-    """Create default preset schedules."""
+    """Create default preset schedules.
+
+    Temperatures follow DOE / ENERGY STAR guidelines:
+    - Comfort (occupied): 68°F — the DOE-recommended winter setpoint.
+    - Sleep:  62°F — DOE recommends 60-65°F while sleeping for up to
+      10% annual savings on heating/cooling.
+    - Away:   temp_min + 4 (≈54-62°F) — DOE recommends lowering the
+      thermostat 7-10°F for 8+ hours when away.
+
+    Previous defaults used ``mid + 4`` for comfort (74°F with 50-90
+    range) and ``mid - 2`` (68°F) for sleep, which were warmer than
+    optimal for energy efficiency.
+    """
     mid = round((temp_min + temp_max) / 2)
-    comfort = mid + 4
-    sleep_temp = mid - 2
+    # DOE recommends 68°F for occupied heating; clamp to configured range
+    comfort = max(temp_min, min(temp_max, 68.0))
+    # DOE recommends 60-65°F for sleep; use 62°F as a good balance
+    sleep_temp = max(temp_min, min(temp_max, comfort - 6))
     away_temp = temp_min + 4
 
     home_entries = [
@@ -111,6 +125,65 @@ class Scheduler:
         except Exception as err:
             _LOGGER.warning("Error getting current schedule entry: %s", err)
             return None
+
+    def get_next_entry(self, now: datetime | None = None) -> tuple[ScheduleEntry | None, int]:
+        """Get the next schedule entry and minutes until it starts.
+
+        Returns (entry, minutes_until_start).  If there is no next entry
+        today, returns (None, 0).
+        """
+        if not self.enabled:
+            return None, 0
+
+        try:
+            if now is None:
+                now = datetime.now(timezone.utc).astimezone()
+
+            day_name = now.strftime("%A").lower()
+            current_time = now.time()
+
+            day_schedule = self._resolve_day_schedule(day_name)
+            if day_schedule is None:
+                return None, 0
+
+            return self._find_next_entry(day_schedule, current_time)
+        except Exception as err:
+            _LOGGER.warning("Error getting next schedule entry: %s", err)
+            return None, 0
+
+    def _resolve_day_schedule(self, day_name: str) -> DaySchedule | None:
+        """Resolve the active day schedule based on mode and preset."""
+        if self.schedule.active_preset and self.schedule.active_preset in self.presets:
+            preset = self.presets[self.schedule.active_preset]
+            return preset.schedule.get(day_name)
+
+        if self.schedule.mode == SCHEDULE_MODE_PER_DAY:
+            return self.schedule.per_day.get(day_name)
+
+        if day_name in WEEKDAYS:
+            return self.schedule.weekday
+        return self.schedule.weekend
+
+    def _find_next_entry(
+        self, day_schedule: DaySchedule, current_time: time
+    ) -> tuple[ScheduleEntry | None, int]:
+        """Find the first entry whose start_time is after current_time."""
+        current_minutes = current_time.hour * 60 + current_time.minute
+        best: ScheduleEntry | None = None
+        best_gap: int = 9999
+
+        for entry in day_schedule.entries:
+            try:
+                start = entry.start_time
+                start_minutes = start.hour * 60 + start.minute
+                gap = start_minutes - current_minutes
+                if gap > 0 and gap < best_gap:
+                    best = entry
+                    best_gap = gap
+            except Exception:
+                continue
+
+        return best, best_gap if best else 0
 
     def _find_entry_for_time(
         self, day_schedule: DaySchedule, current_time: time

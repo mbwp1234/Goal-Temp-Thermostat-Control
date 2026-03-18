@@ -21,6 +21,10 @@ CONF_MANUAL_OVERRIDE_MINUTES = "manual_override_minutes"
 CONF_ACTIVE_ZONE = "active_zone"
 CONF_SCHEDULE_MODE = "schedule_mode"
 CONF_SCHEDULE_ENABLED = "schedule_enabled"
+CONF_OUTDOOR_TEMP_SENSOR = "outdoor_temp_sensor"
+CONF_TOU_PROVIDER = "tou_provider"
+CONF_TOU_ENABLED = "tou_enabled"
+CONF_PRECONDITION_ENABLED = "precondition_enabled"
 
 # Zone config keys
 CONF_ZONE_NAME = "zone_name"
@@ -69,6 +73,27 @@ DEFAULT_LEARNING_THRESHOLD = 3
 DEFAULT_MANUAL_OVERRIDE_MINUTES = 120
 DEFAULT_TEMP_UNIT = "°F"
 DEFAULT_PRESENCE_MODE = PRESENCE_MODE_BOTH
+
+# Pre-conditioning: minutes before a schedule transition to start ramping
+# toward the next entry's target temperature.
+DEFAULT_PRECONDITION_MINUTES = 30
+
+# Outdoor temperature thresholds for heat pump optimization (°F).
+# Below OUTDOOR_COLD_THRESHOLD the heat pump is struggling, so setbacks
+# are further limited to avoid long recovery times / aux heat.
+# Above OUTDOOR_MILD_THRESHOLD recovery is cheap, so deeper setbacks are OK.
+OUTDOOR_COLD_THRESHOLD = 30.0
+OUTDOOR_MILD_THRESHOLD = 45.0
+
+# Heat pump efficiency
+# Maximum setback (°F) from comfort temp before recovery triggers expensive
+# auxiliary/strip heat.  DOE and ENERGY STAR recommend keeping heat-pump
+# setbacks to 5°F or less to avoid aux heat activation during recovery.
+HEAT_PUMP_MAX_SETBACK = 5.0
+# When recovering from a setback on a heat pump, limit each step to this many
+# degrees to prevent the thermostat from engaging aux heat (most systems
+# trigger aux heat when the differential exceeds 2-3°F).
+HEAT_PUMP_RECOVERY_STEP = 2.0
 
 # Learning
 LEARNING_TIME_WINDOW_MINUTES = 30
