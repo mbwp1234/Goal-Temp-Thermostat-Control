@@ -795,9 +795,18 @@ class GTTCCoordinator(DataUpdateCoordinator):
         Example: zone reads 70, thermostat reads 68, goal is 71.
           offset = 68 - 70 = -2  →  thermostat target = 71 + (-2) = 69
           Thermostat heats to 69 at its sensor, zone lands at ~71.
+
+        During a manual override the offset is skipped so the thermostat is
+        set to exactly what the user requested — not an offset-inflated value
+        that causes the zone to overshoot the override goal.
         """
         if desired_temp is None:
             return None
+
+        # Skip offset correction during a manual override so the T6 target
+        # matches the override temp exactly and doesn't overshoot.
+        if self.manual_override and not self.manual_override.is_expired:
+            return desired_temp
 
         thermostat_reading = self._get_thermostat_current_temp()
         zone_reading = (

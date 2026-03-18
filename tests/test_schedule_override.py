@@ -239,6 +239,51 @@ class TestAsyncSetTemperatureIntegration:
         assert entry.target_temp == 75.0  # schedule unchanged
 
 
+class TestCalculateThermostatTargetOverride:
+    """Tests for offset skipping during a manual override."""
+
+    def test_override_skips_offset(self):
+        """During an active override the thermostat target must equal the
+        override temp exactly — no sensor-offset inflation."""
+        from custom_components.gttc.models import ManualOverride
+        from datetime import datetime, timezone
+
+        coord = _make_coordinator()
+
+        # Simulate: zone reads 70.7, T6 reads 72 → offset = +1.3
+        active_zone = MagicMock()
+        active_zone.current_temp = 70.7
+        coord._get_thermostat_current_temp = MagicMock(return_value=72.0)
+
+        # Set an active override at 70°F
+        coord.manual_override = ManualOverride(
+            target_temp=70.0,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            duration_minutes=30,
+            zone_id=None,
+        )
+
+        result = coord._calculate_thermostat_target(70.0, active_zone)
+
+        # Should be exactly 70, not 70 + 1.3 = 71.3
+        assert result == 70.0
+
+    def test_no_override_applies_offset(self):
+        """Without an override the offset correction should still be applied."""
+        coord = _make_coordinator()
+
+        active_zone = MagicMock()
+        active_zone.current_temp = 70.7
+        coord._get_thermostat_current_temp = MagicMock(return_value=72.0)
+        coord.manual_override = None
+
+        result = coord._calculate_thermostat_target(70.0, active_zone)
+
+        # offset = 72 - 70.7 = 1.3 → adjusted = 71.3, clamped within range
+        assert result is not None
+        assert result > 70.0
+
+
 class TestEntryMidpointMinutes:
     """Tests for _entry_midpoint_minutes helper."""
 
