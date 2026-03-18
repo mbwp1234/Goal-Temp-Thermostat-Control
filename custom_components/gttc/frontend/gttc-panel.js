@@ -93,6 +93,7 @@ class GttcPanel extends HTMLElement {
     this._historyData = null;
     this._statusLoading = false;
     this._debugExpanded = false;
+    this._statusError = null;
   }
 
   set hass(hass) {
@@ -1354,7 +1355,16 @@ class GttcPanel extends HTMLElement {
       return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading...</div>`;
     }
     if (!this._diagData) {
-      return `<div class="status-loading">No data. <button class="btn btn-outline" id="statusRefreshBtn">Refresh</button></div>`;
+      return `
+        <div class="status-error-box">
+          <div class="status-error-msg">
+            <ha-icon icon="mdi:alert-circle-outline"></ha-icon>
+            ${this._statusError
+              ? `Failed to load: <code>${this._statusError}</code><br><small>If this says "unknown_command", restart Home Assistant to register the new API endpoint.</small>`
+              : "No data available."}
+          </div>
+          <button class="btn btn-outline" id="statusRefreshBtn">Retry</button>
+        </div>`;
     }
     const d = this._diagData;
     return `
@@ -1632,6 +1642,7 @@ class GttcPanel extends HTMLElement {
     this._statusLoading = true;
     this._render();
     try {
+      this._statusError = null;
       this._diagData = await this._hass.callWS({ type: "gttc/get_diagnostics" });
       // Fetch temperature history if we have the entity ID
       const entityId = this._diagData.entity_ids && this._diagData.entity_ids.active_zone_temp;
@@ -1654,6 +1665,7 @@ class GttcPanel extends HTMLElement {
       console.error("GTTC: Failed to load diagnostics", err);
       this._diagData = null;
       this._historyData = [];
+      this._statusError = err.message || err.code || String(err);
     } finally {
       this._statusLoading = false;
       this._render();
@@ -1904,6 +1916,10 @@ class GttcPanel extends HTMLElement {
       /* Status tab */
       .status-tab { display: flex; flex-direction: column; gap: 16px; }
       .status-loading { padding: 40px; text-align: center; color: var(--secondary-text); font-size: 15px; }
+      .status-error-box { padding: 24px; background: var(--card-bg); border-radius: 12px; border: 1px solid var(--error-color,#db4437); display: flex; flex-direction: column; align-items: flex-start; gap: 12px; }
+      .status-error-msg { color: var(--error-color,#db4437); font-size: 14px; line-height: 1.6; }
+      .status-error-msg code { font-family: monospace; background: rgba(0,0,0,0.06); padding: 1px 4px; border-radius: 3px; }
+      .status-error-msg small { color: var(--secondary-text); display: block; margin-top: 4px; }
 
       /* Stat cards */
       .stat-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
