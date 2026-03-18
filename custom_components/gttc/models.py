@@ -178,12 +178,14 @@ class PresetSchedule:
     name: str
     label: str
     schedule: dict[str, DaySchedule] = field(default_factory=dict)
+    is_builtin: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
             "label": self.label,
             "schedule": {k: v.to_dict() for k, v in self.schedule.items()},
+            "is_builtin": self.is_builtin,
         }
 
     @classmethod
@@ -199,6 +201,7 @@ class PresetSchedule:
             name=data.get("name", "unknown"),
             label=data.get("label", "Unknown"),
             schedule=schedule,
+            is_builtin=data.get("is_builtin", True),
         )
 
 
