@@ -772,7 +772,7 @@ async def ws_get_diagnostics(
             "current_temp": zone.current_temp,
             "is_occupied": zone.is_occupied,
             "is_active": zone.id == coordinator.zone_manager.active_zone_id,
-            "sensor_count": len(zone.temp_sensors),
+            "sensor_count": len(zone.sensor_entities),
         })
 
     override = coordinator.manual_override
