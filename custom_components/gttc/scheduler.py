@@ -193,6 +193,152 @@ class Scheduler:
             self.schedule.per_day[day].entries.append(entry)
             self._sort_entries(self.schedule.per_day[day])
 
+    def add_custom_preset(self, name: str, label: str) -> bool:
+        """Create a new custom preset with empty schedules for each day."""
+        key = name.lower().replace(" ", "_")
+        if key in self.presets:
+            return False
+        self.presets[key] = PresetSchedule(
+            name=key,
+            label=label,
+            schedule={day: DaySchedule() for day in ALL_DAYS},
+            is_builtin=False,
+        )
+        return True
+
+    def remove_custom_preset(self, name: str) -> bool:
+        """Remove a custom (non-builtin) preset."""
+        if name not in self.presets:
+            return False
+        if self.presets[name].is_builtin:
+            return False
+        if self.schedule.active_preset == name:
+            self.schedule.active_preset = None
+        del self.presets[name]
+        return True
+
+    def rename_custom_preset(self, name: str, new_label: str) -> bool:
+        """Rename a custom preset's label."""
+        if name not in self.presets:
+            return False
+        if self.presets[name].is_builtin:
+            return False
+        self.presets[name].label = new_label
+        return True
+
+    def copy_day_schedule(
+        self, source_day: str, target_days: list[str], preset_name: str | None = None
+    ) -> list[str]:
+        """Copy all entries from one day to other days. Returns list of successfully copied days."""
+        copied = []
+        if preset_name and preset_name in self.presets:
+            preset = self.presets[preset_name]
+            source = preset.schedule.get(source_day.lower())
+            if not source:
+                return copied
+            for day in target_days:
+                day_lower = day.lower()
+                if day_lower in preset.schedule and day_lower != source_day.lower():
+                    preset.schedule[day_lower] = DaySchedule(
+                        entries=[
+                            ScheduleEntry(
+                                time_start=e.time_start,
+                                time_end=e.time_end,
+                                target_temp=e.target_temp,
+                                zone_id=e.zone_id,
+                            )
+                            for e in source.entries
+                        ]
+                    )
+                    copied.append(day_lower)
+            return copied
+
+        # Non-preset mode
+        source_day_lower = source_day.lower()
+        if self.schedule.mode == "per_day":
+            source_ds = self.schedule.per_day.get(source_day_lower)
+            if not source_ds:
+                return copied
+            for day in target_days:
+                day_lower = day.lower()
+                if day_lower != source_day_lower and day_lower in ALL_DAYS:
+                    self.schedule.per_day[day_lower] = DaySchedule(
+                        entries=[
+                            ScheduleEntry(
+                                time_start=e.time_start,
+                                time_end=e.time_end,
+                                target_temp=e.target_temp,
+                                zone_id=e.zone_id,
+                            )
+                            for e in source_ds.entries
+                        ]
+                    )
+                    copied.append(day_lower)
+        else:
+            # weekday/weekend mode: copy between weekday and weekend
+            if source_day_lower in WEEKDAYS or source_day_lower == "weekday":
+                source_ds = self.schedule.weekday
+            elif source_day_lower in WEEKEND or source_day_lower == "weekend":
+                source_ds = self.schedule.weekend
+            else:
+                return copied
+            for day in target_days:
+                day_lower = day.lower()
+                if day_lower in WEEKDAYS or day_lower == "weekday":
+                    self.schedule.weekday = DaySchedule(
+                        entries=[
+                            ScheduleEntry(
+                                time_start=e.time_start,
+                                time_end=e.time_end,
+                                target_temp=e.target_temp,
+                                zone_id=e.zone_id,
+                            )
+                            for e in source_ds.entries
+                        ]
+                    )
+                    copied.append(day_lower)
+                elif day_lower in WEEKEND or day_lower == "weekend":
+                    self.schedule.weekend = DaySchedule(
+                        entries=[
+                            ScheduleEntry(
+                                time_start=e.time_start,
+                                time_end=e.time_end,
+                                target_temp=e.target_temp,
+                                zone_id=e.zone_id,
+                            )
+                            for e in source_ds.entries
+                        ]
+                    )
+                    copied.append(day_lower)
+        return copied
+
+    def export_schedule(self) -> dict[str, Any]:
+        """Export the full schedule and presets as a JSON-serializable dict."""
+        return {
+            "version": 1,
+            "schedule": self.schedule.to_dict(),
+            "presets": {k: v.to_dict() for k, v in self.presets.items()},
+            "enabled": self.enabled,
+        }
+
+    def import_schedule(self, data: dict[str, Any]) -> bool:
+        """Import a schedule from exported JSON data. Returns True on success."""
+        try:
+            if "schedule" in data:
+                self.schedule = Schedule.from_dict(data["schedule"])
+            if "presets" in data:
+                imported_presets = {
+                    k: PresetSchedule.from_dict(v)
+                    for k, v in data["presets"].items()
+                }
+                self.presets.update(imported_presets)
+            if "enabled" in data:
+                self.enabled = data["enabled"]
+            return True
+        except Exception as err:
+            _LOGGER.error("Error importing schedule: %s", err)
+            return False
+
     def _sort_entries(self, day_schedule: DaySchedule) -> None:
         try:
             day_schedule.entries.sort(key=lambda e: e.time_start)
