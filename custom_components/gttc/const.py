@@ -70,6 +70,16 @@ DEFAULT_MANUAL_OVERRIDE_MINUTES = 120
 DEFAULT_TEMP_UNIT = "°F"
 DEFAULT_PRESENCE_MODE = PRESENCE_MODE_BOTH
 
+# Heat pump efficiency
+# Maximum setback (°F) from comfort temp before recovery triggers expensive
+# auxiliary/strip heat.  DOE and ENERGY STAR recommend keeping heat-pump
+# setbacks to 5°F or less to avoid aux heat activation during recovery.
+HEAT_PUMP_MAX_SETBACK = 5.0
+# When recovering from a setback on a heat pump, limit each step to this many
+# degrees to prevent the thermostat from engaging aux heat (most systems
+# trigger aux heat when the differential exceeds 2-3°F).
+HEAT_PUMP_RECOVERY_STEP = 2.0
+
 # Learning
 LEARNING_TIME_WINDOW_MINUTES = 30
 LEARNING_TEMP_TOLERANCE = 2.0

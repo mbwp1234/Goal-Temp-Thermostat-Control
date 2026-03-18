@@ -22,10 +22,24 @@ _LOGGER = logging.getLogger(__name__)
 
 
 def _default_presets(temp_min: float, temp_max: float) -> dict[str, PresetSchedule]:
-    """Create default preset schedules."""
+    """Create default preset schedules.
+
+    Temperatures follow DOE / ENERGY STAR guidelines:
+    - Comfort (occupied): 68°F — the DOE-recommended winter setpoint.
+    - Sleep:  62°F — DOE recommends 60-65°F while sleeping for up to
+      10% annual savings on heating/cooling.
+    - Away:   temp_min + 4 (≈54-62°F) — DOE recommends lowering the
+      thermostat 7-10°F for 8+ hours when away.
+
+    Previous defaults used ``mid + 4`` for comfort (74°F with 50-90
+    range) and ``mid - 2`` (68°F) for sleep, which were warmer than
+    optimal for energy efficiency.
+    """
     mid = round((temp_min + temp_max) / 2)
-    comfort = mid + 4
-    sleep_temp = mid - 2
+    # DOE recommends 68°F for occupied heating; clamp to configured range
+    comfort = max(temp_min, min(temp_max, 68.0))
+    # DOE recommends 60-65°F for sleep; use 62°F as a good balance
+    sleep_temp = max(temp_min, min(temp_max, comfort - 6))
     away_temp = temp_min + 4
 
     home_entries = [
