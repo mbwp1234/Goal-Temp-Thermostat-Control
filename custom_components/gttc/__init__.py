@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 import voluptuous as vol
@@ -11,6 +12,7 @@ from homeassistant.const import ATTR_TEMPERATURE
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import config_validation as cv
 
+from .api import async_register_api
 from .const import (
     CONF_ZONES,
     DOMAIN,
@@ -28,6 +30,11 @@ from .coordinator import GTTCCoordinator
 from .models import Zone
 
 _LOGGER = logging.getLogger(__name__)
+
+PANEL_URL = "/gttc_panel"
+PANEL_ICON = "mdi:calendar-clock"
+PANEL_TITLE = "GTTC Schedule"
+FRONTEND_DIR = Path(__file__).parent / "frontend"
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -58,6 +65,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Register services (idempotent)
     _register_services(hass)
+
+    # Register WebSocket API and sidebar panel (idempotent)
+    _register_panel(hass)
 
     # Listen for options updates
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
@@ -114,6 +124,27 @@ def _get_coordinator(
         if isinstance(coordinator, GTTCCoordinator):
             return coordinator
     return None
+
+
+def _register_panel(hass: HomeAssistant) -> None:
+    """Register the sidebar panel and WebSocket API (idempotent)."""
+    # Register WebSocket commands
+    async_register_api(hass)
+
+    # Serve the frontend JS file
+    hass.http.register_static_path(
+        PANEL_URL, str(FRONTEND_DIR / "gttc-panel.js"), cache_headers=False
+    )
+
+    # Register the sidebar panel
+    hass.components.frontend.async_register_panel(
+        component_name="custom",
+        sidebar_title=PANEL_TITLE,
+        sidebar_icon=PANEL_ICON,
+        frontend_url_path="gttc-schedule",
+        config={"_panel_custom": {"name": "gttc-panel", "js_url": PANEL_URL}},
+        require_admin=False,
+    )
 
 
 def _register_services(hass: HomeAssistant) -> None:
