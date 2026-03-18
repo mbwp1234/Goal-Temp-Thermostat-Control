@@ -20,14 +20,19 @@ from .const import (
     CONF_LEARNING_THRESHOLD,
     CONF_MANUAL_OVERRIDE_MINUTES,
     CONF_OCCUPANCY_ENABLED,
+    CONF_OUTDOOR_TEMP_SENSOR,
+    CONF_PRECONDITION_ENABLED,
     CONF_PRESENCE_DETECTION,
     CONF_SCHEDULE_ENABLED,
     CONF_TEMP_MAX,
     CONF_TEMP_MIN,
     CONF_THERMOSTAT,
+    CONF_TOU_ENABLED,
+    CONF_TOU_PROVIDER,
     DEFAULT_AWAY_TEMP,
     DEFAULT_LEARNING_THRESHOLD,
     DEFAULT_MANUAL_OVERRIDE_MINUTES,
+    DEFAULT_PRECONDITION_MINUTES,
     DEFAULT_PRESENCE_MODE,
     DEFAULT_TEMP_MAX,
     DEFAULT_TEMP_MIN,
@@ -35,12 +40,22 @@ from .const import (
     HEAT_PUMP_MAX_SETBACK,
     HEAT_PUMP_RECOVERY_STEP,
     LEARNING_TEMP_TOLERANCE,
+    OUTDOOR_COLD_THRESHOLD,
+    OUTDOOR_MILD_THRESHOLD,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
 from .learning import LearningEngine
 from .models import ManualOverride, ScheduleEntry
 from .scheduler import Scheduler
+from .tou import (
+    RatePeriod,
+    TOU_ON_PEAK_COOLING_OFFSET,
+    TOU_ON_PEAK_HEATING_OFFSET,
+    TOU_PRECONDITION_WINDOW_MINUTES,
+    TOU_PROVIDERS,
+    TOUProvider,
+)
 from .zone_manager import ZoneManager
 
 _LOGGER = logging.getLogger(__name__)
@@ -81,6 +96,15 @@ class GTTCCoordinator(DataUpdateCoordinator):
             data.get(CONF_MANUAL_OVERRIDE_MINUTES, DEFAULT_MANUAL_OVERRIDE_MINUTES)
         )
         self.schedule_enabled: bool = True
+
+        # New efficiency features
+        self.outdoor_temp_sensor: str = data.get(CONF_OUTDOOR_TEMP_SENSOR, "")
+        self.tou_enabled: bool = data.get(CONF_TOU_ENABLED, False)
+        self.precondition_enabled: bool = data.get(CONF_PRECONDITION_ENABLED, True)
+        tou_provider_key = data.get(CONF_TOU_PROVIDER, "none")
+        provider_cls = TOU_PROVIDERS.get(tou_provider_key, TOUProvider)
+        self.tou_provider: TOUProvider = provider_cls()
+        self._outdoor_temp: float | None = None
 
         # Sub-managers
         self.zone_manager = ZoneManager(hass, config_entry.entry_id)
@@ -261,8 +285,20 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     )
                     self._is_heat_pump = fresh
 
+            # Read outdoor temperature sensor (if configured)
+            self._outdoor_temp = self._read_outdoor_temp()
+
             # Determine target temperature
             desired_temp = self._calculate_desired_temp()
+
+            # Pre-conditioning: if a schedule transition is approaching,
+            # start ramping toward the next entry's target now so it's
+            # reached on time instead of playing catch-up.
+            desired_temp = self._apply_precondition(desired_temp)
+
+            # TOU rate optimization: shift setpoint during on-peak to
+            # reduce energy cost, and pre-condition before on-peak starts.
+            desired_temp = self._apply_tou_adjustment(desired_temp)
 
             # For heat pumps, ramp the target gradually to avoid aux heat
             desired_temp = self._apply_gradual_recovery(desired_temp)
@@ -319,6 +355,13 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 self.manual_override.remaining_minutes if override_active else 0
             ),
             "heat_pump_detected": self.is_heat_pump,
+            "outdoor_temp": self._outdoor_temp,
+            "tou_rate_period": (
+                self.tou_provider.get_rate_period().value
+                if self.tou_enabled
+                else None
+            ),
+            "precondition_active": self._is_preconditioning(),
             "learning_status": {
                 "enabled": self.learning_enabled,
                 "events_recorded": len(self.learning.events),
@@ -502,37 +545,6 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 return entry.target_temp
         return self._default_comfort_temp
 
-    def _apply_heat_pump_setback_limit(
-        self, setback_temp: float, comfort_temp: float
-    ) -> float:
-        """For heat pump systems, limit the setback depth.
-
-        Large setbacks (>5°F) cause the heat pump to engage auxiliary
-        resistance heat during recovery, which is 2-5x more expensive.
-        This clamps the away/sleep temperature so the setback doesn't
-        exceed HEAT_PUMP_MAX_SETBACK degrees from comfort.
-        """
-        if not self.is_heat_pump:
-            return setback_temp
-
-        if self.hvac_mode == HVACMode.HEAT or self.hvac_mode == HVACMode.HEAT_COOL:
-            min_allowed = comfort_temp - HEAT_PUMP_MAX_SETBACK
-            if setback_temp < min_allowed:
-                _LOGGER.info(
-                    "Heat pump detected: limiting heating setback from %.1f° to "
-                    "%.1f° (max %.1f° below comfort %.1f°)",
-                    setback_temp,
-                    min_allowed,
-                    HEAT_PUMP_MAX_SETBACK,
-                    comfort_temp,
-                )
-                return min_allowed
-        elif self.hvac_mode == HVACMode.COOL:
-            # In cooling mode, larger setbacks are fine — higher temps save energy
-            pass
-
-        return setback_temp
-
     def _apply_gradual_recovery(self, desired_temp: float) -> float:
         """For heat pump systems, limit how quickly the target temperature
         ramps up during recovery from a setback.
@@ -562,6 +574,212 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 HEAT_PUMP_RECOVERY_STEP,
             )
             return stepped
+
+        return desired_temp
+
+    # ------------------------------------------------------------------
+    # Outdoor temperature integration
+    # ------------------------------------------------------------------
+
+    def _read_outdoor_temp(self) -> float | None:
+        """Read the configured outdoor temperature sensor."""
+        if not self.outdoor_temp_sensor:
+            return None
+        try:
+            state = self.hass.states.get(self.outdoor_temp_sensor)
+            if state and state.state not in ("unavailable", "unknown"):
+                return float(state.state)
+        except (ValueError, TypeError):
+            pass
+        return None
+
+    def _apply_heat_pump_setback_limit(
+        self, setback_temp: float, comfort_temp: float
+    ) -> float:
+        """For heat pump systems, limit the setback depth.
+
+        Large setbacks (>5°F) cause the heat pump to engage auxiliary
+        resistance heat during recovery, which is 2-5x more expensive.
+        This clamps the away/sleep temperature so the setback doesn't
+        exceed HEAT_PUMP_MAX_SETBACK degrees from comfort.
+
+        When an outdoor temperature sensor is available, the limit adapts:
+        - Below OUTDOOR_COLD_THRESHOLD (30°F): tighten the max setback
+          to 3°F because the heat pump is already near its balance point
+          and recovery would be very slow or impossible without aux heat.
+        - Above OUTDOOR_MILD_THRESHOLD (45°F): relax to the full
+          HEAT_PUMP_MAX_SETBACK because recovery is fast and efficient.
+        """
+        if not self.is_heat_pump:
+            return setback_temp
+
+        if self.hvac_mode == HVACMode.HEAT or self.hvac_mode == HVACMode.HEAT_COOL:
+            max_setback = HEAT_PUMP_MAX_SETBACK
+
+            # Adapt setback limit based on outdoor temperature
+            if self._outdoor_temp is not None:
+                if self._outdoor_temp < OUTDOOR_COLD_THRESHOLD:
+                    # Very cold: heat pump struggling, minimize setback
+                    max_setback = 3.0
+                    _LOGGER.info(
+                        "Outdoor temp %.1f° < %.1f°: tightening heat pump "
+                        "setback limit to %.1f°",
+                        self._outdoor_temp,
+                        OUTDOOR_COLD_THRESHOLD,
+                        max_setback,
+                    )
+                elif self._outdoor_temp > OUTDOOR_MILD_THRESHOLD:
+                    # Mild: heat pump efficient, allow full setback
+                    max_setback = HEAT_PUMP_MAX_SETBACK
+
+            min_allowed = comfort_temp - max_setback
+            if setback_temp < min_allowed:
+                _LOGGER.info(
+                    "Heat pump detected: limiting heating setback from %.1f° to "
+                    "%.1f° (max %.1f° below comfort %.1f°)",
+                    setback_temp,
+                    min_allowed,
+                    max_setback,
+                    comfort_temp,
+                )
+                return min_allowed
+        elif self.hvac_mode == HVACMode.COOL:
+            # In cooling mode, larger setbacks are fine — higher temps save energy
+            pass
+
+        return setback_temp
+
+    # ------------------------------------------------------------------
+    # Pre-conditioning
+    # ------------------------------------------------------------------
+
+    def _is_preconditioning(self) -> bool:
+        """Whether the system is currently pre-conditioning for an upcoming schedule change."""
+        if not self.precondition_enabled or not self.schedule_enabled:
+            return False
+        next_entry, minutes_until = self.scheduler.get_next_entry()
+        if next_entry is None:
+            return False
+        return 0 < minutes_until <= DEFAULT_PRECONDITION_MINUTES
+
+    def _apply_precondition(self, desired_temp: float) -> float:
+        """Start ramping toward the next schedule entry's target before
+        it officially starts.
+
+        This avoids the catch-up spike that happens when the schedule
+        switches from a setback (e.g. sleep 62°F) to comfort (68°F) —
+        by starting early, the house reaches the target on time and the
+        HVAC system runs at a moderate, efficient load instead of running
+        flat-out (or triggering aux heat).
+
+        The ramp is linear: if 30 minutes remain and the gap is 6°F,
+        the target moves 1°F every 5 minutes.
+        """
+        if not self.precondition_enabled or not self.schedule_enabled:
+            return desired_temp
+
+        # Don't pre-condition during a manual override
+        if self.manual_override and not self.manual_override.is_expired:
+            return desired_temp
+
+        next_entry, minutes_until = self.scheduler.get_next_entry()
+        if next_entry is None or minutes_until <= 0:
+            return desired_temp
+
+        if minutes_until > DEFAULT_PRECONDITION_MINUTES:
+            return desired_temp
+
+        next_temp = next_entry.target_temp
+        gap = next_temp - desired_temp
+        if abs(gap) < 1.0:
+            return desired_temp  # already close enough
+
+        # Linear interpolation: how far through the precondition window are we?
+        progress = 1.0 - (minutes_until / DEFAULT_PRECONDITION_MINUTES)
+        progress = max(0.0, min(1.0, progress))
+        ramped = desired_temp + (gap * progress)
+
+        _LOGGER.info(
+            "Pre-conditioning: next entry at %s (%.1f°) in %d min, "
+            "current target %.1f°, ramped to %.1f° (%.0f%% progress)",
+            next_entry.time_start,
+            next_temp,
+            minutes_until,
+            desired_temp,
+            ramped,
+            progress * 100,
+        )
+        return ramped
+
+    # ------------------------------------------------------------------
+    # Time-of-Use rate optimization
+    # ------------------------------------------------------------------
+
+    def _apply_tou_adjustment(self, desired_temp: float) -> float:
+        """Adjust the target temperature based on TOU electricity rates.
+
+        During on-peak hours (expensive electricity):
+        - Cooling: raise the setpoint by TOU_ON_PEAK_COOLING_OFFSET (3°F)
+          so the AC runs less.
+        - Heating: lower the setpoint by TOU_ON_PEAK_HEATING_OFFSET (2°F)
+          so the furnace/heat pump runs less.
+
+        Before on-peak starts (within TOU_PRECONDITION_WINDOW_MINUTES):
+        - Pre-condition the house to the comfort target so it can coast
+          through the on-peak window with minimal HVAC runtime.
+        """
+        if not self.tou_enabled:
+            return desired_temp
+
+        # Don't override a manual override
+        if self.manual_override and not self.manual_override.is_expired:
+            return desired_temp
+
+        rate = self.tou_provider.get_rate_period()
+
+        if rate == RatePeriod.ON_PEAK:
+            if self.hvac_mode == HVACMode.COOL:
+                adjusted = desired_temp + TOU_ON_PEAK_COOLING_OFFSET
+                _LOGGER.info(
+                    "TOU on-peak cooling: raising setpoint from %.1f° to %.1f° "
+                    "(+%.1f° to reduce on-peak usage)",
+                    desired_temp, adjusted, TOU_ON_PEAK_COOLING_OFFSET,
+                )
+                return min(self.temp_max, adjusted)
+            elif self.hvac_mode in (HVACMode.HEAT, HVACMode.HEAT_COOL):
+                adjusted = desired_temp + TOU_ON_PEAK_HEATING_OFFSET  # negative offset
+                _LOGGER.info(
+                    "TOU on-peak heating: lowering setpoint from %.1f° to %.1f° "
+                    "(%.1f° to reduce on-peak usage)",
+                    desired_temp, adjusted, TOU_ON_PEAK_HEATING_OFFSET,
+                )
+                return max(self.temp_min, adjusted)
+
+        # Pre-condition before on-peak: drive the house to comfort temp
+        # so it can coast through the expensive window.
+        minutes_to_peak = self.tou_provider.minutes_until_on_peak()
+        if (
+            minutes_to_peak is not None
+            and 0 < minutes_to_peak <= TOU_PRECONDITION_WINDOW_MINUTES
+        ):
+            comfort = self._get_comfort_reference()
+            if self.hvac_mode == HVACMode.COOL and desired_temp > comfort:
+                _LOGGER.info(
+                    "TOU pre-cool: on-peak in %d min, targeting comfort %.1f° "
+                    "(was %.1f°) to coast through peak",
+                    minutes_to_peak, comfort, desired_temp,
+                )
+                return comfort
+            elif (
+                self.hvac_mode in (HVACMode.HEAT, HVACMode.HEAT_COOL)
+                and desired_temp < comfort
+            ):
+                _LOGGER.info(
+                    "TOU pre-heat: on-peak in %d min, targeting comfort %.1f° "
+                    "(was %.1f°) to coast through peak",
+                    minutes_to_peak, comfort, desired_temp,
+                )
+                return comfort
 
         return desired_temp
 

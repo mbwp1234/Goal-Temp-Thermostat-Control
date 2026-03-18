@@ -25,11 +25,15 @@ from .const import (
     CONF_MANUAL_OVERRIDE_MINUTES,
     CONF_NAME,
     CONF_OCCUPANCY_ENABLED,
+    CONF_OUTDOOR_TEMP_SENSOR,
+    CONF_PRECONDITION_ENABLED,
     CONF_PRESENCE_DETECTION,
     CONF_TEMP_MAX,
     CONF_TEMP_MIN,
     CONF_TEMP_UNIT,
     CONF_THERMOSTAT,
+    CONF_TOU_ENABLED,
+    CONF_TOU_PROVIDER,
     CONF_ZONES,
     DEFAULT_AWAY_TEMP,
     DEFAULT_LEARNING_THRESHOLD,
@@ -349,6 +353,29 @@ class GTTCConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         unit_of_measurement="min",
                     )
                 ),
+                vol.Required(CONF_PRECONDITION_ENABLED, default=True): bool,
+                vol.Required(CONF_TOU_ENABLED, default=False): bool,
+                vol.Required(CONF_TOU_PROVIDER, default="none"): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            selector.SelectOptionDict(
+                                value="none",
+                                label="None (disabled)",
+                            ),
+                            selector.SelectOptionDict(
+                                value="dominion_virginia",
+                                label="Dominion Energy Virginia",
+                            ),
+                        ],
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                vol.Optional(CONF_OUTDOOR_TEMP_SENSOR): selector.EntitySelector(
+                    selector.EntitySelectorConfig(
+                        domain=SENSOR_DOMAIN,
+                        device_class="temperature",
+                    )
+                ),
             }
         )
 
@@ -484,6 +511,41 @@ class GTTCOptionsFlow(config_entries.OptionsFlow):
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
                         min=15, max=480, step=15, unit_of_measurement="min"
+                    )
+                ),
+                vol.Required(
+                    CONF_PRECONDITION_ENABLED,
+                    default=data.get(CONF_PRECONDITION_ENABLED, True),
+                ): bool,
+                vol.Required(
+                    CONF_TOU_ENABLED,
+                    default=data.get(CONF_TOU_ENABLED, False),
+                ): bool,
+                vol.Required(
+                    CONF_TOU_PROVIDER,
+                    default=data.get(CONF_TOU_PROVIDER, "none"),
+                ): selector.SelectSelector(
+                    selector.SelectSelectorConfig(
+                        options=[
+                            selector.SelectOptionDict(
+                                value="none",
+                                label="None (disabled)",
+                            ),
+                            selector.SelectOptionDict(
+                                value="dominion_virginia",
+                                label="Dominion Energy Virginia",
+                            ),
+                        ],
+                        mode=selector.SelectSelectorMode.DROPDOWN,
+                    )
+                ),
+                vol.Optional(
+                    CONF_OUTDOOR_TEMP_SENSOR,
+                    default=data.get(CONF_OUTDOOR_TEMP_SENSOR) or vol.UNDEFINED,
+                ): selector.EntitySelector(
+                    selector.EntitySelectorConfig(
+                        domain=SENSOR_DOMAIN,
+                        device_class="temperature",
                     )
                 ),
             }
