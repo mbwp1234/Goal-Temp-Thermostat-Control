@@ -83,7 +83,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id, None)
 
-    # Unregister services if no more entries
+    # Unregister services and panel if no more entries
     if not hass.data.get(DOMAIN):
         for service in (
             SERVICE_SET_ZONE_TEMP,
@@ -96,6 +96,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             SERVICE_TOGGLE_SCHEDULE,
         ):
             hass.services.async_remove(DOMAIN, service)
+
+        if hass.data.pop(f"{DOMAIN}_panel_registered", None):
+            from homeassistant.components.frontend import async_remove_panel
+            async_remove_panel(hass, "gttc-schedule")
 
     return unload_ok
 
@@ -130,8 +134,13 @@ def _get_coordinator(
 
 async def _async_register_panel(hass: HomeAssistant) -> None:
     """Register the sidebar panel and WebSocket API (idempotent)."""
-    # Register WebSocket commands
+    # Register WebSocket commands (safe to call multiple times)
     async_register_api(hass)
+
+    # Static path and panel registration must only happen once — calling
+    # them again on reload raises errors (path/panel already registered).
+    if hass.data.get(f"{DOMAIN}_panel_registered"):
+        return
 
     # Serve the frontend JS file
     await hass.http.async_register_static_paths(
@@ -148,6 +157,8 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
         config={"_panel_custom": {"name": "gttc-panel", "js_url": PANEL_URL}},
         require_admin=False,
     )
+
+    hass.data[f"{DOMAIN}_panel_registered"] = True
 
 
 def _register_services(hass: HomeAssistant) -> None:
