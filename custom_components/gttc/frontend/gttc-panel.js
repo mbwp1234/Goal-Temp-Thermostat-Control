@@ -5,7 +5,12 @@
  *   - Day tabs with 24-hour timeline
  *   - Colored temperature blocks
  *   - Click-to-edit with inline form
- *   - Preset selector
+ *   - Preset selector with deactivate support
+ *   - Copy entry to other days
+ *   - Bulk add entry to multiple days
+ *   - Cancel override button
+ *   - Zone/room selector per entry
+ *   - Schedule mode toggle (weekday/weekend vs per-day)
  *   - Current status display
  */
 
@@ -15,6 +20,10 @@ const DAYS_ORDERED = [
 const DAY_LABELS = {
   monday: "Mon", tuesday: "Tue", wednesday: "Wed", thursday: "Thu",
   friday: "Fri", saturday: "Sat", sunday: "Sun",
+};
+const DAY_LABELS_FULL = {
+  monday: "Monday", tuesday: "Tuesday", wednesday: "Wednesday", thursday: "Thursday",
+  friday: "Friday", saturday: "Saturday", sunday: "Sunday",
 };
 const HOURS = Array.from({ length: 25 }, (_, i) => i); // 0-24 for labels
 
@@ -56,9 +65,12 @@ class GttcPanel extends HTMLElement {
     this._schedule = null;
     this._status = null;
     this._selectedDay = null;
-    this._editingEntry = null; // {entry, isNew}
+    this._editingEntry = null; // {entry, isNew, day, index}
     this._activePreset = null;
     this._viewMode = "week"; // "week" or "day"
+    this._copyingEntry = null; // {entry, sourceDay} — entry being copied
+    this._showCopyModal = false;
+    this._copyTargetDays = new Set();
   }
 
   set hass(hass) {
@@ -131,6 +143,7 @@ class GttcPanel extends HTMLElement {
           </div>
           <div class="header-right">
             ${this._renderStatus()}
+            ${this._renderScheduleMode()}
             ${this._renderPresetSelector()}
           </div>
         </header>
@@ -152,6 +165,7 @@ class GttcPanel extends HTMLElement {
         </div>
 
         ${this._editingEntry ? this._renderEditModal() : ""}
+        ${this._showCopyModal ? this._renderCopyModal() : ""}
       </div>
     `;
 
@@ -162,11 +176,26 @@ class GttcPanel extends HTMLElement {
     const st = this._status;
     if (!st) return "";
     const parts = [];
-    if (st.current_temp != null) parts.push(`<span class="status-item">Now: ${st.current_temp.toFixed(1)}°</span>`);
-    if (st.target_temp != null) parts.push(`<span class="status-item">Goal: ${st.target_temp.toFixed(1)}°</span>`);
+    if (st.current_temp != null) parts.push(`<span class="status-item">Now: ${st.current_temp.toFixed(1)}\u00b0</span>`);
+    if (st.target_temp != null) parts.push(`<span class="status-item">Goal: ${st.target_temp.toFixed(1)}\u00b0</span>`);
     if (st.active_zone) parts.push(`<span class="status-item">${st.active_zone}</span>`);
-    if (st.override_active) parts.push(`<span class="status-item override">Override: ${st.override_remaining}m</span>`);
+    if (st.override_active) {
+      parts.push(`<span class="status-item override">Override: ${st.override_remaining}m
+        <button class="btn-cancel-override" id="cancelOverrideBtn" title="Cancel Override">\u2715</button>
+      </span>`);
+    }
     return `<div class="status-bar">${parts.join("")}</div>`;
+  }
+
+  _renderScheduleMode() {
+    const s = this._schedule;
+    if (s.active_preset) return ""; // Mode toggle not relevant when preset active
+    return `
+      <select class="mode-select" id="modeSelect">
+        <option value="weekday_weekend" ${s.mode === "weekday_weekend" ? "selected" : ""}>Weekday / Weekend</option>
+        <option value="per_day" ${s.mode === "per_day" ? "selected" : ""}>Per Day</option>
+      </select>
+    `;
   }
 
   _renderPresetSelector() {
@@ -220,7 +249,10 @@ class GttcPanel extends HTMLElement {
       <div class="day-detail">
         <div class="day-detail-header">
           <h2>${day.charAt(0).toUpperCase() + day.slice(1)} Schedule</h2>
-          <button class="btn btn-add" id="addEntryBtn">+ Add Entry</button>
+          <div class="day-actions">
+            <button class="btn btn-add" id="addEntryBtn">+ Add Entry</button>
+            <button class="btn btn-bulk" id="bulkAddBtn">+ Bulk Add</button>
+          </div>
         </div>
         <div class="day-timeline-container">
           <div class="day-timeline-hours">
@@ -258,15 +290,16 @@ class GttcPanel extends HTMLElement {
       const widthPct = ((endMin - startMin) / 1440) * 100;
       const color = tempColor(entry.target_temp, s.temp_min, s.temp_max);
       const textColor = this._contrastColor(color);
+      const zoneLabel = entry.zone_id ? ` [${this._getZoneName(entry.zone_id)}]` : "";
 
       return `
         <div class="timeline-block ${compact ? "compact" : ""}"
              style="left:${leftPct}%;width:${widthPct}%;background:${color};color:${textColor}"
              data-day="${day}" data-index="${i}"
-             title="${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}: ${entry.target_temp}°F">
+             title="${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}: ${entry.target_temp}\u00b0F${zoneLabel}">
           ${compact
-            ? `<span class="block-temp">${entry.target_temp}°</span>`
-            : `<span class="block-temp">${entry.target_temp}°F</span>
+            ? `<span class="block-temp">${entry.target_temp}\u00b0</span>`
+            : `<span class="block-temp">${entry.target_temp}\u00b0F</span>
                <span class="block-time">${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}</span>`
           }
         </div>
@@ -277,14 +310,17 @@ class GttcPanel extends HTMLElement {
   _renderEntryCard(entry, index, day) {
     const s = this._schedule;
     const color = tempColor(entry.target_temp, s.temp_min, s.temp_max);
+    const zoneLabel = entry.zone_id ? this._getZoneName(entry.zone_id) : "";
     return `
       <div class="entry-card" data-day="${day}" data-index="${index}">
         <div class="entry-color" style="background:${color}"></div>
         <div class="entry-info">
-          <span class="entry-time">${formatTime12(entry.time_start)} — ${formatTime12(entry.time_end)}</span>
-          <span class="entry-temp">${entry.target_temp}°F</span>
+          <span class="entry-time">${formatTime12(entry.time_start)} \u2014 ${formatTime12(entry.time_end)}</span>
+          <span class="entry-temp">${entry.target_temp}\u00b0F</span>
+          ${zoneLabel ? `<span class="entry-zone">${zoneLabel}</span>` : ""}
         </div>
         <div class="entry-actions">
+          <button class="btn btn-sm btn-copy" data-action="copy" data-day="${day}" data-index="${index}" title="Copy to other days">Copy</button>
           <button class="btn btn-sm btn-edit" data-action="edit" data-day="${day}" data-index="${index}">Edit</button>
           <button class="btn btn-sm btn-delete" data-action="delete" data-day="${day}" data-index="${index}">Delete</button>
         </div>
@@ -292,17 +328,46 @@ class GttcPanel extends HTMLElement {
     `;
   }
 
+  _getZoneName(zoneId) {
+    const s = this._schedule;
+    if (!s || !s.zones) return zoneId;
+    const zone = s.zones.find(z => z.id === zoneId);
+    return zone ? zone.name : zoneId;
+  }
+
   _renderEditModal() {
     const e = this._editingEntry;
     const entry = e.entry || {};
     const s = this._schedule;
-    const title = e.isNew ? "Add Schedule Entry" : "Edit Schedule Entry";
+    const isBulk = !!e.isBulk;
+    const title = isBulk ? "Bulk Add Entry" : (e.isNew ? "Add Schedule Entry" : "Edit Schedule Entry");
+
+    const zones = s.zones || [];
+    const hasZones = zones.length > 0;
 
     return `
       <div class="modal-overlay" id="modalOverlay">
         <div class="modal">
           <h3>${title}</h3>
           <form id="entryForm">
+            ${isBulk ? `
+              <div class="form-row">
+                <label>Select Days</label>
+                <div class="day-checkboxes" id="bulkDayCheckboxes">
+                  ${DAYS_ORDERED.map(d => `
+                    <label class="day-checkbox-label">
+                      <input type="checkbox" value="${d}" ${e.targetDays && e.targetDays.has(d) ? "checked" : ""}>
+                      <span>${DAY_LABELS[d]}</span>
+                    </label>
+                  `).join("")}
+                  <div class="quick-select">
+                    <button type="button" class="btn btn-xs" id="selectWeekdays">Weekdays</button>
+                    <button type="button" class="btn btn-xs" id="selectWeekend">Weekend</button>
+                    <button type="button" class="btn btn-xs" id="selectAll">All</button>
+                  </div>
+                </div>
+              </div>
+            ` : ""}
             <div class="form-row">
               <label>Start Time</label>
               <input type="time" id="editStart" value="${entry.time_start || "08:00"}" required>
@@ -312,24 +377,72 @@ class GttcPanel extends HTMLElement {
               <input type="time" id="editEnd" value="${entry.time_end || "17:00"}" required>
             </div>
             <div class="form-row">
-              <label>Temperature (°F)</label>
+              <label>Temperature (\u00b0F)</label>
               <div class="temp-input-row">
                 <input type="range" id="editTempRange" min="${s.temp_min}" max="${s.temp_max}" step="1"
                        value="${entry.target_temp || 70}">
                 <input type="number" id="editTemp" min="${s.temp_min}" max="${s.temp_max}" step="0.5"
                        value="${entry.target_temp || 70}" required>
-                <span class="temp-unit">°F</span>
+                <span class="temp-unit">\u00b0F</span>
               </div>
               <div class="temp-preview" id="tempPreview"
                    style="background:${tempColor(entry.target_temp || 70, s.temp_min, s.temp_max)}">
-                ${entry.target_temp || 70}°F
+                ${entry.target_temp || 70}\u00b0F
               </div>
             </div>
+            ${hasZones ? `
+              <div class="form-row">
+                <label>Zone / Room (optional)</label>
+                <select id="editZone" class="zone-select">
+                  <option value="">All Zones (default)</option>
+                  ${zones.map(z => `
+                    <option value="${z.id}" ${entry.zone_id === z.id ? "selected" : ""}>${z.name}</option>
+                  `).join("")}
+                </select>
+              </div>
+            ` : ""}
             <div class="form-actions">
               <button type="button" class="btn btn-cancel" id="cancelEdit">Cancel</button>
-              <button type="submit" class="btn btn-save">Save</button>
+              <button type="submit" class="btn btn-save">${isBulk ? "Add to Selected Days" : "Save"}</button>
             </div>
           </form>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderCopyModal() {
+    const entry = this._copyingEntry;
+    if (!entry) return "";
+    return `
+      <div class="modal-overlay" id="copyModalOverlay">
+        <div class="modal">
+          <h3>Copy Entry to Other Days</h3>
+          <p class="copy-info">
+            ${formatTime12(entry.entry.time_start)} \u2014 ${formatTime12(entry.entry.time_end)} at ${entry.entry.target_temp}\u00b0F
+          </p>
+          <div class="form-row">
+            <label>Copy to:</label>
+            <div class="day-checkboxes" id="copyDayCheckboxes">
+              ${DAYS_ORDERED.map(d => `
+                <label class="day-checkbox-label">
+                  <input type="checkbox" value="${d}"
+                    ${d === entry.sourceDay ? "disabled" : ""}
+                    ${this._copyTargetDays.has(d) ? "checked" : ""}>
+                  <span class="${d === entry.sourceDay ? "source-day" : ""}">${DAY_LABELS_FULL[d]}${d === entry.sourceDay ? " (source)" : ""}</span>
+                </label>
+              `).join("")}
+              <div class="quick-select">
+                <button type="button" class="btn btn-xs" id="copySelectWeekdays">Weekdays</button>
+                <button type="button" class="btn btn-xs" id="copySelectWeekend">Weekend</button>
+                <button type="button" class="btn btn-xs" id="copySelectAll">All Others</button>
+              </div>
+            </div>
+          </div>
+          <div class="form-actions">
+            <button type="button" class="btn btn-cancel" id="cancelCopy">Cancel</button>
+            <button type="button" class="btn btn-save" id="confirmCopy">Copy</button>
+          </div>
         </div>
       </div>
     `;
@@ -395,6 +508,21 @@ class GttcPanel extends HTMLElement {
       });
     });
 
+    // Copy buttons
+    root.querySelectorAll("[data-action='copy']").forEach(btn => {
+      btn.addEventListener("click", () => {
+        const day = btn.dataset.day;
+        const idx = parseInt(btn.dataset.index);
+        const entries = this._getEntriesForDay(day);
+        if (entries[idx]) {
+          this._copyingEntry = { entry: { ...entries[idx] }, sourceDay: day };
+          this._copyTargetDays = new Set();
+          this._showCopyModal = true;
+          this._render();
+        }
+      });
+    });
+
     // Add entry button
     const addBtn = root.getElementById("addEntryBtn");
     if (addBtn) {
@@ -402,6 +530,21 @@ class GttcPanel extends HTMLElement {
         this._editingEntry = {
           entry: { time_start: "08:00", time_end: "17:00", target_temp: 70 },
           isNew: true,
+          day: this._selectedDay,
+        };
+        this._render();
+      });
+    }
+
+    // Bulk add button
+    const bulkBtn = root.getElementById("bulkAddBtn");
+    if (bulkBtn) {
+      bulkBtn.addEventListener("click", () => {
+        this._editingEntry = {
+          entry: { time_start: "08:00", time_end: "17:00", target_temp: 70 },
+          isNew: true,
+          isBulk: true,
+          targetDays: new Set([this._selectedDay]),
           day: this._selectedDay,
         };
         this._render();
@@ -416,7 +559,24 @@ class GttcPanel extends HTMLElement {
       });
     }
 
-    // Modal
+    // Schedule mode selector
+    const modeSelect = root.getElementById("modeSelect");
+    if (modeSelect) {
+      modeSelect.addEventListener("change", () => {
+        this._setScheduleMode(modeSelect.value);
+      });
+    }
+
+    // Cancel override button
+    const cancelOverrideBtn = root.getElementById("cancelOverrideBtn");
+    if (cancelOverrideBtn) {
+      cancelOverrideBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        this._cancelOverride();
+      });
+    }
+
+    // Modal overlay
     const overlay = root.getElementById("modalOverlay");
     if (overlay) {
       overlay.addEventListener("click", (e) => {
@@ -435,6 +595,20 @@ class GttcPanel extends HTMLElement {
       });
     }
 
+    // Bulk day quick-select buttons
+    const selectWeekdays = root.getElementById("selectWeekdays");
+    if (selectWeekdays) {
+      selectWeekdays.addEventListener("click", () => this._quickSelectDays("weekdays", "bulkDayCheckboxes"));
+    }
+    const selectWeekend = root.getElementById("selectWeekend");
+    if (selectWeekend) {
+      selectWeekend.addEventListener("click", () => this._quickSelectDays("weekend", "bulkDayCheckboxes"));
+    }
+    const selectAll = root.getElementById("selectAll");
+    if (selectAll) {
+      selectAll.addEventListener("click", () => this._quickSelectDays("all", "bulkDayCheckboxes"));
+    }
+
     // Temperature slider/input sync
     const tempRange = root.getElementById("editTempRange");
     const tempInput = root.getElementById("editTemp");
@@ -446,7 +620,7 @@ class GttcPanel extends HTMLElement {
         tempInput.value = val;
         if (tempPreview) {
           tempPreview.style.background = tempColor(parseFloat(val), s.temp_min, s.temp_max);
-          tempPreview.textContent = `${val}°F`;
+          tempPreview.textContent = `${val}\u00b0F`;
         }
       };
       tempRange.addEventListener("input", () => syncTemp(tempRange.value));
@@ -458,9 +632,97 @@ class GttcPanel extends HTMLElement {
     if (form) {
       form.addEventListener("submit", (e) => {
         e.preventDefault();
-        this._saveEntry();
+        if (this._editingEntry && this._editingEntry.isBulk) {
+          this._saveBulkEntry();
+        } else {
+          this._saveEntry();
+        }
       });
     }
+
+    // Copy modal
+    const copyOverlay = root.getElementById("copyModalOverlay");
+    if (copyOverlay) {
+      copyOverlay.addEventListener("click", (e) => {
+        if (e.target === copyOverlay) {
+          this._showCopyModal = false;
+          this._copyingEntry = null;
+          this._render();
+        }
+      });
+    }
+
+    const cancelCopy = root.getElementById("cancelCopy");
+    if (cancelCopy) {
+      cancelCopy.addEventListener("click", () => {
+        this._showCopyModal = false;
+        this._copyingEntry = null;
+        this._render();
+      });
+    }
+
+    const confirmCopy = root.getElementById("confirmCopy");
+    if (confirmCopy) {
+      confirmCopy.addEventListener("click", () => this._executeCopy());
+    }
+
+    // Copy day quick-select buttons
+    const copySelectWeekdays = root.getElementById("copySelectWeekdays");
+    if (copySelectWeekdays) {
+      copySelectWeekdays.addEventListener("click", () => this._quickSelectDays("weekdays", "copyDayCheckboxes"));
+    }
+    const copySelectWeekend = root.getElementById("copySelectWeekend");
+    if (copySelectWeekend) {
+      copySelectWeekend.addEventListener("click", () => this._quickSelectDays("weekend", "copyDayCheckboxes"));
+    }
+    const copySelectAll = root.getElementById("copySelectAll");
+    if (copySelectAll) {
+      copySelectAll.addEventListener("click", () => this._quickSelectDays("all_others", "copyDayCheckboxes"));
+    }
+
+    // Track checkbox changes in copy modal
+    const copyCheckboxes = root.getElementById("copyDayCheckboxes");
+    if (copyCheckboxes) {
+      copyCheckboxes.querySelectorAll("input[type='checkbox']").forEach(cb => {
+        cb.addEventListener("change", () => {
+          if (cb.checked) {
+            this._copyTargetDays.add(cb.value);
+          } else {
+            this._copyTargetDays.delete(cb.value);
+          }
+        });
+      });
+    }
+  }
+
+  _quickSelectDays(mode, containerId) {
+    const root = this.shadowRoot;
+    const container = root.getElementById(containerId);
+    if (!container) return;
+
+    const weekdays = ["monday", "tuesday", "wednesday", "thursday", "friday"];
+    const weekend = ["saturday", "sunday"];
+    const sourceDay = this._copyingEntry ? this._copyingEntry.sourceDay : null;
+
+    container.querySelectorAll("input[type='checkbox']").forEach(cb => {
+      if (cb.disabled) return;
+      const day = cb.value;
+      if (mode === "weekdays") {
+        cb.checked = weekdays.includes(day);
+      } else if (mode === "weekend") {
+        cb.checked = weekend.includes(day);
+      } else if (mode === "all") {
+        cb.checked = true;
+      } else if (mode === "all_others") {
+        cb.checked = day !== sourceDay;
+      }
+
+      // Update tracking sets
+      if (containerId === "copyDayCheckboxes") {
+        if (cb.checked) this._copyTargetDays.add(day);
+        else this._copyTargetDays.delete(day);
+      }
+    });
   }
 
   async _saveEntry() {
@@ -468,6 +730,8 @@ class GttcPanel extends HTMLElement {
     const start = root.getElementById("editStart").value;
     const end = root.getElementById("editEnd").value;
     const temp = parseFloat(root.getElementById("editTemp").value);
+    const zoneSelect = root.getElementById("editZone");
+    const zoneId = zoneSelect ? zoneSelect.value || undefined : undefined;
     const e = this._editingEntry;
 
     const msg = {
@@ -477,6 +741,8 @@ class GttcPanel extends HTMLElement {
       time_end: end,
       target_temp: temp,
     };
+
+    if (zoneId) msg.zone_id = zoneId;
 
     if (!e.isNew && e.entry) {
       msg.old_time_start = e.entry.time_start;
@@ -498,8 +764,90 @@ class GttcPanel extends HTMLElement {
     }
   }
 
+  async _saveBulkEntry() {
+    const root = this.shadowRoot;
+    const start = root.getElementById("editStart").value;
+    const end = root.getElementById("editEnd").value;
+    const temp = parseFloat(root.getElementById("editTemp").value);
+    const zoneSelect = root.getElementById("editZone");
+    const zoneId = zoneSelect ? zoneSelect.value || undefined : undefined;
+
+    // Collect checked days
+    const container = root.getElementById("bulkDayCheckboxes");
+    const days = [];
+    if (container) {
+      container.querySelectorAll("input[type='checkbox']:checked").forEach(cb => {
+        days.push(cb.value);
+      });
+    }
+
+    if (days.length === 0) {
+      alert("Please select at least one day.");
+      return;
+    }
+
+    const msg = {
+      type: "gttc/bulk_add_entry",
+      days: days,
+      time_start: start,
+      time_end: end,
+      target_temp: temp,
+    };
+
+    if (zoneId) msg.zone_id = zoneId;
+
+    const s = this._schedule;
+    if (s.active_preset) {
+      msg.preset = s.active_preset;
+    }
+
+    try {
+      await this._hass.callWS(msg);
+      this._editingEntry = null;
+      await this._loadData();
+    } catch (err) {
+      console.error("GTTC: Failed to bulk add entry", err);
+      alert("Failed to add: " + (err.message || err));
+    }
+  }
+
+  async _executeCopy() {
+    const entry = this._copyingEntry;
+    if (!entry) return;
+
+    const targetDays = Array.from(this._copyTargetDays);
+    if (targetDays.length === 0) {
+      alert("Please select at least one target day.");
+      return;
+    }
+
+    const msg = {
+      type: "gttc/copy_entry_to_days",
+      source_day: entry.sourceDay,
+      time_start: entry.entry.time_start,
+      time_end: entry.entry.time_end,
+      target_days: targetDays,
+    };
+
+    const s = this._schedule;
+    if (s.active_preset) {
+      msg.preset = s.active_preset;
+    }
+
+    try {
+      await this._hass.callWS(msg);
+      this._showCopyModal = false;
+      this._copyingEntry = null;
+      this._copyTargetDays = new Set();
+      await this._loadData();
+    } catch (err) {
+      console.error("GTTC: Failed to copy entry", err);
+      alert("Failed to copy: " + (err.message || err));
+    }
+  }
+
   async _deleteEntry(day, entry) {
-    if (!confirm(`Delete ${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)} (${entry.target_temp}°F)?`)) {
+    if (!confirm(`Delete ${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)} (${entry.target_temp}\u00b0F)?`)) {
       return;
     }
 
@@ -528,12 +876,35 @@ class GttcPanel extends HTMLElement {
     try {
       if (presetName) {
         await this._hass.callService("gttc", "set_preset", { preset: presetName });
+      } else {
+        // Deactivate preset
+        await this._hass.callWS({ type: "gttc/deactivate_preset" });
       }
       // Reload data
       await new Promise(r => setTimeout(r, 500));
       await this._loadData();
     } catch (err) {
       console.error("GTTC: Failed to set preset", err);
+    }
+  }
+
+  async _setScheduleMode(mode) {
+    try {
+      await this._hass.callWS({ type: "gttc/set_schedule_mode", mode: mode });
+      await new Promise(r => setTimeout(r, 300));
+      await this._loadData();
+    } catch (err) {
+      console.error("GTTC: Failed to set schedule mode", err);
+    }
+  }
+
+  async _cancelOverride() {
+    try {
+      await this._hass.callWS({ type: "gttc/cancel_override" });
+      await this._loadData();
+    } catch (err) {
+      console.error("GTTC: Failed to cancel override", err);
+      alert("Failed to cancel override: " + (err.message || err));
     }
   }
 
@@ -544,7 +915,6 @@ class GttcPanel extends HTMLElement {
 
   _contrastColor(bgColor) {
     // Simple: use white for dark backgrounds, dark for light
-    // Parse HSL from our tempColor function
     return "rgba(255,255,255,0.95)";
   }
 
@@ -614,6 +984,9 @@ class GttcPanel extends HTMLElement {
         padding: 4px 10px;
         border-radius: 12px;
         border: 1px solid var(--divider);
+        display: flex;
+        align-items: center;
+        gap: 6px;
       }
       .status-item.override {
         background: #fff3e0;
@@ -621,8 +994,29 @@ class GttcPanel extends HTMLElement {
         color: #e65100;
       }
 
-      /* Preset selector */
-      .preset-select {
+      /* Cancel override button */
+      .btn-cancel-override {
+        background: none;
+        border: 1px solid #e65100;
+        color: #e65100;
+        border-radius: 50%;
+        width: 20px;
+        height: 20px;
+        font-size: 12px;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 0;
+        line-height: 1;
+      }
+      .btn-cancel-override:hover {
+        background: #e65100;
+        color: #fff;
+      }
+
+      /* Preset & mode selectors */
+      .preset-select, .mode-select {
         padding: 6px 12px;
         border-radius: 8px;
         border: 1px solid var(--divider);
@@ -780,6 +1174,10 @@ class GttcPanel extends HTMLElement {
         font-size: 18px;
         font-weight: 500;
       }
+      .day-actions {
+        display: flex;
+        gap: 8px;
+      }
 
       /* Day timeline */
       .day-timeline-container {
@@ -859,6 +1257,14 @@ class GttcPanel extends HTMLElement {
         font-size: 16px;
         font-weight: 600;
       }
+      .entry-zone {
+        font-size: 12px;
+        color: var(--secondary-text);
+        background: var(--card-bg);
+        padding: 2px 8px;
+        border-radius: 10px;
+        border: 1px solid var(--divider);
+      }
       .entry-actions {
         display: flex;
         gap: 6px;
@@ -881,12 +1287,44 @@ class GttcPanel extends HTMLElement {
       .btn-add:hover {
         filter: brightness(0.9);
       }
+      .btn-bulk {
+        background: transparent;
+        color: var(--primary);
+        border: 1px solid var(--primary);
+      }
+      .btn-bulk:hover {
+        background: var(--primary);
+        color: #fff;
+      }
       .btn-sm {
         padding: 4px 10px;
         font-size: 12px;
         border-radius: 6px;
       }
+      .btn-xs {
+        padding: 3px 8px;
+        font-size: 11px;
+        border-radius: 4px;
+        background: var(--bg);
+        color: var(--primary-text);
+        border: 1px solid var(--divider);
+        cursor: pointer;
+      }
+      .btn-xs:hover {
+        background: var(--primary);
+        color: #fff;
+        border-color: var(--primary);
+      }
       .btn-edit {
+        background: var(--primary);
+        color: #fff;
+      }
+      .btn-copy {
+        background: transparent;
+        color: var(--primary);
+        border: 1px solid var(--primary);
+      }
+      .btn-copy:hover {
         background: var(--primary);
         color: #fff;
       }
@@ -924,13 +1362,24 @@ class GttcPanel extends HTMLElement {
         border-radius: 16px;
         padding: 24px;
         min-width: 340px;
-        max-width: 420px;
+        max-width: 460px;
         box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+        max-height: 90vh;
+        overflow-y: auto;
       }
       .modal h3 {
         margin: 0 0 16px;
         font-size: 18px;
         font-weight: 500;
+      }
+      .copy-info {
+        font-size: 14px;
+        color: var(--secondary-text);
+        margin: 0 0 12px;
+        padding: 8px 12px;
+        background: var(--bg);
+        border-radius: 8px;
+        border: 1px solid var(--divider);
       }
       .form-row {
         margin-bottom: 14px;
@@ -943,7 +1392,8 @@ class GttcPanel extends HTMLElement {
         margin-bottom: 4px;
       }
       .form-row input[type="time"],
-      .form-row input[type="number"] {
+      .form-row input[type="number"],
+      .form-row select {
         width: 100%;
         padding: 8px 12px;
         border: 1px solid var(--divider);
@@ -952,6 +1402,17 @@ class GttcPanel extends HTMLElement {
         background: var(--bg);
         color: var(--primary-text);
         box-sizing: border-box;
+      }
+      .zone-select {
+        width: 100%;
+        padding: 8px 12px;
+        border: 1px solid var(--divider);
+        border-radius: 8px;
+        font-size: 14px;
+        background: var(--bg);
+        color: var(--primary-text);
+        box-sizing: border-box;
+        cursor: pointer;
       }
       .temp-input-row {
         display: flex;
@@ -986,6 +1447,43 @@ class GttcPanel extends HTMLElement {
         margin-top: 20px;
       }
 
+      /* Day checkboxes for bulk/copy */
+      .day-checkboxes {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        padding: 8px 0;
+      }
+      .day-checkbox-label {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 14px;
+        cursor: pointer;
+        padding: 4px 8px;
+        border-radius: 6px;
+        transition: background 0.1s;
+      }
+      .day-checkbox-label:hover {
+        background: var(--bg);
+      }
+      .day-checkbox-label input[type="checkbox"] {
+        width: 18px;
+        height: 18px;
+        cursor: pointer;
+      }
+      .source-day {
+        color: var(--secondary-text);
+        font-style: italic;
+      }
+      .quick-select {
+        display: flex;
+        gap: 6px;
+        margin-top: 6px;
+        padding-top: 6px;
+        border-top: 1px solid var(--divider);
+      }
+
       /* Responsive */
       @media (max-width: 600px) {
         .header {
@@ -1001,6 +1499,14 @@ class GttcPanel extends HTMLElement {
         }
         .day-tab {
           min-width: 42px;
+        }
+        .day-actions {
+          flex-direction: column;
+          gap: 4px;
+        }
+        .entry-actions {
+          flex-direction: column;
+          gap: 4px;
         }
       }
     `;

@@ -20,6 +20,11 @@ def async_register_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_update_entry)
     websocket_api.async_register_command(hass, ws_delete_entry)
     websocket_api.async_register_command(hass, ws_get_status)
+    websocket_api.async_register_command(hass, ws_bulk_add_entry)
+    websocket_api.async_register_command(hass, ws_copy_entry_to_days)
+    websocket_api.async_register_command(hass, ws_cancel_override)
+    websocket_api.async_register_command(hass, ws_deactivate_preset)
+    websocket_api.async_register_command(hass, ws_set_schedule_mode)
 
 
 def _get_coordinator(hass: HomeAssistant, entry_id: str | None = None):
@@ -67,6 +72,11 @@ async def ws_get_schedule(
             },
         }
 
+    # Build zone data for the frontend
+    zones_data = []
+    for zone in coordinator.zone_manager.zones.values():
+        zones_data.append(zone.to_dict())
+
     result = {
         "mode": schedule.mode,
         "active_preset": schedule.active_preset,
@@ -81,6 +91,8 @@ async def ws_get_schedule(
         "enabled": coordinator.schedule_enabled,
         "temp_min": coordinator.temp_min,
         "temp_max": coordinator.temp_max,
+        "zones": zones_data,
+        "active_zone_id": coordinator.zone_manager.active_zone_id,
     }
     connection.send_result(msg["id"], result)
 
@@ -235,6 +247,189 @@ async def ws_get_status(
         "schedule_enabled": coordinator.schedule_enabled,
     }
     connection.send_result(msg["id"], result)
+
+
+# ── Bulk add entry to multiple days ──────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/bulk_add_entry",
+        vol.Required("days"): [str],
+        vol.Required("time_start"): str,
+        vol.Required("time_end"): str,
+        vol.Required("target_temp"): vol.Coerce(float),
+        vol.Optional("zone_id"): str,
+        vol.Optional("preset"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_bulk_add_entry(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Add a schedule entry to multiple days at once."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    scheduler = coordinator.scheduler
+    preset_name = msg.get("preset") or scheduler.schedule.active_preset
+
+    from .models import ScheduleEntry
+
+    added_days = []
+    failed_days = []
+
+    for day in msg["days"]:
+        new_entry = ScheduleEntry(
+            time_start=msg["time_start"],
+            time_end=msg["time_end"],
+            target_temp=msg["target_temp"],
+            zone_id=msg.get("zone_id"),
+        )
+        entries_list = _get_entries_list(scheduler, preset_name, day)
+        if entries_list is None:
+            failed_days.append(day)
+            continue
+        entries_list.append(new_entry)
+        entries_list.sort(key=lambda e: e.time_start)
+        added_days.append(day)
+
+    await coordinator.async_save()
+    connection.send_result(msg["id"], {"success": True, "added_days": added_days, "failed_days": failed_days})
+
+
+# ── Copy entry to other days ────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/copy_entry_to_days",
+        vol.Required("source_day"): str,
+        vol.Required("time_start"): str,
+        vol.Required("time_end"): str,
+        vol.Required("target_days"): [str],
+        vol.Optional("preset"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_copy_entry_to_days(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Copy a schedule entry from one day to other days."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    scheduler = coordinator.scheduler
+    preset_name = msg.get("preset") or scheduler.schedule.active_preset
+
+    # Find source entry
+    source_list = _get_entries_list(scheduler, preset_name, msg["source_day"])
+    if source_list is None:
+        connection.send_error(msg["id"], "invalid_day", f"Cannot find schedule for day '{msg['source_day']}'")
+        return
+
+    source_entry = None
+    for entry in source_list:
+        if entry.time_start == msg["time_start"] and entry.time_end == msg["time_end"]:
+            source_entry = entry
+            break
+
+    if source_entry is None:
+        connection.send_error(msg["id"], "not_found", "Source entry not found")
+        return
+
+    from .models import ScheduleEntry
+
+    copied_days = []
+    for day in msg["target_days"]:
+        target_list = _get_entries_list(scheduler, preset_name, day)
+        if target_list is None:
+            continue
+        new_entry = ScheduleEntry(
+            time_start=source_entry.time_start,
+            time_end=source_entry.time_end,
+            target_temp=source_entry.target_temp,
+            zone_id=source_entry.zone_id,
+        )
+        target_list.append(new_entry)
+        target_list.sort(key=lambda e: e.time_start)
+        copied_days.append(day)
+
+    await coordinator.async_save()
+    connection.send_result(msg["id"], {"success": True, "copied_days": copied_days})
+
+
+# ── Cancel override via WebSocket ───────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/cancel_override",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_cancel_override(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Cancel the active manual override."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    await coordinator.async_cancel_override()
+    connection.send_result(msg["id"], {"success": True})
+
+
+# ── Deactivate preset ──────────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/deactivate_preset",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_deactivate_preset(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Deactivate the current preset and return to custom schedule."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    coordinator.scheduler.deactivate_preset()
+    await coordinator.async_save()
+    connection.send_result(msg["id"], {"success": True})
+
+
+# ── Set schedule mode ───────────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/set_schedule_mode",
+        vol.Required("mode"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_schedule_mode(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Switch schedule mode between weekday_weekend and per_day."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    coordinator.scheduler.set_schedule_mode(msg["mode"])
+    await coordinator.async_save()
+    connection.send_result(msg["id"], {"success": True})
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
