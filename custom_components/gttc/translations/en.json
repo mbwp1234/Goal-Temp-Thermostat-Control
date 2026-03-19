@@ -52,7 +52,10 @@
           "precondition_enabled": "Enable Pre-conditioning (ramp temp before schedule changes)",
           "tou_enabled": "Enable Time-of-Use Rate Optimization",
           "tou_provider": "Electricity Provider (TOU schedule)",
-          "outdoor_temp_sensor": "Outdoor Temperature Sensor (for heat pump optimization)"
+          "outdoor_temp_sensor": "Outdoor Temperature Sensor (for heat pump optimization & season detection)",
+          "cooling_comfort": "Cooling Comfort Temperature (°F when AC is running, default 75°F)",
+          "cooling_away_temp": "Cooling Away Temperature (°F when nobody is home in summer, default 78°F)",
+          "seasonal_recommend_hours": "Hours of sustained conditions before season switch is recommended (default 12h)"
         }
       }
     },
@@ -88,7 +91,10 @@
           "precondition_enabled": "Enable Pre-conditioning",
           "tou_enabled": "Enable TOU Rate Optimization",
           "tou_provider": "Electricity Provider",
-          "outdoor_temp_sensor": "Outdoor Temperature Sensor"
+          "outdoor_temp_sensor": "Outdoor Temperature Sensor",
+          "cooling_comfort": "Cooling Comfort Temperature",
+          "cooling_away_temp": "Cooling Away Temperature",
+          "seasonal_recommend_hours": "Season Switch Recommendation Threshold (hours)"
         }
       },
       "manage_zones": {

@@ -15,6 +15,8 @@ from .const import (
     DOMAIN,
     SCHEDULE_MODE_PER_DAY,
     SCHEDULE_MODE_WEEKDAY_WEEKEND,
+    SEASON_COOLING,
+    SEASON_HEATING,
 )
 from .coordinator import GTTCCoordinator
 
@@ -34,6 +36,7 @@ async def async_setup_entry(
     async_add_entities([
         ActiveZoneSelect(coordinator, config_entry, name),
         ScheduleModeSelect(coordinator, config_entry, name),
+        SeasonModeSelect(coordinator, config_entry, name),
     ])
 
 
@@ -96,3 +99,50 @@ class ScheduleModeSelect(CoordinatorEntity, SelectEntity):
         else:
             self.coordinator.scheduler.set_schedule_mode(SCHEDULE_MODE_WEEKDAY_WEEKEND)
         await self.coordinator.async_save()
+
+
+class SeasonModeSelect(CoordinatorEntity, SelectEntity):
+    """Select entity for controlling the heating / cooling season.
+
+    Switching season immediately updates the real thermostat's HVAC mode (heat
+    or cool) and causes all schedule entries to use their season-appropriate
+    target temperatures.  The system never switches automatically — this entity
+    is always the authoritative control.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:weather-partly-cloudy"
+
+    _OPTION_HEATING = "Heating"
+    _OPTION_COOLING = "Cooling"
+
+    def __init__(self, coordinator, config_entry, name):
+        super().__init__(coordinator)
+        self._attr_name = f"{name} Season Mode"
+        self._attr_unique_id = f"{DOMAIN}_{config_entry.entry_id}_season_mode"
+
+    @property
+    def options(self) -> list[str]:
+        return [self._OPTION_HEATING, self._OPTION_COOLING]
+
+    @property
+    def current_option(self) -> str | None:
+        if self.coordinator.season == SEASON_COOLING:
+            return self._OPTION_COOLING
+        return self._OPTION_HEATING
+
+    @property
+    def extra_state_attributes(self):
+        return {
+            "suggest_switch": self.coordinator.suggest_season_switch,
+            "conditions_sustained_hours": self.coordinator.season_conditions_hours,
+            "recommend_hours_threshold": self.coordinator.seasonal_recommend_hours,
+        }
+
+    async def async_select_option(self, option: str) -> None:
+        if option == self._OPTION_COOLING:
+            await self.coordinator.async_set_season(SEASON_COOLING)
+        elif option == self._OPTION_HEATING:
+            await self.coordinator.async_set_season(SEASON_HEATING)
+        else:
+            _LOGGER.warning("Unknown season option: %s", option)

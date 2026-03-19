@@ -48,7 +48,10 @@
           "occupancy_enabled": "Enable Occupancy-based Control",
           "presence_detection": "Presence Detection Method",
           "away_temp": "Away Temperature",
-          "manual_override_minutes": "Manual Override Duration"
+          "manual_override_minutes": "Manual Override Duration",
+          "cooling_comfort": "Cooling Comfort Temperature (°F when AC is running)",
+          "cooling_away_temp": "Cooling Away Temperature (°F when nobody is home in summer)",
+          "seasonal_recommend_hours": "Hours before season switch is recommended"
         }
       }
     },
@@ -80,7 +83,10 @@
           "occupancy_enabled": "Enable Occupancy Control",
           "presence_detection": "Presence Detection Method",
           "away_temp": "Away Temperature",
-          "manual_override_minutes": "Manual Override Duration (minutes)"
+          "manual_override_minutes": "Manual Override Duration (minutes)",
+          "cooling_comfort": "Cooling Comfort Temperature",
+          "cooling_away_temp": "Cooling Away Temperature",
+          "seasonal_recommend_hours": "Season Switch Recommendation Threshold (hours)"
         }
       },
       "manage_zones": {

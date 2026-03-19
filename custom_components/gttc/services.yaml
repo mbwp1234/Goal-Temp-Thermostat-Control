@@ -46,7 +46,10 @@ set_schedule:
             - sunday
     entries:
       name: Entries
-      description: List of schedule entries with time_start, time_end, and target_temp.
+      description: >
+        List of schedule entries. Each entry supports:
+        time_start (HH:MM), time_end (HH:MM), target_temp (heating setpoint),
+        cooling_temp (optional, cooling-season setpoint), zone_id (optional).
       required: true
       selector:
         object:

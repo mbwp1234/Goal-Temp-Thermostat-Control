@@ -7,6 +7,9 @@ from typing import Any
 
 from .const import (
     ALL_DAYS,
+    DEFAULT_COOLING_AWAY,
+    DEFAULT_COOLING_COMFORT,
+    DEFAULT_COOLING_SLEEP,
     SCHEDULE_MODE_PER_DAY,
     SCHEDULE_MODE_WEEKDAY_WEEKEND,
     WEEKDAYS,
@@ -42,27 +45,32 @@ def _default_presets(temp_min: float, temp_max: float) -> dict[str, PresetSchedu
     sleep_temp = max(temp_min, min(temp_max, comfort - 6))
     away_temp = temp_min + 4
 
+    # Cooling-season counterparts (clamped to configured range)
+    cooling_comfort = max(temp_min, min(temp_max, DEFAULT_COOLING_COMFORT))
+    cooling_sleep = max(temp_min, min(temp_max, DEFAULT_COOLING_SLEEP))
+    cooling_away = max(temp_min, min(temp_max, DEFAULT_COOLING_AWAY))
+
     home_entries = [
-        ScheduleEntry("06:00", "08:00", comfort),
-        ScheduleEntry("08:00", "12:00", comfort),
-        ScheduleEntry("12:00", "17:00", comfort),
-        ScheduleEntry("17:00", "22:00", comfort),
-        ScheduleEntry("22:00", "06:00", sleep_temp),
+        ScheduleEntry("06:00", "08:00", comfort, cooling_temp=cooling_comfort),
+        ScheduleEntry("08:00", "12:00", comfort, cooling_temp=cooling_comfort),
+        ScheduleEntry("12:00", "17:00", comfort, cooling_temp=cooling_comfort),
+        ScheduleEntry("17:00", "22:00", comfort, cooling_temp=cooling_comfort),
+        ScheduleEntry("22:00", "06:00", sleep_temp, cooling_temp=cooling_sleep),
     ]
 
     wfh_entries = [
-        ScheduleEntry("06:00", "08:00", comfort),
-        ScheduleEntry("08:00", "18:00", comfort + 1),
-        ScheduleEntry("18:00", "22:00", comfort),
-        ScheduleEntry("22:00", "06:00", sleep_temp),
+        ScheduleEntry("06:00", "08:00", comfort, cooling_temp=cooling_comfort),
+        ScheduleEntry("08:00", "18:00", comfort + 1, cooling_temp=cooling_comfort),
+        ScheduleEntry("18:00", "22:00", comfort, cooling_temp=cooling_comfort),
+        ScheduleEntry("22:00", "06:00", sleep_temp, cooling_temp=cooling_sleep),
     ]
 
     away_entries = [
-        ScheduleEntry("00:00", "23:59", away_temp),
+        ScheduleEntry("00:00", "23:59", away_temp, cooling_temp=cooling_away),
     ]
 
     sleep_entries = [
-        ScheduleEntry("00:00", "23:59", sleep_temp),
+        ScheduleEntry("00:00", "23:59", sleep_temp, cooling_temp=cooling_sleep),
     ]
 
     presets = {}
@@ -319,6 +327,7 @@ class Scheduler:
                                 time_end=e.time_end,
                                 target_temp=e.target_temp,
                                 zone_id=e.zone_id,
+                                cooling_temp=e.cooling_temp,
                             )
                             for e in source.entries
                         ]
@@ -342,6 +351,7 @@ class Scheduler:
                                 time_end=e.time_end,
                                 target_temp=e.target_temp,
                                 zone_id=e.zone_id,
+                                cooling_temp=e.cooling_temp,
                             )
                             for e in source_ds.entries
                         ]
@@ -365,6 +375,7 @@ class Scheduler:
                                 time_end=e.time_end,
                                 target_temp=e.target_temp,
                                 zone_id=e.zone_id,
+                                cooling_temp=e.cooling_temp,
                             )
                             for e in source_ds.entries
                         ]
@@ -378,6 +389,7 @@ class Scheduler:
                                 time_end=e.time_end,
                                 target_temp=e.target_temp,
                                 zone_id=e.zone_id,
+                                cooling_temp=e.cooling_temp,
                             )
                             for e in source_ds.entries
                         ]

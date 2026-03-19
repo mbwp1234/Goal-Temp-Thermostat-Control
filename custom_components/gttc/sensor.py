@@ -12,7 +12,18 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import CONF_NAME, CONF_TEMP_UNIT, DEFAULT_NAME, DEFAULT_TEMP_UNIT, DOMAIN
+from .const import (
+    CONF_NAME,
+    CONF_TEMP_UNIT,
+    DEFAULT_NAME,
+    DEFAULT_TEMP_UNIT,
+    DOMAIN,
+    OUTDOOR_COLD_THRESHOLD,
+    OUTDOOR_MILD_THRESHOLD,
+    SEASON_COOLING,
+    SEASON_HEATING,
+    SEASONAL_SWITCH_MARGIN,
+)
 from .coordinator import GTTCCoordinator
 
 
@@ -31,6 +42,7 @@ async def async_setup_entry(
         LearnedPatternsSensor(coordinator, config_entry, name),
         OutdoorTempSensor(coordinator, config_entry, name, temp_unit),
         TOURateSensor(coordinator, config_entry, name),
+        SeasonRecommendationSensor(coordinator, config_entry, name),
     ]
 
     # Create a temperature sensor per zone
@@ -155,21 +167,90 @@ class OutdoorTempSensor(CoordinatorEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self):
-        from .const import OUTDOOR_COLD_THRESHOLD, OUTDOOR_MILD_THRESHOLD
-        outdoor = self.coordinator._outdoor_temp
+        coord = self.coordinator
+        outdoor = coord._outdoor_temp
+        indoor = coord.current_temp
+
         if outdoor is None:
-            status = "unavailable"
+            hp_status = "unavailable"
         elif outdoor < OUTDOOR_COLD_THRESHOLD:
-            status = "cold (setbacks minimized)"
+            hp_status = "cold (setbacks minimized)"
         elif outdoor > OUTDOOR_MILD_THRESHOLD:
-            status = "mild (full setbacks allowed)"
+            hp_status = "mild (full setbacks allowed)"
         else:
-            status = "moderate"
+            hp_status = "moderate"
+
+        margin = (
+            round(outdoor - indoor, 1)
+            if outdoor is not None and indoor is not None
+            else None
+        )
+
         return {
-            "optimization_status": status,
+            "optimization_status": hp_status,
             "cold_threshold": OUTDOOR_COLD_THRESHOLD,
             "mild_threshold": OUTDOOR_MILD_THRESHOLD,
-            "sensor_entity": self.coordinator.outdoor_temp_sensor,
+            "sensor_entity": coord.outdoor_temp_sensor,
+            "current_season": coord.season,
+            "outdoor_minus_indoor": margin,
+            "switch_margin": SEASONAL_SWITCH_MARGIN,
+            "conditions_sustained_hours": coord.season_conditions_hours,
+            "suggest_season_switch": coord.suggest_season_switch,
+        }
+
+
+class SeasonRecommendationSensor(CoordinatorEntity, SensorEntity):
+    """Shows whether outdoor conditions suggest switching to a different season.
+
+    State is one of:
+      "Cooling Recommended"  — outdoor has been warmer than indoor for >= threshold hours
+      "Heating Recommended"  — outdoor has been cooler than indoor for >= threshold hours
+      "No Change"            — conditions have not been sustained long enough
+      "No Outdoor Sensor"    — no outdoor sensor configured, cannot assess
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:thermometer-auto"
+
+    def __init__(self, coordinator, config_entry, name):
+        super().__init__(coordinator)
+        self._attr_name = f"{name} Season Recommendation"
+        self._attr_unique_id = f"{DOMAIN}_{config_entry.entry_id}_season_recommendation"
+
+    @property
+    def native_value(self) -> str:
+        coord = self.coordinator
+        if not coord.outdoor_temp_sensor:
+            return "No Outdoor Sensor"
+        if coord._outdoor_temp is None:
+            return "No Outdoor Sensor"
+        if coord.suggest_season_switch:
+            if coord.season == SEASON_HEATING:
+                return "Cooling Recommended"
+            return "Heating Recommended"
+        return "No Change"
+
+    @property
+    def extra_state_attributes(self):
+        coord = self.coordinator
+        outdoor = coord._outdoor_temp
+        indoor = coord.current_temp
+        return {
+            "current_season": coord.season,
+            "outdoor_temp": outdoor,
+            "indoor_temp": indoor,
+            "outdoor_minus_indoor": (
+                round(outdoor - indoor, 1)
+                if outdoor is not None and indoor is not None
+                else None
+            ),
+            "switch_margin_f": SEASONAL_SWITCH_MARGIN,
+            "conditions_sustained_hours": coord.season_conditions_hours,
+            "threshold_hours": coord.seasonal_recommend_hours,
+            "hours_until_recommendation": max(
+                0.0,
+                round(coord.seasonal_recommend_hours - coord.season_conditions_hours, 1),
+            ) if coord.season_conditions_hours > 0 else None,
         }
 
 

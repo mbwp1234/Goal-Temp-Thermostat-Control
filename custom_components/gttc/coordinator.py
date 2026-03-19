@@ -16,6 +16,8 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .const import (
     CONF_AWAY_TEMP,
+    CONF_COOLING_AWAY_TEMP,
+    CONF_COOLING_COMFORT,
     CONF_LEARNING_ENABLED,
     CONF_LEARNING_THRESHOLD,
     CONF_MANUAL_OVERRIDE_MINUTES,
@@ -24,6 +26,7 @@ from .const import (
     CONF_PRECONDITION_ENABLED,
     CONF_PRESENCE_DETECTION,
     CONF_SCHEDULE_ENABLED,
+    CONF_SEASONAL_RECOMMEND_HOURS,
     CONF_TEMP_MAX,
     CONF_TEMP_MIN,
     CONF_THERMOSTAT,
@@ -31,6 +34,8 @@ from .const import (
     CONF_TOU_PROVIDER,
     CONF_WINDOW_SENSORS,
     DEFAULT_AWAY_TEMP,
+    DEFAULT_COOLING_AWAY,
+    DEFAULT_COOLING_COMFORT,
     DEFAULT_LEARNING_THRESHOLD,
     DEFAULT_MANUAL_OVERRIDE_MINUTES,
     DEFAULT_PRECONDITION_MINUTES,
@@ -43,6 +48,10 @@ from .const import (
     LEARNING_TEMP_TOLERANCE,
     OUTDOOR_COLD_THRESHOLD,
     OUTDOOR_MILD_THRESHOLD,
+    SEASON_COOLING,
+    SEASON_HEATING,
+    SEASONAL_RECOMMEND_HOURS,
+    SEASONAL_SWITCH_MARGIN,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
@@ -106,6 +115,26 @@ class GTTCCoordinator(DataUpdateCoordinator):
         provider_cls = TOU_PROVIDERS.get(tou_provider_key, TOUProvider)
         self.tou_provider: TOUProvider = provider_cls()
         self._outdoor_temp: float | None = None
+
+        # Season management — Heating or Cooling.
+        # Controlled manually via SeasonModeSelect; the system only recommends
+        # when to switch (via SeasonSwitchRecommendedBinarySensor) and never
+        # auto-switches to avoid mid-season oscillation.
+        self.season: str = SEASON_HEATING
+        self.cooling_comfort: float = float(
+            data.get(CONF_COOLING_COMFORT, DEFAULT_COOLING_COMFORT)
+        )
+        self.cooling_away_temp: float = float(
+            data.get(CONF_COOLING_AWAY_TEMP, DEFAULT_COOLING_AWAY)
+        )
+        self.seasonal_recommend_hours: float = float(
+            data.get(CONF_SEASONAL_RECOMMEND_HOURS, SEASONAL_RECOMMEND_HOURS)
+        )
+        # Timestamps tracking how long opposite-season conditions have held.
+        # Not persisted — reset on restart so the recommendation countdown
+        # starts fresh rather than triggering on stale pre-restart data.
+        self._cooling_conditions_since: datetime | None = None
+        self._heating_conditions_since: datetime | None = None
 
         # Sub-managers
         self.zone_manager = ZoneManager(hass, config_entry.entry_id)
@@ -213,6 +242,23 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 self.windows_open_override = bool(data["windows_open_override"])
             if "tracked_persons" in data and isinstance(data["tracked_persons"], list):
                 self.zone_manager.tracked_persons = data["tracked_persons"]
+            if "season" in data and data["season"] in (SEASON_HEATING, SEASON_COOLING):
+                self.season = data["season"]
+            if "cooling_comfort" in data and data["cooling_comfort"] is not None:
+                try:
+                    self.cooling_comfort = float(data["cooling_comfort"])
+                except (ValueError, TypeError):
+                    pass
+            if "cooling_away_temp" in data and data["cooling_away_temp"] is not None:
+                try:
+                    self.cooling_away_temp = float(data["cooling_away_temp"])
+                except (ValueError, TypeError):
+                    pass
+            if "seasonal_recommend_hours" in data and data["seasonal_recommend_hours"] is not None:
+                try:
+                    self.seasonal_recommend_hours = float(data["seasonal_recommend_hours"])
+                except (ValueError, TypeError):
+                    pass
         except Exception as err:
             _LOGGER.error("Error restoring state: %s", err)
 
@@ -232,6 +278,10 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 "window_sensors": self.window_sensors,
                 "windows_open_override": self.windows_open_override,
                 "tracked_persons": self.zone_manager.tracked_persons,
+                "season": self.season,
+                "cooling_comfort": self.cooling_comfort,
+                "cooling_away_temp": self.cooling_away_temp,
+                "seasonal_recommend_hours": self.seasonal_recommend_hours,
             }
             await self._store.async_save(data)
         except Exception as err:
@@ -311,6 +361,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
 
             # Read outdoor temperature sensor (if configured)
             self._outdoor_temp = self._read_outdoor_temp()
+
+            # Update season switch recommendation tracking (never auto-switches)
+            self._update_season_recommendation()
 
             # Determine target temperature
             desired_temp = self._calculate_desired_temp()
@@ -394,6 +447,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 "events_recorded": len(self.learning.events),
                 "patterns_learned": len(self.learning.learned_entries),
             },
+            "season": self.season,
+            "suggest_season_switch": self.suggest_season_switch,
+            "season_conditions_hours": self.season_conditions_hours,
         }
 
     def _read_thermostat_state(self) -> None:
@@ -524,13 +580,18 @@ class GTTCCoordinator(DataUpdateCoordinator):
     def _calculate_desired_temp(self) -> float:
         """Determine target temp: manual > occupancy > schedule > last setting > comfort default.
 
-        For heat pump systems, setbacks are capped to avoid triggering
-        expensive auxiliary/strip heat during the recovery phase.  The DOE
-        recommends keeping heat-pump setbacks to 5°F or less.
+        In cooling season, all temperature sources use their cooling counterparts:
+        schedule entries use cooling_temp, away uses cooling_away_temp, and the
+        fallback uses cooling_comfort.  Heat-pump setback limiting is bypassed in
+        cooling season (it is a heating-only protection).
+
+        For heat pump systems in heating season, setbacks are capped to avoid
+        triggering expensive auxiliary/strip heat during the recovery phase.
         """
         comfort = self._get_comfort_reference()
+        in_cooling = self.season == SEASON_COOLING
 
-        # 1. Manual override (highest priority)
+        # 1. Manual override (highest priority — season doesn't affect overrides)
         if self.manual_override and not self.manual_override.is_expired:
             return self.manual_override.target_temp
 
@@ -544,32 +605,48 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 and active_zone.occupancy_sensor_entities
                 and active_zone.is_occupied is False
             ):
+                if in_cooling:
+                    return self.cooling_away_temp
                 zone_away = active_zone.away_temp or self.away_temp
                 return self._apply_heat_pump_setback_limit(zone_away, comfort)
 
             # Global: nobody home
             if not self.zone_manager.is_anyone_home():
+                if in_cooling:
+                    return self.cooling_away_temp
                 return self._apply_heat_pump_setback_limit(self.away_temp, comfort)
 
         # 3. Schedule
         if self.schedule_enabled:
             entry = self.scheduler.get_current_entry()
             if entry:
+                if in_cooling:
+                    return (
+                        entry.cooling_temp
+                        if entry.cooling_temp is not None
+                        else self.cooling_comfort
+                    )
                 return entry.target_temp
 
-        # 4. Fall back to current target or default comfort temp
+        # 4. Fall back to seasonal comfort or last known target
+        if in_cooling:
+            return self.cooling_comfort
         return self.target_temp if self.target_temp is not None else self._default_comfort_temp
 
     def _get_comfort_reference(self) -> float:
         """Return the current comfort temperature for setback calculations.
 
-        Uses the most recent scheduled comfort entry, falling back to the
-        default comfort temperature.
+        Uses the most recent scheduled comfort entry (season-aware), falling
+        back to the season's default comfort temperature.
         """
         if self.schedule_enabled:
             entry = self.scheduler.get_current_entry()
             if entry:
+                if self.season == SEASON_COOLING and entry.cooling_temp is not None:
+                    return entry.cooling_temp
                 return entry.target_temp
+        if self.season == SEASON_COOLING:
+            return self.cooling_comfort
         return self._default_comfort_temp
 
     def _apply_gradual_recovery(self, desired_temp: float) -> float:
@@ -716,7 +793,11 @@ class GTTCCoordinator(DataUpdateCoordinator):
         if minutes_until > DEFAULT_PRECONDITION_MINUTES:
             return desired_temp
 
-        next_temp = next_entry.target_temp
+        next_temp = (
+            next_entry.cooling_temp
+            if (self.season == SEASON_COOLING and next_entry.cooling_temp is not None)
+            else next_entry.target_temp
+        )
         gap = next_temp - desired_temp
         if abs(gap) < 1.0:
             return desired_temp  # already close enough
@@ -870,10 +951,17 @@ class GTTCCoordinator(DataUpdateCoordinator):
             return None
         entry = self.scheduler.get_current_entry()
         if entry:
+            effective_temp = (
+                entry.cooling_temp
+                if (self.season == SEASON_COOLING and entry.cooling_temp is not None)
+                else entry.target_temp
+            )
             return {
                 "time_start": entry.time_start,
                 "time_end": entry.time_end,
                 "target_temp": entry.target_temp,
+                "cooling_temp": entry.cooling_temp,
+                "effective_temp": effective_temp,
                 "zone_id": entry.zone_id,
             }
         return None
@@ -886,11 +974,18 @@ class GTTCCoordinator(DataUpdateCoordinator):
         old_temp = self.target_temp
         self.target_temp = temperature
 
+        # Skip schedule override tracking and learning in cooling season to
+        # avoid corrupting heating-season schedule entries with cooling data.
+        # Manual override still applies so the user can still fine-tune.
+        in_cooling = self.season == SEASON_COOLING
+
         # Track repeated overrides of the same schedule entry.
         # When the user keeps fighting a schedule entry (override expires,
         # they set it back), update the schedule entry directly so the
         # override cycle stops.  Returns True if the schedule was updated.
-        schedule_updated = await self._track_schedule_override(temperature)
+        schedule_updated = False
+        if not in_cooling:
+            schedule_updated = await self._track_schedule_override(temperature)
 
         # Set manual override — but skip if we just updated the schedule
         # to match, since there's nothing to override anymore.
@@ -902,8 +997,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 zone_id=self.zone_manager.active_zone_id,
             )
 
-        # Record for learning
-        if self.learning_enabled:
+        # Record for learning — skip in cooling season (patterns are heating-specific)
+        if self.learning_enabled and not in_cooling:
             try:
                 learned = self.learning.record_event(
                     target_temp=temperature,
@@ -1180,9 +1275,178 @@ class GTTCCoordinator(DataUpdateCoordinator):
             self.precondition_enabled = bool(updates["precondition_enabled"])
         if "tracked_persons" in updates:
             self.zone_manager.tracked_persons = list(updates["tracked_persons"])
+        if "cooling_comfort" in updates:
+            self.cooling_comfort = float(updates["cooling_comfort"])
+        if "cooling_away_temp" in updates:
+            self.cooling_away_temp = float(updates["cooling_away_temp"])
+        if "seasonal_recommend_hours" in updates:
+            self.seasonal_recommend_hours = float(updates["seasonal_recommend_hours"])
 
         await self.async_save()
         self.async_set_updated_data(self._build_state_dict())
+
+    # ------------------------------------------------------------------
+    # Season management
+    # ------------------------------------------------------------------
+
+    @property
+    def suggest_season_switch(self) -> bool:
+        """True when outdoor conditions have been opposite to the current season
+        for at least ``seasonal_recommend_hours``.  This is a signal to the user
+        that it is likely time to switch — the system never acts on it
+        automatically."""
+        now = datetime.now(timezone.utc)
+        if self.season == SEASON_HEATING and self._cooling_conditions_since is not None:
+            elapsed = (now - self._cooling_conditions_since).total_seconds() / 3600
+            return elapsed >= self.seasonal_recommend_hours
+        if self.season == SEASON_COOLING and self._heating_conditions_since is not None:
+            elapsed = (now - self._heating_conditions_since).total_seconds() / 3600
+            return elapsed >= self.seasonal_recommend_hours
+        return False
+
+    @property
+    def season_conditions_hours(self) -> float:
+        """Hours that opposite-season conditions have been sustained.
+        Returns 0.0 when conditions are neutral or no outdoor sensor is available."""
+        now = datetime.now(timezone.utc)
+        if self.season == SEASON_HEATING and self._cooling_conditions_since is not None:
+            return round(
+                (now - self._cooling_conditions_since).total_seconds() / 3600, 1
+            )
+        if self.season == SEASON_COOLING and self._heating_conditions_since is not None:
+            return round(
+                (now - self._heating_conditions_since).total_seconds() / 3600, 1
+            )
+        return 0.0
+
+    def _update_season_recommendation(self) -> None:
+        """Track how long outdoor conditions have been opposite to the current season.
+
+        Never changes the season automatically — that is always a deliberate
+        user action via SeasonModeSelect.  Updates the internal timestamps that
+        power SeasonSwitchRecommendedBinarySensor and SeasonRecommendationSensor.
+
+        Resets the countdown whenever conditions reverse, so a brief warm day
+        in winter doesn't linger in the counter.
+        """
+        if self._outdoor_temp is None or self.current_temp is None:
+            self._cooling_conditions_since = None
+            self._heating_conditions_since = None
+            return
+
+        now = datetime.now(timezone.utc)
+
+        if self.season == SEASON_HEATING:
+            if self._outdoor_temp > self.current_temp + SEASONAL_SWITCH_MARGIN:
+                if self._cooling_conditions_since is None:
+                    self._cooling_conditions_since = now
+                    _LOGGER.debug(
+                        "Cooling conditions started: outdoor %.1f° > indoor %.1f° + %.1f°",
+                        self._outdoor_temp,
+                        self.current_temp,
+                        SEASONAL_SWITCH_MARGIN,
+                    )
+                self._heating_conditions_since = None
+            else:
+                if self._cooling_conditions_since is not None:
+                    _LOGGER.debug(
+                        "Cooling conditions ended after %.1fh — resetting countdown",
+                        self.season_conditions_hours,
+                    )
+                self._cooling_conditions_since = None
+        else:  # SEASON_COOLING
+            if self._outdoor_temp < self.current_temp - SEASONAL_SWITCH_MARGIN:
+                if self._heating_conditions_since is None:
+                    self._heating_conditions_since = now
+                    _LOGGER.debug(
+                        "Heating conditions started: outdoor %.1f° < indoor %.1f° - %.1f°",
+                        self._outdoor_temp,
+                        self.current_temp,
+                        SEASONAL_SWITCH_MARGIN,
+                    )
+                self._cooling_conditions_since = None
+            else:
+                if self._heating_conditions_since is not None:
+                    _LOGGER.debug(
+                        "Heating conditions ended after %.1fh — resetting countdown",
+                        self.season_conditions_hours,
+                    )
+                self._heating_conditions_since = None
+
+    async def async_set_season(self, season: str) -> None:
+        """Switch season and immediately update the real thermostat's HVAC mode.
+
+        Called by SeasonModeSelect when the user deliberately changes the season.
+        Clears any pending recommendation tracking so the countdown starts fresh
+        from the new season baseline.
+        """
+        if season not in (SEASON_HEATING, SEASON_COOLING):
+            _LOGGER.warning("Invalid season value: %s", season)
+            return
+
+        old_season = self.season
+        self.season = season
+
+        # Clear recommendation tracking — the user just made a deliberate call
+        self._cooling_conditions_since = None
+        self._heating_conditions_since = None
+
+        if old_season != season:
+            _LOGGER.info(
+                "Season switched %s → %s — applying HVAC mode immediately",
+                old_season,
+                season,
+            )
+            await self._apply_season_hvac_mode()
+
+        await self.async_save()
+        # Full recalculation so the target temperature also updates immediately
+        await self.async_request_refresh()
+
+    async def _apply_season_hvac_mode(self) -> None:
+        """Switch the real thermostat's HVAC mode to match the current season.
+
+        Only acts when the thermostat is available, not in off mode, and the
+        target mode is supported.  Falls back gracefully with a warning when
+        the thermostat doesn't advertise the needed mode.
+        """
+        if not self._available:
+            _LOGGER.debug(
+                "Thermostat unavailable — deferring HVAC mode switch to next update"
+            )
+            return
+
+        if self.hvac_mode in (HVACMode.OFF, None):
+            _LOGGER.debug(
+                "Thermostat is off — leaving HVAC mode unchanged for season switch"
+            )
+            return
+
+        supported = self.get_thermostat_hvac_modes()
+
+        if self.season == SEASON_COOLING:
+            if HVACMode.COOL in supported:
+                await self.async_set_hvac_mode(HVACMode.COOL)
+                _LOGGER.info("HVAC mode → cool (cooling season)")
+            else:
+                _LOGGER.warning(
+                    "Thermostat does not support cool mode — season set to cooling "
+                    "but HVAC mode unchanged (%s)",
+                    self.hvac_mode,
+                )
+        else:  # SEASON_HEATING
+            if HVACMode.HEAT in supported:
+                await self.async_set_hvac_mode(HVACMode.HEAT)
+                _LOGGER.info("HVAC mode → heat (heating season)")
+            elif HVACMode.HEAT_COOL in supported:
+                await self.async_set_hvac_mode(HVACMode.HEAT_COOL)
+                _LOGGER.info("HVAC mode → heat_cool (heating season, heat not available)")
+            else:
+                _LOGGER.warning(
+                    "Thermostat does not support heat mode — season set to heating "
+                    "but HVAC mode unchanged (%s)",
+                    self.hvac_mode,
+                )
 
     # ------------------------------------------------------------------
     # Window open detection

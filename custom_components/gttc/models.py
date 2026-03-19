@@ -87,6 +87,7 @@ class ScheduleEntry:
     time_end: str  # "HH:MM"
     target_temp: float
     zone_id: str | None = None
+    cooling_temp: float | None = None  # target temp when in cooling season
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -94,6 +95,7 @@ class ScheduleEntry:
             "time_end": self.time_end,
             "target_temp": self.target_temp,
             "zone_id": self.zone_id,
+            "cooling_temp": self.cooling_temp,
         }
 
     @classmethod
@@ -103,6 +105,7 @@ class ScheduleEntry:
             time_end=data.get("time_end", "23:59"),
             target_temp=data.get("target_temp", 70),
             zone_id=data.get("zone_id"),
+            cooling_temp=data.get("cooling_temp"),
         )
 
     @property

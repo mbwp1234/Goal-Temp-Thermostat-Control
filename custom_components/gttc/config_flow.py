@@ -20,6 +20,8 @@ from homeassistant.helpers import (
 
 from .const import (
     CONF_AWAY_TEMP,
+    CONF_COOLING_AWAY_TEMP,
+    CONF_COOLING_COMFORT,
     CONF_LEARNING_ENABLED,
     CONF_LEARNING_THRESHOLD,
     CONF_MANUAL_OVERRIDE_MINUTES,
@@ -28,6 +30,7 @@ from .const import (
     CONF_OUTDOOR_TEMP_SENSOR,
     CONF_PRECONDITION_ENABLED,
     CONF_PRESENCE_DETECTION,
+    CONF_SEASONAL_RECOMMEND_HOURS,
     CONF_TEMP_MAX,
     CONF_TEMP_MIN,
     CONF_TEMP_UNIT,
@@ -36,6 +39,8 @@ from .const import (
     CONF_TOU_PROVIDER,
     CONF_ZONES,
     DEFAULT_AWAY_TEMP,
+    DEFAULT_COOLING_AWAY,
+    DEFAULT_COOLING_COMFORT,
     DEFAULT_LEARNING_THRESHOLD,
     DEFAULT_MANUAL_OVERRIDE_MINUTES,
     DEFAULT_NAME,
@@ -47,6 +52,7 @@ from .const import (
     PRESENCE_MODE_BOTH,
     PRESENCE_MODE_OCCUPANCY,
     PRESENCE_MODE_PERSON,
+    SEASONAL_RECOMMEND_HOURS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -376,6 +382,23 @@ class GTTCConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         device_class="temperature",
                     )
                 ),
+                vol.Optional(
+                    CONF_COOLING_COMFORT, default=DEFAULT_COOLING_COMFORT
+                ): vol.Coerce(float),
+                vol.Optional(
+                    CONF_COOLING_AWAY_TEMP, default=DEFAULT_COOLING_AWAY
+                ): vol.Coerce(float),
+                vol.Optional(
+                    CONF_SEASONAL_RECOMMEND_HOURS, default=SEASONAL_RECOMMEND_HOURS
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=4,
+                        max=72,
+                        step=1,
+                        mode=selector.NumberSelectorMode.SLIDER,
+                        unit_of_measurement="h",
+                    )
+                ),
             }
         )
 
@@ -546,6 +569,25 @@ class GTTCOptionsFlow(config_entries.OptionsFlow):
                     selector.EntitySelectorConfig(
                         domain=SENSOR_DOMAIN,
                         device_class="temperature",
+                    )
+                ),
+                vol.Optional(
+                    CONF_COOLING_COMFORT,
+                    default=data.get(CONF_COOLING_COMFORT, DEFAULT_COOLING_COMFORT),
+                ): vol.Coerce(float),
+                vol.Optional(
+                    CONF_COOLING_AWAY_TEMP,
+                    default=data.get(CONF_COOLING_AWAY_TEMP, DEFAULT_COOLING_AWAY),
+                ): vol.Coerce(float),
+                vol.Optional(
+                    CONF_SEASONAL_RECOMMEND_HOURS,
+                    default=data.get(CONF_SEASONAL_RECOMMEND_HOURS, SEASONAL_RECOMMEND_HOURS),
+                ): selector.NumberSelector(
+                    selector.NumberSelectorConfig(
+                        min=4,
+                        max=72,
+                        step=1,
+                        unit_of_measurement="h",
                     )
                 ),
             }

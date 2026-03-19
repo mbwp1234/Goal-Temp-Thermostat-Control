@@ -79,6 +79,29 @@ DEFAULT_PRESENCE_MODE = PRESENCE_MODE_BOTH
 # toward the next entry's target temperature.
 DEFAULT_PRECONDITION_MINUTES = 30
 
+# Season management
+SEASON_HEATING = "heating"
+SEASON_COOLING = "cooling"
+
+# Config keys for seasonal / warm-weather settings
+CONF_COOLING_COMFORT = "cooling_comfort"
+CONF_COOLING_AWAY_TEMP = "cooling_away_temp"
+CONF_SEASONAL_RECOMMEND_HOURS = "seasonal_recommend_hours"
+
+# Warm-weather (cooling season) defaults (°F)
+DEFAULT_COOLING_COMFORT = 75.0   # comfort setpoint when AC is running
+DEFAULT_COOLING_SLEEP = 72.0     # overnight cooling target
+DEFAULT_COOLING_AWAY = 78.0      # nobody-home setback (UP, not down, in summer)
+
+# Outdoor temp must exceed indoor temp by this many °F before the season
+# switch recommendation countdown starts.
+SEASONAL_SWITCH_MARGIN = 3.0
+
+# How many hours of sustained opposite-season conditions before the
+# SeasonSwitchRecommended binary sensor fires.  12 hours = "it's been warm
+# all day", not just a warm afternoon.
+SEASONAL_RECOMMEND_HOURS = 12.0
+
 # Outdoor temperature thresholds for heat pump optimization (°F).
 # Below OUTDOOR_COLD_THRESHOLD the heat pump is struggling, so setbacks
 # are further limited to avoid long recovery times / aux heat.
