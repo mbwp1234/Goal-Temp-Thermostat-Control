@@ -22,6 +22,8 @@ class ZoneManager:
         self.zones: dict[str, Zone] = {}
         self._active_zone_id: str | None = None
         self.presence_mode: str = PRESENCE_MODE_BOTH
+        # Empty = track all person entities. Non-empty = only these entities.
+        self.tracked_persons: list[str] = []
 
     @property
     def active_zone(self) -> Zone | None:
@@ -263,13 +265,21 @@ class ZoneManager:
         return any(z.occupancy_sensor_entities for z in self.zones.values())
 
     def _check_person_entities(self) -> bool:
-        """Check if any person entity is 'home' (using HA's built-in zone.home)."""
+        """Check if any tracked person entity is 'home' (using HA's built-in zone.home).
+
+        If tracked_persons is non-empty, only those entities are checked.
+        If tracked_persons is empty, all person entities are checked.
+        """
         try:
-            person_states = self.hass.states.async_all("person")
+            all_persons = self.hass.states.async_all("person")
+            if self.tracked_persons:
+                person_states = [p for p in all_persons if p.entity_id in self.tracked_persons]
+            else:
+                person_states = all_persons
             for person in person_states:
                 if person.state == "home":
                     return True
-            # If no person entities exist, assume home
+            # If no person entities exist (or none selected), assume home
             if not person_states:
                 return True
             return False

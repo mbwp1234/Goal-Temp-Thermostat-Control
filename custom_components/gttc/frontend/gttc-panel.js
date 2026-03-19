@@ -1491,27 +1491,75 @@ class GttcPanel extends HTMLElement {
       return `<div class="chart-card"><div class="chart-title">Temperature — last 24h</div><div class="chart-empty">Not enough data</div></div>`;
     }
 
-    const W = 800, H = 180, PAD = { top: 12, right: 16, bottom: 28, left: 40 };
+    const W = 800, H = 200, PAD = { top: 12, right: 16, bottom: 28, left: 40 };
     const innerW = W - PAD.left - PAD.right;
     const innerH = H - PAD.top - PAD.bottom;
 
     const tMin = points[0].t, tMax = points[points.length - 1].t;
-    const temps = points.map(p => p.v);
+
+    // Build schedule goal steps from the current schedule data
+    const goalSteps = this._buildScheduleGoalSteps(tMin, tMax);
+
+    // Include goal temps in y-axis range so the line is always visible
+    const goalTemps = goalSteps.map(s => s.temp);
+    const temps = points.map(p => p.v).concat(goalTemps);
     const vMin = Math.floor(Math.min(...temps) - 1);
     const vMax = Math.ceil(Math.max(...temps) + 1);
 
     const xScale = t => PAD.left + ((t - tMin) / (tMax - tMin)) * innerW;
     const yScale = v => PAD.top + (1 - (v - vMin) / (vMax - vMin)) * innerH;
 
-    // Line path
+    // Actual temp line path
     const pathD = points.map((p, i) => `${i === 0 ? "M" : "L"}${xScale(p.t).toFixed(1)},${yScale(p.v).toFixed(1)}`).join(" ");
-
-    // Area fill
     const areaD = pathD + ` L${xScale(tMax).toFixed(1)},${(PAD.top + innerH).toFixed(1)} L${xScale(tMin).toFixed(1)},${(PAD.top + innerH).toFixed(1)} Z`;
 
-    // Goal line
-    const goalTemp = diag && diag.target_temp != null ? diag.target_temp : null;
-    const goalY = goalTemp != null ? yScale(goalTemp) : null;
+    // Zone color palette (for multi-zone band coloring)
+    const ZONE_COLORS = ["#6c63ff","#ff6584","#43a047","#ff9800","#00bcd4","#795548"];
+    const zoneIds = [...new Set(goalSteps.map(s => s.zone_id).filter(Boolean))];
+    const zoneColorMap = {};
+    zoneIds.forEach((id, i) => { zoneColorMap[id] = ZONE_COLORS[i % ZONE_COLORS.length]; });
+
+    // Zone band SVG rects behind chart
+    const zoneBands = goalSteps.filter(s => s.zone_id).map(s => {
+      const x1 = xScale(s.tStart);
+      const x2 = xScale(s.tEnd);
+      const color = zoneColorMap[s.zone_id] || "#888";
+      return `<rect x="${x1.toFixed(1)}" y="${PAD.top}" width="${(x2 - x1).toFixed(1)}" height="${innerH}"
+                fill="${color}" opacity="0.07" rx="0"/>`;
+    }).join("");
+
+    // Goal step-function path
+    let goalPathD = "";
+    let goalLegendParts = [];
+    if (goalSteps.length > 0) {
+      const segments = [];
+      for (const s of goalSteps) {
+        const x1 = xScale(s.tStart), x2 = xScale(s.tEnd);
+        const y = yScale(s.temp);
+        segments.push(`M${x1.toFixed(1)},${y.toFixed(1)} L${x2.toFixed(1)},${y.toFixed(1)}`);
+      }
+      // Connect steps with vertical transitions
+      for (let i = 0; i < goalSteps.length - 1; i++) {
+        const curr = goalSteps[i], next = goalSteps[i + 1];
+        if (Math.abs(curr.tEnd - next.tStart) < 60000) { // adjacent
+          const x = xScale(curr.tEnd);
+          segments.push(`M${x.toFixed(1)},${yScale(curr.temp).toFixed(1)} L${x.toFixed(1)},${yScale(next.temp).toFixed(1)}`);
+        }
+      }
+      goalPathD = segments.join(" ");
+
+      // Legend: unique zones
+      if (zoneIds.length > 1) {
+        // Build zone name map from diag data
+        const zoneNames = {};
+        (diag && diag.zones || []).forEach(z => { zoneNames[z.id] = z.name; });
+        zoneIds.forEach(id => {
+          const color = zoneColorMap[id];
+          const name = zoneNames[id] || id;
+          goalLegendParts.push(`<span class="chart-legend-zone" style="--zone-color:${color}">${name}</span>`);
+        });
+      }
+    }
 
     // Y-axis ticks
     const yTicks = [];
@@ -1533,7 +1581,9 @@ class GttcPanel extends HTMLElement {
       <div class="chart-card">
         <div class="chart-title">
           Zone Temperature — last 24h
-          ${goalTemp != null ? `<span class="chart-legend"><span class="legend-dot goal"></span> Goal ${goalTemp}°</span>` : ""}
+          <span class="chart-legend"><span class="legend-dot actual"></span> Actual</span>
+          ${goalSteps.length > 0 ? `<span class="chart-legend"><span class="legend-dot goal"></span> Schedule goal</span>` : ""}
+          ${goalLegendParts.join("")}
         </div>
         <svg class="temp-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
           <defs>
@@ -1542,6 +1592,8 @@ class GttcPanel extends HTMLElement {
               <stop offset="100%" stop-color="var(--primary-color,#03a9f4)" stop-opacity="0.02"/>
             </linearGradient>
           </defs>
+          <!-- Zone bands -->
+          ${zoneBands}
           <!-- Grid lines -->
           ${yTicks.map(v => `
             <line x1="${PAD.left}" y1="${yScale(v).toFixed(1)}" x2="${PAD.left + innerW}" y2="${yScale(v).toFixed(1)}"
@@ -1550,13 +1602,10 @@ class GttcPanel extends HTMLElement {
           `).join("")}
           <!-- Area fill -->
           <path d="${areaD}" fill="url(#areaGrad)"/>
-          <!-- Zone temp line -->
+          <!-- Actual zone temp line -->
           <path d="${pathD}" fill="none" stroke="var(--primary-color,#03a9f4)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-          <!-- Goal line -->
-          ${goalY != null ? `
-            <line x1="${PAD.left}" y1="${goalY.toFixed(1)}" x2="${PAD.left + innerW}" y2="${goalY.toFixed(1)}"
-                  stroke="var(--success-color,#43a047)" stroke-width="1.5" stroke-dasharray="5,4" opacity="0.8"/>
-          ` : ""}
+          <!-- Schedule goal step-function -->
+          ${goalPathD ? `<path d="${goalPathD}" fill="none" stroke="var(--success-color,#43a047)" stroke-width="2" stroke-dasharray="6,4" opacity="0.9"/>` : ""}
           <!-- X-axis ticks -->
           ${xTicks.map(t => {
             const x = xScale(t).toFixed(1);
@@ -1573,6 +1622,65 @@ class GttcPanel extends HTMLElement {
         </svg>
       </div>
     `;
+  }
+
+  _buildScheduleGoalSteps(tMin, tMax) {
+    // Returns [{tStart, tEnd, temp, zone_id}] segments from schedule entries
+    // covering the [tMin, tMax] window, sorted by tStart.
+    const s = this._schedule;
+    if (!s) return [];
+
+    const steps = [];
+
+    // Check yesterday and today to cover the full 24h window
+    for (let dayOffset = -1; dayOffset <= 0; dayOffset++) {
+      const date = new Date();
+      date.setDate(date.getDate() + dayOffset);
+      date.setHours(0, 0, 0, 0);
+
+      const dow = date.getDay(); // 0=Sun
+      const dayName = ["sunday","monday","tuesday","wednesday","thursday","friday","saturday"][dow];
+      const isWeekend = dow === 0 || dow === 6;
+
+      let entries;
+      if (s.active_preset && s.presets[s.active_preset]) {
+        entries = s.presets[s.active_preset].schedule[dayName] || [];
+      } else if (s.mode === "per_day") {
+        entries = (s.per_day && s.per_day[dayName]) || [];
+      } else {
+        entries = isWeekend ? (s.weekend || []) : (s.weekday || []);
+      }
+
+      for (const entry of entries) {
+        const [sh, sm] = entry.time_start.split(":").map(Number);
+        const [eh, em] = entry.time_end.split(":").map(Number);
+
+        const entryStart = new Date(date);
+        entryStart.setHours(sh, sm, 0, 0);
+        const entryEnd = new Date(date);
+        entryEnd.setHours(eh, em, 0, 0);
+
+        // Handle overnight entries
+        if (entryEnd.getTime() <= entryStart.getTime()) {
+          entryEnd.setDate(entryEnd.getDate() + 1);
+        }
+
+        const eStart = entryStart.getTime();
+        const eEnd = entryEnd.getTime();
+
+        // Only include if it overlaps with our window
+        if (eStart < tMax && eEnd > tMin) {
+          steps.push({
+            tStart: Math.max(eStart, tMin),
+            tEnd: Math.min(eEnd, tMax),
+            temp: entry.target_temp,
+            zone_id: entry.zone_id || null,
+          });
+        }
+      }
+    }
+
+    return steps.sort((a, b) => a.tStart - b.tStart);
   }
 
   _renderZonesCard(d) {
@@ -1673,11 +1781,16 @@ class GttcPanel extends HTMLElement {
     this._render();
     try {
       this._settingsError = null;
-      const [cfg, zonesResult] = await Promise.all([
+      const [cfg, zonesResult, personsResult] = await Promise.all([
         this._hass.callWS({ type: "gttc/get_config" }),
         this._hass.callWS({ type: "gttc/list_zones" }),
+        this._hass.callWS({ type: "gttc/list_persons" }),
       ]);
-      this._settingsData = { ...cfg, zones: zonesResult.zones || [] };
+      this._settingsData = {
+        ...cfg,
+        zones: zonesResult.zones || [],
+        all_persons: personsResult.persons || [],
+      };
     } catch (err) {
       this._settingsData = null;
       this._settingsError = err.message || err.code || String(err);
@@ -1798,6 +1911,10 @@ class GttcPanel extends HTMLElement {
   }
 
   _renderSettingsOccupancyCard(d) {
+    const allPersons = d.all_persons || [];
+    const trackedPersons = new Set(d.tracked_persons || []);
+    const showPersons = d.presence_detection !== "occupancy_sensors";
+
     return `
       <div class="settings-card">
         <div class="settings-card-title">
@@ -1821,6 +1938,30 @@ class GttcPanel extends HTMLElement {
               <option value="person_entities" ${d.presence_detection === "person_entities" ? "selected" : ""}>Person entities only</option>
               <option value="occupancy_sensors" ${d.presence_detection === "occupancy_sensors" ? "selected" : ""}>Occupancy sensors only</option>
             </select>
+          </div>
+          <div class="settings-field ${showPersons ? "" : "settings-field-disabled"}" id="person-entities-field">
+            <label>Tracked person entities</label>
+            <div class="settings-hint">
+              Check the people GTTC should monitor. Leave all unchecked to track everyone.
+            </div>
+            ${allPersons.length === 0
+              ? `<div class="person-empty">No person entities found in Home Assistant.</div>`
+              : `<div class="person-list">
+                  ${allPersons.map(p => `
+                    <label class="person-row ${p.is_home ? "person-home" : ""}">
+                      <input type="checkbox" class="person-chk" data-entity="${p.entity_id}"
+                        ${trackedPersons.has(p.entity_id) ? "checked" : ""}
+                        ${!showPersons ? "disabled" : ""} />
+                      <div class="person-info">
+                        <span class="person-name">${p.name}</span>
+                        <span class="person-entity">${p.entity_id}</span>
+                      </div>
+                      <span class="person-badge ${p.is_home ? "person-badge-home" : "person-badge-away"}">
+                        ${p.is_home ? "home" : p.state}
+                      </span>
+                    </label>
+                  `).join("")}
+                </div>`}
           </div>
         </div>
         <div class="settings-card-footer">
@@ -2129,23 +2270,34 @@ class GttcPanel extends HTMLElement {
 
     // Occupancy section
     const occChk = root.getElementById("cfg-occupancy-enabled");
+    const presenceSelect = root.getElementById("cfg-presence-detection");
+    const personField = root.getElementById("person-entities-field");
+    const _updatePersonFieldVisibility = () => {
+      const mode = presenceSelect?.value || "both";
+      const showPersons = mode !== "occupancy_sensors";
+      personField?.classList.toggle("settings-field-disabled", !showPersons);
+      root.querySelectorAll(".person-chk").forEach(c => { c.disabled = !showPersons; });
+    };
     if (occChk) {
       occChk.addEventListener("change", () => {
-        const presenceField = root.getElementById("cfg-presence-detection");
-        if (presenceField) {
-          presenceField.disabled = !occChk.checked;
-          presenceField.closest(".settings-field")?.classList.toggle("settings-field-disabled", !occChk.checked);
+        if (presenceSelect) {
+          presenceSelect.disabled = !occChk.checked;
+          presenceSelect.closest(".settings-field")?.classList.toggle("settings-field-disabled", !occChk.checked);
         }
       });
+    }
+    if (presenceSelect) {
+      presenceSelect.addEventListener("change", _updatePersonFieldVisibility);
     }
     this._addClick("saveOccupancyBtn", async () => {
       const enabled = root.getElementById("cfg-occupancy-enabled")?.checked ?? false;
       const mode = root.getElementById("cfg-presence-detection")?.value || "both";
+      const trackedPersons = [...root.querySelectorAll(".person-chk:checked")].map(c => c.dataset.entity);
       try {
         await this._hass.callWS({ type: "gttc/set_config",
-          occupancy_enabled: enabled, presence_detection: mode });
+          occupancy_enabled: enabled, presence_detection: mode, tracked_persons: trackedPersons });
         this._settingsData = { ...this._settingsData,
-          occupancy_enabled: enabled, presence_detection: mode };
+          occupancy_enabled: enabled, presence_detection: mode, tracked_persons: trackedPersons };
         this._showToast("Occupancy settings saved.");
       } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
     });
@@ -2747,7 +2899,15 @@ class GttcPanel extends HTMLElement {
       }
       .chart-legend { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--secondary-text); font-weight: 400; }
       .legend-dot { width: 12px; height: 2px; display: inline-block; border-radius: 1px; }
+      .legend-dot.actual { background: var(--primary-color, #03a9f4); }
       .legend-dot.goal { background: var(--success-color, #43a047); }
+      .chart-legend-zone {
+        display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--secondary-text); font-weight: 400;
+      }
+      .chart-legend-zone::before {
+        content: ""; display: inline-block; width: 10px; height: 10px;
+        border-radius: 2px; background: var(--zone-color, #888); opacity: 0.5; flex-shrink: 0;
+      }
       .chart-empty { padding: 40px 0; text-align: center; color: var(--secondary-text); font-size: 13px; }
       .temp-chart { width: 100%; height: auto; display: block; overflow: visible; }
 
@@ -2946,6 +3106,27 @@ class GttcPanel extends HTMLElement {
         from { opacity: 0; transform: translateX(-50%) translateY(8px); }
         to   { opacity: 1; transform: translateX(-50%) translateY(0); }
       }
+
+      /* Person entity selector */
+      .person-list { display: flex; flex-direction: column; gap: 6px; }
+      .person-empty { font-size: 13px; color: var(--secondary-text); padding: 4px 0; }
+      .person-row {
+        display: flex; align-items: center; gap: 10px;
+        padding: 8px 10px; border-radius: 8px; background: var(--bg);
+        border: 1px solid var(--divider); cursor: pointer; transition: background 0.15s;
+      }
+      .person-row:hover { background: var(--card-bg); }
+      .person-row.person-home { border-color: var(--success-color, #43a047); }
+      .person-row input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; flex-shrink: 0; accent-color: var(--primary); }
+      .person-info { flex: 1; min-width: 0; }
+      .person-name { display: block; font-size: 14px; font-weight: 500; color: var(--primary-text); }
+      .person-entity { display: block; font-size: 11px; font-family: monospace; color: var(--secondary-text); }
+      .person-badge {
+        font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 8px;
+        text-transform: lowercase; flex-shrink: 0;
+      }
+      .person-badge-home { background: #e8f5e9; color: #2e7d32; }
+      .person-badge-away { background: var(--bg); color: var(--secondary-text); border: 1px solid var(--divider); }
 
       /* Zone list */
       .zone-list { display: flex; flex-direction: column; gap: 8px; }

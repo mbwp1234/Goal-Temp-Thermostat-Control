@@ -211,6 +211,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 self.window_sensors = data["window_sensors"]
             if "windows_open_override" in data:
                 self.windows_open_override = bool(data["windows_open_override"])
+            if "tracked_persons" in data and isinstance(data["tracked_persons"], list):
+                self.zone_manager.tracked_persons = data["tracked_persons"]
         except Exception as err:
             _LOGGER.error("Error restoring state: %s", err)
 
@@ -229,6 +231,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 ),
                 "window_sensors": self.window_sensors,
                 "windows_open_override": self.windows_open_override,
+                "tracked_persons": self.zone_manager.tracked_persons,
             }
             await self._store.async_save(data)
         except Exception as err:
@@ -1175,6 +1178,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
             self.tou_provider = provider_cls()
         if "precondition_enabled" in updates:
             self.precondition_enabled = bool(updates["precondition_enabled"])
+        if "tracked_persons" in updates:
+            self.zone_manager.tracked_persons = list(updates["tracked_persons"])
 
         await self.async_save()
         self.async_set_updated_data(self._build_state_dict())

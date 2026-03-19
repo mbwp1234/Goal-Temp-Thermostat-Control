@@ -68,6 +68,7 @@ def async_register_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_save_zone)
     websocket_api.async_register_command(hass, ws_delete_zone)
     websocket_api.async_register_command(hass, ws_set_active_zone)
+    websocket_api.async_register_command(hass, ws_list_persons)
 
 
 def _get_coordinator(hass: HomeAssistant, entry_id: str | None = None):
@@ -979,6 +980,7 @@ async def ws_get_config(
             "outdoor_temp_sensor": coordinator.outdoor_temp_sensor or "",
             "window_sensors": list(coordinator.window_sensors),
             "windows_open_override": coordinator.windows_open_override,
+            "tracked_persons": list(coordinator.zone_manager.tracked_persons),
         },
     )
 
@@ -1005,6 +1007,7 @@ async def ws_get_config(
         vol.Optional("tou_enabled"): bool,
         vol.Optional("tou_provider"): vol.In(["none", "dominion_virginia"]),
         vol.Optional("outdoor_temp_sensor"): str,
+        vol.Optional("tracked_persons"): [str],
     }
 )
 @websocket_api.async_response
@@ -1211,6 +1214,42 @@ async def ws_set_active_zone(
 
     await coordinator.async_save()
     connection.send_result(msg["id"], {"success": True})
+
+
+# ── Person entity discovery ────────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/list_persons",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_list_persons(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Return all HA person entities with their current state."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    persons = []
+    for state in hass.states.async_all("person"):
+        persons.append({
+            "entity_id": state.entity_id,
+            "name": state.attributes.get("friendly_name", state.entity_id),
+            "state": state.state,
+            "is_home": state.state == "home",
+        })
+
+    connection.send_result(
+        msg["id"],
+        {
+            "persons": persons,
+            "tracked_persons": list(coordinator.zone_manager.tracked_persons),
+        },
+    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
