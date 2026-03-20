@@ -4,13 +4,13 @@ Supports Dominion Energy Virginia's Off-Peak Plan rate schedule
 and provides a generic framework for other providers.
 
 Dominion Energy Virginia TOU schedule (effective 2025-2026):
-  Summer (June 1 – September 30):
-    On-peak:       11:00 AM – 7:00 PM, weekdays
+  Summer (May 1 – September 30):
+    On-peak:       3:00 PM – 6:00 PM, weekdays
     Off-peak:      All other weekday hours + weekends/holidays
     Super off-peak: 12:00 AM – 5:00 AM, every day
 
-  Winter (October 1 – May 31):
-    On-peak:       7:00 AM – 11:00 AM and 5:00 PM – 9:00 PM, weekdays
+  Winter (October 1 – April 30):
+    On-peak:       6:00 AM – 9:00 AM and 5:00 PM – 8:00 PM, weekdays
     Off-peak:      All other weekday hours + weekends/holidays
     Super off-peak: 12:00 AM – 5:00 AM, every day
 
@@ -69,8 +69,8 @@ class DominionEnergyVirginia(TOUProvider):
 
     name = "dominion_virginia"
 
-    # Summer: June–September
-    _SUMMER_MONTHS = {6, 7, 8, 9}
+    # Summer: May–September
+    _SUMMER_MONTHS = {5, 6, 7, 8, 9}
 
     def _is_holiday(self, d: date) -> bool:
         """Check if the date is a Dominion-observed holiday."""
@@ -128,14 +128,14 @@ class DominionEnergyVirginia(TOUProvider):
 
         # Weekday on-peak windows
         if self._is_summer(d):
-            # Summer: 11 AM – 7 PM
-            if time(11, 0) <= t < time(19, 0):
+            # Summer: 3 PM – 6 PM
+            if time(15, 0) <= t < time(18, 0):
                 return RatePeriod.ON_PEAK
         else:
-            # Winter: 7–11 AM and 5–9 PM
-            if time(7, 0) <= t < time(11, 0):
+            # Winter: 6–9 AM and 5–8 PM
+            if time(6, 0) <= t < time(9, 0):
                 return RatePeriod.ON_PEAK
-            if time(17, 0) <= t < time(21, 0):
+            if time(17, 0) <= t < time(20, 0):
                 return RatePeriod.ON_PEAK
 
         return RatePeriod.OFF_PEAK
@@ -153,16 +153,16 @@ class DominionEnergyVirginia(TOUProvider):
         current_minutes = t.hour * 60 + t.minute
 
         if self._is_summer(d):
-            on_peak_start = 11 * 60  # 11:00
+            on_peak_start = 15 * 60  # 15:00
             if current_minutes < on_peak_start:
                 return on_peak_start - current_minutes
         else:
             # Winter has two windows
-            morning_start = 7 * 60   # 7:00
+            morning_start = 6 * 60   # 6:00
             evening_start = 17 * 60  # 17:00
             if current_minutes < morning_start:
                 return morning_start - current_minutes
-            morning_end = 11 * 60
+            morning_end = 9 * 60
             if morning_end <= current_minutes < evening_start:
                 return evening_start - current_minutes
 
@@ -180,11 +180,11 @@ class DominionEnergyVirginia(TOUProvider):
             return None
 
         if self._is_summer(d):
-            return 19 * 60 - current_minutes  # ends at 7 PM
+            return 18 * 60 - current_minutes  # ends at 6 PM
         else:
-            if current_minutes < 11 * 60:
-                return 11 * 60 - current_minutes  # morning window ends 11 AM
-            return 21 * 60 - current_minutes  # evening window ends 9 PM
+            if current_minutes < 9 * 60:
+                return 9 * 60 - current_minutes  # morning window ends 9 AM
+            return 20 * 60 - current_minutes  # evening window ends 8 PM
 
 
 # Registry of supported TOU providers
