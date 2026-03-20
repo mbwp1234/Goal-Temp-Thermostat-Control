@@ -91,6 +91,7 @@ class GttcPanel extends HTMLElement {
     this._activeMainTab = "command";
     this._diagData = null;
     this._historyData = null;
+    this._hvacHistory = null;
     this._statusLoading = false;
     this._debugExpanded = false;
     this._statusError = null;
@@ -138,14 +139,24 @@ class GttcPanel extends HTMLElement {
       this._render();
       // Load history async (non-blocking) — only on first load or explicit refresh
       const entityId = diagData?.entity_ids?.active_zone_temp;
+      const climateId = diagData?.entity_ids?.climate;
       if (entityId && !this._historyData) {
         const start = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-        this._hass.callApi("GET",
-          `history/period/${start}?filter_entity_id=${entityId}&minimal_response=true&no_attributes=true`
-        ).then(r => {
-          this._historyData = r?.[0] || [];
+        Promise.all([
+          this._hass.callApi("GET",
+            `history/period/${start}?filter_entity_id=${entityId}&minimal_response=true&no_attributes=true`
+          ),
+          climateId
+            ? this._hass.callApi("GET", `history/period/${start}?filter_entity_id=${climateId}`)
+            : Promise.resolve(null),
+        ]).then(([tempResult, hvacResult]) => {
+          this._historyData = tempResult?.[0] || [];
+          this._hvacHistory = hvacResult?.[0] || [];
           this._render();
-        }).catch(() => { this._historyData = []; });
+        }).catch(() => {
+          this._historyData = [];
+          this._hvacHistory = [];
+        });
       }
     } catch (err) {
       console.error("GTTC: Failed to load data", err);
@@ -317,6 +328,7 @@ class GttcPanel extends HTMLElement {
             <div class="week-row ${isSelected ? "selected" : ""}" data-day="${day}">
               <div class="week-row-label">${DAY_LABELS[day]}</div>
               <div class="week-row-timeline">
+                ${this._renderOnPeakOverlay(day)}
                 ${this._renderTimelineBlocks(entries, day, true)}
                 <div class="now-line" style="left:${this._nowPercent()}%"></div>
               </div>
@@ -352,6 +364,7 @@ class GttcPanel extends HTMLElement {
             `).join("")}
           </div>
           <div class="day-timeline" id="dayTimeline" data-day="${day}">
+            ${this._renderOnPeakOverlay(day)}
             ${this._renderTimelineBlocks(entries, day, false)}
           </div>
         </div>
@@ -667,6 +680,7 @@ class GttcPanel extends HTMLElement {
     // Command center refresh
     this._addClick("statusRefreshBtn", () => {
       this._historyData = null;
+      this._hvacHistory = null;
       this._loadData();
     });
 
@@ -1838,6 +1852,60 @@ class GttcPanel extends HTMLElement {
       }
     }
 
+    // On-peak bands for chart
+    const onPeakRects = [];
+    if (this._configData?.tou_enabled && this._configData?.tou_provider === "dominion_virginia") {
+      const SUMMER_MONTHS = new Set([5, 6, 7, 8, 9]);
+      for (let dayOffset = -1; dayOffset <= 0; dayOffset++) {
+        const opDate = new Date();
+        opDate.setDate(opDate.getDate() + dayOffset);
+        opDate.setHours(0, 0, 0, 0);
+        const dow = opDate.getDay();
+        if (dow === 0 || dow === 6) continue;
+        const isSummer = SUMMER_MONTHS.has(opDate.getMonth() + 1);
+        const windows = isSummer ? [{ h: 15, eh: 18 }] : [{ h: 6, eh: 9 }, { h: 17, eh: 20 }];
+        for (const w of windows) {
+          const wStart = new Date(opDate); wStart.setHours(w.h, 0, 0, 0);
+          const wEnd = new Date(opDate); wEnd.setHours(w.eh, 0, 0, 0);
+          if (wStart.getTime() >= tMax || wEnd.getTime() <= tMin) continue;
+          const rx1 = xScale(Math.max(wStart.getTime(), tMin)).toFixed(1);
+          const rx2 = xScale(Math.min(wEnd.getTime(), tMax)).toFixed(1);
+          const rw = (parseFloat(rx2) - parseFloat(rx1)).toFixed(1);
+          if (parseFloat(rw) > 0) onPeakRects.push({ x1: rx1, x2: rx2, w: rw });
+        }
+      }
+    }
+    const onPeakSvg = onPeakRects.map(r =>
+      `<rect x="${r.x1}" y="${PAD.top}" width="${r.w}" height="${innerH}" fill="rgba(219,68,55,0.07)"/>` +
+      `<line x1="${r.x1}" y1="${PAD.top}" x2="${r.x1}" y2="${PAD.top + innerH}" stroke="rgba(219,68,55,0.22)" stroke-width="1" stroke-dasharray="4,3"/>` +
+      `<line x1="${r.x2}" y1="${PAD.top}" x2="${r.x2}" y2="${PAD.top + innerH}" stroke="rgba(219,68,55,0.22)" stroke-width="1" stroke-dasharray="4,3"/>`
+    ).join("");
+
+    // HVAC state bands
+    const hvacSegments = [];
+    if (this._hvacHistory && this._hvacHistory.length > 0) {
+      const hvacPts = this._hvacHistory
+        .filter(p => p.state !== "unavailable" && p.state !== "unknown")
+        .map(p => ({ t: new Date(p.last_changed).getTime(), action: p.attributes?.hvac_action || "idle" }))
+        .sort((a, b) => a.t - b.t);
+      hvacPts.forEach((p, i) => {
+        const segEnd = i < hvacPts.length - 1 ? hvacPts[i + 1].t : tMax;
+        if (p.t < tMax && segEnd > tMin && (p.action === "heating" || p.action === "cooling")) {
+          hvacSegments.push({ tStart: Math.max(p.t, tMin), tEnd: Math.min(segEnd, tMax), action: p.action });
+        }
+      });
+    }
+    const hvacHasHeating = hvacSegments.some(s => s.action === "heating");
+    const hvacHasCooling = hvacSegments.some(s => s.action === "cooling");
+    const hvacBandsSvg = hvacSegments.map(s => {
+      const hx1 = xScale(s.tStart).toFixed(1);
+      const hx2 = xScale(s.tEnd).toFixed(1);
+      const hw = (parseFloat(hx2) - parseFloat(hx1)).toFixed(1);
+      if (parseFloat(hw) <= 0) return "";
+      const fill = s.action === "heating" ? "rgba(245,124,0,0.15)" : "rgba(2,136,209,0.15)";
+      return `<rect x="${hx1}" y="${PAD.top}" width="${hw}" height="${innerH}" fill="${fill}"/>`;
+    }).join("");
+
     // Y-axis ticks
     const yTicks = [];
     const step = (vMax - vMin) <= 6 ? 1 : 2;
@@ -1861,6 +1929,9 @@ class GttcPanel extends HTMLElement {
           <span class="chart-legend"><span class="legend-dot actual"></span> Actual</span>
           ${goalSteps.length > 0 ? `<span class="chart-legend"><span class="legend-dot goal"></span> Schedule goal</span>` : ""}
           ${goalLegendParts.join("")}
+          ${onPeakRects.length > 0 ? `<span class="chart-legend"><span class="legend-dot on-peak"></span> On-Peak</span>` : ""}
+          ${hvacHasHeating ? `<span class="chart-legend"><span class="legend-dot hvac-heat"></span> Heating</span>` : ""}
+          ${hvacHasCooling ? `<span class="chart-legend"><span class="legend-dot hvac-cool"></span> Cooling</span>` : ""}
         </div>
         <svg class="temp-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
           <defs>
@@ -1869,6 +1940,10 @@ class GttcPanel extends HTMLElement {
               <stop offset="100%" stop-color="var(--primary-color,#03a9f4)" stop-opacity="0.02"/>
             </linearGradient>
           </defs>
+          <!-- On-peak bands -->
+          ${onPeakSvg}
+          <!-- HVAC state bands -->
+          ${hvacBandsSvg}
           <!-- Zone bands -->
           ${zoneBands}
           <!-- Grid lines -->
@@ -1899,6 +1974,27 @@ class GttcPanel extends HTMLElement {
         </svg>
       </div>
     `;
+  }
+
+  _getOnPeakWindows(day) {
+    const cfg = this._configData;
+    if (!cfg?.tou_enabled || cfg?.tou_provider !== "dominion_virginia") return [];
+    if (["saturday", "sunday"].includes(day)) return [];
+    const SUMMER_MONTHS = new Set([5, 6, 7, 8, 9]);
+    const isSummer = SUMMER_MONTHS.has(new Date().getMonth() + 1);
+    return isSummer
+      ? [{ start: 15 * 60, end: 18 * 60 }]
+      : [{ start: 6 * 60, end: 9 * 60 }, { start: 17 * 60, end: 20 * 60 }];
+  }
+
+  _renderOnPeakOverlay(day) {
+    const windows = this._getOnPeakWindows(day);
+    if (!windows.length) return "";
+    return windows.map(w => {
+      const leftPct = ((w.start / 1440) * 100).toFixed(2);
+      const widthPct = (((w.end - w.start) / 1440) * 100).toFixed(2);
+      return `<div class="on-peak-band" style="left:${leftPct}%;width:${widthPct}%" title="On-Peak hours"></div>`;
+    }).join("");
   }
 
   _buildScheduleGoalSteps(tMin, tMax) {
@@ -2996,6 +3092,15 @@ class GttcPanel extends HTMLElement {
       .drag-handle-right { right: 0; }
       .drag-handle:hover { background: rgba(255,255,255,0.3); }
 
+      /* On-peak overlay band */
+      .on-peak-band {
+        position: absolute; top: 0; bottom: 0;
+        background: rgba(219,68,55,0.10);
+        border-left: 1px dashed rgba(219,68,55,0.35);
+        border-right: 1px dashed rgba(219,68,55,0.35);
+        pointer-events: none; z-index: 0;
+      }
+
       /* Now line */
       .now-line { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--error); z-index: 3; opacity: 0.7; }
 
@@ -3178,6 +3283,9 @@ class GttcPanel extends HTMLElement {
       .legend-dot { width: 12px; height: 2px; display: inline-block; border-radius: 1px; }
       .legend-dot.actual { background: var(--primary-color, #03a9f4); }
       .legend-dot.goal { background: var(--success-color, #43a047); }
+      .legend-dot.on-peak { background: rgba(219,68,55,0.55); width: 10px; height: 10px; border-radius: 2px; }
+      .legend-dot.hvac-heat { background: rgba(245,124,0,0.7); width: 10px; height: 10px; border-radius: 2px; }
+      .legend-dot.hvac-cool { background: rgba(2,136,209,0.7); width: 10px; height: 10px; border-radius: 2px; }
       .chart-legend-zone {
         display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--secondary-text); font-weight: 400;
       }
