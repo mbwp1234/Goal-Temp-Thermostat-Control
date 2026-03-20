@@ -88,7 +88,7 @@ class GttcPanel extends HTMLElement {
     // Drag state
     this._dragging = null;
     // Status tab
-    this._activeMainTab = "schedule";
+    this._activeMainTab = "command";
     this._diagData = null;
     this._historyData = null;
     this._statusLoading = false;
@@ -98,6 +98,7 @@ class GttcPanel extends HTMLElement {
     this._settingsData = null;
     this._settingsLoading = false;
     this._settingsError = null;
+    this._configData = null;
     this._toast = null;
     this._toastTimer = null;
     // Zone management
@@ -119,24 +120,39 @@ class GttcPanel extends HTMLElement {
   async _loadData() {
     if (!this._hass) return;
     try {
-      const [schedule, status] = await Promise.all([
+      const [schedule, status, diagData, configData] = await Promise.all([
         this._hass.callWS({ type: "gttc/get_schedule" }),
         this._hass.callWS({ type: "gttc/get_status" }),
+        this._hass.callWS({ type: "gttc/get_diagnostics" }).catch(() => null),
+        this._hass.callWS({ type: "gttc/get_config" }).catch(() => null),
       ]);
       this._schedule = schedule;
       this._status = status;
+      this._diagData = diagData;
+      this._configData = configData;
       this._activePreset = schedule.active_preset;
       if (!this._selectedDay) {
         const today = DAYS_ORDERED[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
         this._selectedDay = today;
       }
       this._render();
+      // Load history async (non-blocking) — only on first load or explicit refresh
+      const entityId = diagData?.entity_ids?.active_zone_temp;
+      if (entityId && !this._historyData) {
+        const start = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        this._hass.callApi("GET",
+          `history/period/${start}?filter_entity_id=${entityId}&minimal_response=true&no_attributes=true`
+        ).then(r => {
+          this._historyData = r?.[0] || [];
+          this._render();
+        }).catch(() => { this._historyData = []; });
+      }
     } catch (err) {
-      console.error("GTTC: Failed to load schedule data", err);
+      console.error("GTTC: Failed to load data", err);
       this.shadowRoot.innerHTML = `
         <div style="padding:24px;color:var(--primary-text-color,#333)">
-          <h2>GTTC Schedule</h2>
-          <p style="color:var(--error-color,#c00)">Failed to load schedule data. Make sure GTTC is configured.</p>
+          <h2>GTTC</h2>
+          <p style="color:var(--error-color,#c00)">Failed to load data. Make sure GTTC is configured.</p>
           <pre>${err.message || err}</pre>
         </div>`;
     }
@@ -168,32 +184,15 @@ class GttcPanel extends HTMLElement {
           </div>
           <div class="header-right">
             ${this._renderStatus()}
-            ${this._activeMainTab === "schedule" ? this._renderUndoRedo() : ""}
-            ${this._activeMainTab === "schedule" ? this._renderScheduleMode() : ""}
-            ${this._activeMainTab === "schedule" ? this._renderPresetSelector() : ""}
-            ${this._activeMainTab === "schedule" ? this._renderToolbar() : ""}
           </div>
         </header>
 
         ${this._renderMainTabBar()}
 
         <div class="content">
-          ${this._activeMainTab === "schedule" ? `
-            <div class="day-tabs">
-              ${DAYS_ORDERED.map(d => `
-                <button class="day-tab ${d === this._selectedDay ? "active" : ""}"
-                        data-day="${d}">
-                  <span class="day-short">${DAY_LABELS[d]}</span>
-                </button>
-              `).join("")}
-            </div>
-            <div class="schedule-view">
-              ${this._renderWeekOverview()}
-              ${this._renderDayDetail()}
-            </div>
-          ` : this._activeMainTab === "status"
-              ? this._renderStatusTab()
-              : this._renderSettingsTab()
+          ${this._activeMainTab === "command"
+            ? this._renderCommandCenterTab()
+            : this._renderSettingsTab()
           }
         </div>
 
@@ -653,14 +652,11 @@ class GttcPanel extends HTMLElement {
         const tab = btn.dataset.mainTab;
         if (tab === this._activeMainTab) return;
         this._activeMainTab = tab;
-        // Reset zone edit state when leaving settings
         if (tab !== "settings") {
           this._editingZoneId = null;
           this._zoneFormData = null;
         }
-        if (tab === "status") {
-          this._loadStatusData();
-        } else if (tab === "settings") {
+        if (tab === "settings") {
           this._loadSettingsData();
         } else {
           this._render();
@@ -668,14 +664,31 @@ class GttcPanel extends HTMLElement {
       });
     });
 
-    // Status tab buttons
-    this._addClick("statusRefreshBtn", () => this._loadStatusData());
-    this._addClick("debugToggleBtn", () => {
-      this._debugExpanded = !this._debugExpanded;
-      this._render();
+    // Command center refresh
+    this._addClick("statusRefreshBtn", () => {
+      this._historyData = null;
+      this._loadData();
     });
 
-    // "Manage in Settings" link on the Status window card
+    // Automation toggles
+    root.querySelectorAll(".automation-toggle").forEach(toggle => {
+      toggle.addEventListener("change", () => {
+        this._handleAutomationToggle(toggle.dataset.toggleId, toggle.checked);
+      });
+    });
+
+    // Active zone quick selector
+    const activeZoneSelect = root.getElementById("activeZoneSelect");
+    if (activeZoneSelect) {
+      activeZoneSelect.addEventListener("change", async () => {
+        try {
+          await this._hass.callWS({ type: "gttc/set_active_zone", zone_id: activeZoneSelect.value });
+          await this._loadData();
+        } catch (err) { this._showToast("Failed to change zone.", "error"); }
+      });
+    }
+
+    // "Manage in Settings" link
     this._addClick("goToWindowSettings", () => {
       this._activeMainTab = "settings";
       this._loadSettingsData();
@@ -1364,16 +1377,280 @@ class GttcPanel extends HTMLElement {
     return "rgba(255,255,255,0.95)";
   }
 
+  // ── Command Center ────────────────────────────────────────────────────────
+
+  _renderCommandCenterTab() {
+    if (!this._schedule) {
+      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading...</div>`;
+    }
+    const d = this._diagData;
+    return `
+      <div class="command-center">
+        ${d ? this._renderStatCards(d) : ""}
+        <div class="cc-main-row">
+          ${this._renderAutomationToggles()}
+          ${this._renderQuickPanel()}
+        </div>
+        ${this._renderTempChart()}
+        <div class="schedule-section">
+          <div class="schedule-section-header">
+            <div class="section-label"><ha-icon icon="mdi:calendar-clock"></ha-icon> Schedule</div>
+            <div class="schedule-controls-row">
+              ${this._renderUndoRedo()}
+              ${this._renderScheduleMode()}
+              ${this._renderPresetSelector()}
+              ${this._renderToolbar()}
+            </div>
+          </div>
+          <div class="schedule-section-body">
+            <div class="day-tabs">
+              ${DAYS_ORDERED.map(day => `
+                <button class="day-tab ${day === this._selectedDay ? "active" : ""}" data-day="${day}">
+                  <span class="day-short">${DAY_LABELS[day]}</span>
+                </button>
+              `).join("")}
+            </div>
+            <div class="schedule-view">
+              ${this._renderWeekOverview()}
+              ${this._renderDayDetail()}
+            </div>
+          </div>
+        </div>
+        <div class="cc-footer">
+          <button class="btn btn-outline" id="statusRefreshBtn">
+            <ha-icon icon="mdi:refresh"></ha-icon> Refresh
+          </button>
+          ${d ? `<span class="status-updated">Updated ${new Date().toLocaleTimeString()}</span>` : ""}
+        </div>
+      </div>
+    `;
+  }
+
+  _renderAutomationToggles() {
+    const d = this._diagData;
+    const cfg = this._configData;
+    const f = d?.features || {};
+    const windows = d?.windows || {};
+
+    const toggles = [
+      {
+        id: "schedule",
+        icon: "mdi:calendar-check",
+        label: "Schedule",
+        desc: "Follow temperature time blocks",
+        enabled: d?.schedule_enabled ?? false,
+        badge: null,
+      },
+      {
+        id: "learning",
+        icon: "mdi:brain",
+        label: "Learning",
+        desc: "Auto-adapt from repeated changes",
+        enabled: d?.learning?.enabled ?? cfg?.learning_enabled ?? false,
+        badge: d?.learning?.patterns_learned > 0 ? `${d.learning.patterns_learned} patterns` : null,
+        badgeType: "neutral",
+      },
+      {
+        id: "occupancy",
+        icon: "mdi:account-check",
+        label: "Presence",
+        desc: "Away temp when no one is home",
+        enabled: cfg?.occupancy_enabled ?? false,
+        badge: f.presence_home != null ? (f.presence_home ? "Home" : "Away") : null,
+        badgeType: f.presence_home ? "success" : "warn",
+      },
+      {
+        id: "tou",
+        icon: "mdi:lightning-bolt-circle",
+        label: "TOU Optimization",
+        desc: "Shift setpoint during peak rate hours",
+        enabled: f.tou_enabled ?? cfg?.tou_enabled ?? false,
+        badge: f.tou_enabled && f.tou_rate ? this._touRateLabel(f.tou_rate) : null,
+        badgeType: this._touRateBadgeType(f.tou_rate),
+      },
+      {
+        id: "precondition",
+        icon: "mdi:weather-partly-cloudy",
+        label: "Pre-conditioning",
+        desc: "Ramp toward next schedule entry early",
+        enabled: f.precondition_enabled ?? cfg?.precondition_enabled ?? false,
+        badge: f.precondition_active ? "Active" : null,
+        badgeType: "success",
+      },
+      {
+        id: "windows",
+        icon: "mdi:window-open-variant",
+        label: "Windows Suspend",
+        desc: "Pause HVAC when windows open",
+        enabled: windows.manual_override ?? false,
+        badge: windows.open
+          ? `${windows.open_sensors?.length ?? 1} open`
+          : (windows.sensors?.length > 0 ? "All closed" : null),
+        badgeType: windows.open ? "warn" : "success",
+      },
+    ];
+
+    return `
+      <div class="automation-panel">
+        <div class="panel-title"><ha-icon icon="mdi:tune"></ha-icon> Automation Controls</div>
+        <div class="toggle-grid">
+          ${toggles.map(t => `
+            <div class="toggle-card ${t.enabled ? "toggle-card-on" : "toggle-card-off"}">
+              <div class="toggle-icon-wrap ${t.enabled ? "icon-active" : "icon-idle"}">
+                <ha-icon icon="${t.icon}"></ha-icon>
+              </div>
+              <div class="toggle-card-body">
+                <div class="toggle-card-label">${t.label}</div>
+                <div class="toggle-card-desc">${t.desc}</div>
+                ${t.badge ? `<span class="toggle-badge badge-${t.badgeType || "neutral"}">${t.badge}</span>` : ""}
+              </div>
+              <label class="toggle-switch">
+                <input type="checkbox" class="automation-toggle" data-toggle-id="${t.id}" ${t.enabled ? "checked" : ""} />
+                <span class="toggle-slider"></span>
+              </label>
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  _renderQuickPanel() {
+    const d = this._diagData;
+    const sc = this._schedule;
+    if (!d && !sc) return "";
+    const zones = sc?.zones || [];
+    const f = d?.features || {};
+
+    return `
+      <div class="quick-panel">
+        ${zones.length > 1 ? `
+          <div class="qp-section">
+            <div class="qp-label">Active Zone</div>
+            <select class="qp-select" id="activeZoneSelect">
+              ${zones.map(z => `
+                <option value="${z.id}" ${z.is_active ? "selected" : ""}>${z.name}</option>
+              `).join("")}
+            </select>
+          </div>
+        ` : ""}
+        ${d?.override_active ? `
+          <div class="override-banner">
+            <ha-icon icon="mdi:clock-edit"></ha-icon>
+            <div class="override-info">
+              <span class="override-label">Override Active</span>
+              <span class="override-sub">${d.override_target_temp}° &middot; ${d.override_remaining_minutes}m left</span>
+            </div>
+            <button class="btn-cancel-override" id="cancelOverrideBtn" title="Cancel">&#x2715;</button>
+          </div>
+        ` : ""}
+        ${d?.zones?.length > 0 ? `
+          <div class="qp-section">
+            <div class="qp-label">Zone Temperatures</div>
+            <div class="mini-zones">
+              ${d.zones.map(z => `
+                <div class="mini-zone ${z.is_active ? "mini-zone-active" : ""}">
+                  <span class="mz-dot">${z.is_active ? "&#9679;" : "&#9675;"}</span>
+                  <span class="mz-name">${z.name}</span>
+                  ${z.is_occupied != null ? `<span class="mz-occ ${z.is_occupied ? "occ-yes" : ""}">${z.is_occupied ? "occ" : ""}</span>` : ""}
+                  <span class="mz-temp">${z.current_temp != null ? z.current_temp.toFixed(1) + "°" : "—"}</span>
+                </div>
+              `).join("")}
+            </div>
+          </div>
+        ` : ""}
+        ${f.tou_enabled && f.tou_rate ? `
+          <div class="qp-section">
+            <div class="qp-label">Current Rate Period</div>
+            <div class="tou-rate-row">
+              <span class="tou-rate-badge badge-${this._touRateBadgeType(f.tou_rate)}">${this._touRateLabel(f.tou_rate)}</span>
+              ${f.precondition_active ? `<span class="tou-note">Pre-conditioning active</span>` : ""}
+            </div>
+          </div>
+        ` : ""}
+        ${d ? `
+          <div class="qp-section">
+            <div class="qp-label">System</div>
+            <table class="sys-table">
+              <tr><td class="sys-label">Outdoor</td><td class="sys-val">${f.outdoor_temp != null ? f.outdoor_temp.toFixed(1) + "°" : "—"}</td></tr>
+              <tr><td class="sys-label">Heat pump</td><td class="sys-val">${f.heat_pump_detected ? "Yes" : "No"}</td></tr>
+              <tr><td class="sys-label">Presence</td><td class="sys-val">${f.presence_home != null ? (f.presence_home ? "Home" : "Away") : "—"}</td></tr>
+            </table>
+          </div>
+        ` : ""}
+        ${d?.windows?.sensors?.length > 0 ? `
+          <div class="qp-section">
+            <div class="qp-label">Windows</div>
+            <div class="win-status ${d.windows.open ? "win-open" : "win-closed"}">
+              <ha-icon icon="${d.windows.open ? "mdi:window-open-variant" : "mdi:window-closed-variant"}"></ha-icon>
+              <span>${d.windows.open ? `${d.windows.open_sensors.length} open` : "All closed"}</span>
+              ${d.windows.open ? `<span class="win-badge">HVAC paused</span>` : ""}
+            </div>
+            <div style="margin-top:8px">
+              <button class="btn btn-outline btn-sm" id="goToWindowSettings">
+                <ha-icon icon="mdi:cog"></ha-icon> Manage
+              </button>
+            </div>
+          </div>
+        ` : ""}
+      </div>
+    `;
+  }
+
+  _touRateLabel(rate) {
+    if (rate === "on_peak") return "On-Peak";
+    if (rate === "super_off_peak") return "Super Off-Peak";
+    return "Off-Peak";
+  }
+
+  _touRateBadgeType(rate) {
+    if (rate === "on_peak") return "danger";
+    if (rate === "super_off_peak") return "info";
+    return "success";
+  }
+
+  async _handleAutomationToggle(toggleId, enabled) {
+    const labels = {
+      schedule: "Schedule", learning: "Learning", occupancy: "Presence",
+      tou: "TOU optimization", precondition: "Pre-conditioning", windows: "Windows suspend",
+    };
+    const label = labels[toggleId] || toggleId;
+    try {
+      switch (toggleId) {
+        case "schedule":
+          await this._hass.callService("switch", enabled ? "turn_on" : "turn_off", { entity_id: "switch.gttc_schedule" });
+          break;
+        case "learning":
+          await this._hass.callWS({ type: "gttc/set_config", learning_enabled: enabled });
+          break;
+        case "occupancy":
+          await this._hass.callWS({ type: "gttc/set_config", occupancy_enabled: enabled });
+          break;
+        case "tou":
+          await this._hass.callWS({ type: "gttc/set_config", tou_enabled: enabled });
+          break;
+        case "precondition":
+          await this._hass.callWS({ type: "gttc/set_config", precondition_enabled: enabled });
+          break;
+        case "windows":
+          await this._hass.callService("switch", enabled ? "turn_on" : "turn_off", { entity_id: "switch.gttc_windows_open" });
+          break;
+      }
+      this._showToast(`${label} ${enabled ? "enabled" : "disabled"}.`);
+      await this._loadData();
+    } catch (err) {
+      this._showToast(`Failed to update: ${err.message || err}`, "error");
+      this._render();
+    }
+  }
+
   // ── Main tab bar ──────────────────────────────────────────────────────────
 
   _renderMainTabBar() {
     return `
       <div class="main-tab-bar">
-        <button class="main-tab ${this._activeMainTab === "schedule" ? "active" : ""}" data-main-tab="schedule">
-          <ha-icon icon="mdi:calendar-clock"></ha-icon> Schedule
-        </button>
-        <button class="main-tab ${this._activeMainTab === "status" ? "active" : ""}" data-main-tab="status">
-          <ha-icon icon="mdi:chart-line"></ha-icon> Status
+        <button class="main-tab ${this._activeMainTab === "command" ? "active" : ""}" data-main-tab="command">
+          <ha-icon icon="mdi:view-dashboard"></ha-icon> Command Center
         </button>
         <button class="main-tab ${this._activeMainTab === "settings" ? "active" : ""}" data-main-tab="settings">
           <ha-icon icon="mdi:cog"></ha-icon> Settings
@@ -3158,6 +3435,127 @@ class GttcPanel extends HTMLElement {
         .day-actions { flex-direction: column; gap: 4px; }
         .entry-actions { flex-direction: column; gap: 4px; }
       }
+
+      /* ── Command Center ─────────────────────────────────────────────── */
+      .command-center { display: flex; flex-direction: column; gap: 16px; }
+
+      .cc-main-row {
+        display: grid; grid-template-columns: 1fr 270px; gap: 16px; align-items: start;
+      }
+      @media (max-width: 900px) { .cc-main-row { grid-template-columns: 1fr; } }
+
+      /* Automation panel */
+      .automation-panel {
+        background: var(--card-bg); border-radius: 12px; border: 1px solid var(--divider); overflow: hidden;
+      }
+      .panel-title {
+        display: flex; align-items: center; gap: 8px; padding: 12px 16px;
+        font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px;
+        color: var(--secondary-text); border-bottom: 1px solid var(--divider); background: var(--bg);
+      }
+      .panel-title ha-icon { --mdc-icon-size: 15px; }
+
+      .toggle-grid {
+        display: grid; grid-template-columns: repeat(2, 1fr);
+        gap: 1px; background: var(--divider);
+      }
+      @media (max-width: 700px) { .toggle-grid { grid-template-columns: 1fr; } }
+
+      .toggle-card {
+        display: flex; align-items: center; gap: 12px; padding: 14px 16px;
+        background: var(--card-bg); transition: background 0.15s; cursor: default;
+      }
+      .toggle-card:hover { background: rgba(0,0,0,0.02); }
+      .toggle-icon-wrap { flex-shrink: 0; transition: color 0.2s; }
+      .toggle-icon-wrap ha-icon { --mdc-icon-size: 22px; }
+      .toggle-card-on .toggle-icon-wrap { color: var(--primary); }
+      .toggle-card-off .toggle-icon-wrap { color: var(--secondary-text); }
+      .icon-active { opacity: 1; }
+      .icon-idle { opacity: 0.45; }
+
+      .toggle-card-body { flex: 1; min-width: 0; }
+      .toggle-card-label { font-size: 14px; font-weight: 500; color: var(--primary-text); line-height: 1.2; }
+      .toggle-card-desc { font-size: 11px; color: var(--secondary-text); margin-top: 2px; }
+      .toggle-badge {
+        display: inline-block; margin-top: 5px;
+        font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 8px;
+      }
+      .badge-success { background: #e8f5e9; color: #2e7d32; }
+      .badge-warn    { background: #fff8e1; color: #e65100; }
+      .badge-danger  { background: #fce4ec; color: #c62828; }
+      .badge-info    { background: #e3f2fd; color: #0d47a1; }
+      .badge-neutral { background: var(--bg); color: var(--secondary-text); border: 1px solid var(--divider); }
+
+      /* Quick panel */
+      .quick-panel {
+        display: flex; flex-direction: column; gap: 14px;
+        background: var(--card-bg); border-radius: 12px; border: 1px solid var(--divider);
+        padding: 14px 16px;
+      }
+      .qp-section { display: flex; flex-direction: column; gap: 6px; }
+      .qp-label {
+        font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px;
+        color: var(--secondary-text);
+      }
+      .qp-select {
+        padding: 7px 10px; border-radius: 8px; border: 1px solid var(--divider);
+        background: var(--bg); color: var(--primary-text); font-size: 14px; cursor: pointer; width: 100%;
+      }
+      .qp-select:focus { outline: none; border-color: var(--primary); }
+
+      /* Override banner */
+      .override-banner {
+        display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+        background: #fff3e0; border: 1px solid #ff9800; border-radius: 8px; color: #e65100;
+      }
+      .override-banner ha-icon { --mdc-icon-size: 20px; flex-shrink: 0; }
+      .override-info { flex: 1; }
+      .override-label { display: block; font-size: 13px; font-weight: 600; }
+      .override-sub { display: block; font-size: 11px; opacity: 0.85; }
+
+      /* Mini zones */
+      .mini-zones { display: flex; flex-direction: column; gap: 4px; }
+      .mini-zone {
+        display: flex; align-items: center; gap: 7px; padding: 5px 8px;
+        border-radius: 6px; background: var(--bg); font-size: 13px;
+      }
+      .mini-zone-active {
+        background: rgba(3,169,244,0.08); font-weight: 500;
+        border: 1px solid rgba(3,169,244,0.2);
+      }
+      .mz-dot { font-size: 9px; color: var(--secondary-text); flex-shrink: 0; }
+      .mini-zone-active .mz-dot { color: var(--primary); }
+      .mz-name { flex: 1; }
+      .mz-temp { font-weight: 600; font-size: 14px; }
+      .mz-occ { font-size: 10px; padding: 1px 5px; border-radius: 6px; background: var(--divider); color: var(--secondary-text); }
+      .occ-yes { background: #e8f5e9; color: #2e7d32; }
+
+      /* TOU rate */
+      .tou-rate-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .tou-rate-badge { font-size: 13px; font-weight: 600; padding: 4px 12px; border-radius: 8px; }
+      .tou-note { font-size: 11px; color: var(--secondary-text); }
+
+      /* Schedule section card */
+      .schedule-section {
+        background: var(--card-bg); border-radius: 12px; border: 1px solid var(--divider); overflow: hidden;
+      }
+      .schedule-section-header {
+        display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap;
+        gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--divider); background: var(--bg);
+      }
+      .section-label {
+        display: flex; align-items: center; gap: 6px;
+        font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px;
+        color: var(--secondary-text);
+      }
+      .section-label ha-icon { --mdc-icon-size: 15px; }
+      .schedule-controls-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .schedule-section-body { padding: 16px; }
+      .schedule-section-body .day-tabs { margin-bottom: 16px; }
+      .schedule-section-body .week-overview { margin-bottom: 20px; }
+
+      /* Command center footer */
+      .cc-footer { display: flex; align-items: center; gap: 12px; padding-top: 4px; }
     `;
   }
 }
