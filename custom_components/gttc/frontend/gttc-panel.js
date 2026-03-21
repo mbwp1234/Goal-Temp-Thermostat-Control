@@ -1762,7 +1762,6 @@ class GttcPanel extends HTMLElement {
 
   _renderTempChart() {
     const hist = this._historyData;
-    const diag = this._diagData;
 
     if (!hist || hist.length === 0) {
       return `
@@ -1788,10 +1787,8 @@ class GttcPanel extends HTMLElement {
 
     const tMin = points[0].t, tMax = points[points.length - 1].t;
 
-    // Build schedule goal steps from the current schedule data
     const goalSteps = this._buildScheduleGoalSteps(tMin, tMax);
 
-    // Include goal temps in y-axis range so the line is always visible
     const goalTemps = goalSteps.map(s => s.temp);
     const temps = points.map(p => p.v).concat(goalTemps);
     const vMin = Math.floor(Math.min(...temps) - 1);
@@ -1800,60 +1797,66 @@ class GttcPanel extends HTMLElement {
     const xScale = t => PAD.left + ((t - tMin) / (tMax - tMin)) * innerW;
     const yScale = v => PAD.top + (1 - (v - vMin) / (vMax - vMin)) * innerH;
 
-    // Actual temp line path
-    const pathD = points.map((p, i) => `${i === 0 ? "M" : "L"}${xScale(p.t).toFixed(1)},${yScale(p.v).toFixed(1)}`).join(" ");
-    const areaD = pathD + ` L${xScale(tMax).toFixed(1)},${(PAD.top + innerH).toFixed(1)} L${xScale(tMin).toFixed(1)},${(PAD.top + innerH).toFixed(1)} Z`;
+    // Area fill path (always primary color gradient)
+    const mainPathD = points.map((p, i) => `${i === 0 ? "M" : "L"}${xScale(p.t).toFixed(1)},${yScale(p.v).toFixed(1)}`).join(" ");
+    const areaD = mainPathD + ` L${xScale(tMax).toFixed(1)},${(PAD.top + innerH).toFixed(1)} L${xScale(tMin).toFixed(1)},${(PAD.top + innerH).toFixed(1)} Z`;
 
-    // Zone color palette (for multi-zone band coloring)
-    const ZONE_COLORS = ["#6c63ff","#ff6584","#43a047","#ff9800","#00bcd4","#795548"];
-    const zoneIds = [...new Set(goalSteps.map(s => s.zone_id).filter(Boolean))];
-    const zoneColorMap = {};
-    zoneIds.forEach((id, i) => { zoneColorMap[id] = ZONE_COLORS[i % ZONE_COLORS.length]; });
+    // Build HVAC state lookup from history (binary search by timestamp)
+    const hvacPts = (this._hvacHistory || [])
+      .filter(p => p.state !== "unavailable" && p.state !== "unknown")
+      .map(p => ({ t: new Date(p.last_changed).getTime(), action: p.attributes?.hvac_action || "idle" }))
+      .sort((a, b) => a.t - b.t);
 
-    // Zone band SVG rects behind chart
-    const zoneBands = goalSteps.filter(s => s.zone_id).map(s => {
-      const x1 = xScale(s.tStart);
-      const x2 = xScale(s.tEnd);
-      const color = zoneColorMap[s.zone_id] || "#888";
-      return `<rect x="${x1.toFixed(1)}" y="${PAD.top}" width="${(x2 - x1).toFixed(1)}" height="${innerH}"
-                fill="${color}" opacity="0.07" rx="0"/>`;
-    }).join("");
-
-    // Goal step-function path
-    let goalPathD = "";
-    let goalLegendParts = [];
-    if (goalSteps.length > 0) {
-      const segments = [];
-      for (const s of goalSteps) {
-        const x1 = xScale(s.tStart), x2 = xScale(s.tEnd);
-        const y = yScale(s.temp);
-        segments.push(`M${x1.toFixed(1)},${y.toFixed(1)} L${x2.toFixed(1)},${y.toFixed(1)}`);
+    const getHvacAction = (ts) => {
+      let lo = 0, hi = hvacPts.length - 1, result = "idle";
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (hvacPts[mid].t <= ts) { result = hvacPts[mid].action; lo = mid + 1; }
+        else hi = mid - 1;
       }
-      // Connect steps with vertical transitions
-      for (let i = 0; i < goalSteps.length - 1; i++) {
-        const curr = goalSteps[i], next = goalSteps[i + 1];
-        if (Math.abs(curr.tEnd - next.tStart) < 60000) { // adjacent
-          const x = xScale(curr.tEnd);
-          segments.push(`M${x.toFixed(1)},${yScale(curr.temp).toFixed(1)} L${x.toFixed(1)},${yScale(next.temp).toFixed(1)}`);
+      return result;
+    };
+
+    // Split actual temp line into colored segments by HVAC state
+    const COLOR_IDLE = "var(--primary-color,#03a9f4)";
+    const COLOR_HEATING = "#f57c00";
+    const COLOR_COOLING = "#0288d1";
+    const getLineColor = (action) => action === "heating" ? COLOR_HEATING : action === "cooling" ? COLOR_COOLING : COLOR_IDLE;
+
+    let actualLineSvg;
+    let hvacHasHeating = false, hvacHasCooling = false;
+    if (hvacPts.length > 0) {
+      // Group consecutive points sharing the same HVAC action
+      const colorSegs = [];
+      let segStart = 0;
+      let curAction = getHvacAction(points[0].t);
+      for (let i = 1; i < points.length; i++) {
+        const a = getHvacAction(points[i].t);
+        if (a !== curAction) {
+          colorSegs.push({ from: segStart, to: i, action: curAction });
+          segStart = i; curAction = a;
         }
       }
-      goalPathD = segments.join(" ");
+      colorSegs.push({ from: segStart, to: points.length - 1, action: curAction });
 
-      // Legend: unique zones
-      if (zoneIds.length > 1) {
-        // Build zone name map from diag data
-        const zoneNames = {};
-        (diag && diag.zones || []).forEach(z => { zoneNames[z.id] = z.name; });
-        zoneIds.forEach(id => {
-          const color = zoneColorMap[id];
-          const name = zoneNames[id] || id;
-          goalLegendParts.push(`<span class="chart-legend-zone" style="--zone-color:${color}">${name}</span>`);
-        });
-      }
+      hvacHasHeating = colorSegs.some(s => s.action === "heating");
+      hvacHasCooling = colorSegs.some(s => s.action === "cooling");
+
+      actualLineSvg = colorSegs.map(seg => {
+        const pts = points.slice(seg.from, seg.to + 1);
+        if (pts.length < 2) {
+          const p = pts[0];
+          return `<circle cx="${xScale(p.t).toFixed(1)}" cy="${yScale(p.v).toFixed(1)}" r="2" fill="${getLineColor(seg.action)}"/>`;
+        }
+        const d = pts.map((p, i) => `${i === 0 ? "M" : "L"}${xScale(p.t).toFixed(1)},${yScale(p.v).toFixed(1)}`).join(" ");
+        return `<path d="${d}" fill="none" stroke="${getLineColor(seg.action)}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+      }).join("");
+    } else {
+      actualLineSvg = `<path d="${mainPathD}" fill="none" stroke="${COLOR_IDLE}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
     }
 
-    // On-peak bands for chart
-    const onPeakRects = [];
+    // Build on-peak time intervals [tStart_ms, tEnd_ms]
+    const onPeakIntervals = [];
     if (this._configData?.tou_enabled && this._configData?.tou_provider === "dominion_virginia") {
       const SUMMER_MONTHS = new Set([5, 6, 7, 8, 9]);
       for (let dayOffset = -1; dayOffset <= 0; dayOffset++) {
@@ -1867,44 +1870,49 @@ class GttcPanel extends HTMLElement {
         for (const w of windows) {
           const wStart = new Date(opDate); wStart.setHours(w.h, 0, 0, 0);
           const wEnd = new Date(opDate); wEnd.setHours(w.eh, 0, 0, 0);
-          if (wStart.getTime() >= tMax || wEnd.getTime() <= tMin) continue;
-          const rx1 = xScale(Math.max(wStart.getTime(), tMin)).toFixed(1);
-          const rx2 = xScale(Math.min(wEnd.getTime(), tMax)).toFixed(1);
-          const rw = (parseFloat(rx2) - parseFloat(rx1)).toFixed(1);
-          if (parseFloat(rw) > 0) onPeakRects.push({ x1: rx1, x2: rx2, w: rw });
+          onPeakIntervals.push([wStart.getTime(), wEnd.getTime()]);
         }
       }
     }
-    const onPeakSvg = onPeakRects.map(r =>
-      `<rect x="${r.x1}" y="${PAD.top}" width="${r.w}" height="${innerH}" fill="rgba(219,68,55,0.07)"/>` +
-      `<line x1="${r.x1}" y1="${PAD.top}" x2="${r.x1}" y2="${PAD.top + innerH}" stroke="rgba(219,68,55,0.22)" stroke-width="1" stroke-dasharray="4,3"/>` +
-      `<line x1="${r.x2}" y1="${PAD.top}" x2="${r.x2}" y2="${PAD.top + innerH}" stroke="rgba(219,68,55,0.22)" stroke-width="1" stroke-dasharray="4,3"/>`
-    ).join("");
+    const isOnPeakTime = (t) => onPeakIntervals.some(([s, e]) => t >= s && t < e);
 
-    // HVAC state bands
-    const hvacSegments = [];
-    if (this._hvacHistory && this._hvacHistory.length > 0) {
-      const hvacPts = this._hvacHistory
-        .filter(p => p.state !== "unavailable" && p.state !== "unknown")
-        .map(p => ({ t: new Date(p.last_changed).getTime(), action: p.attributes?.hvac_action || "idle" }))
-        .sort((a, b) => a.t - b.t);
-      hvacPts.forEach((p, i) => {
-        const segEnd = i < hvacPts.length - 1 ? hvacPts[i + 1].t : tMax;
-        if (p.t < tMax && segEnd > tMin && (p.action === "heating" || p.action === "cooling")) {
-          hvacSegments.push({ tStart: Math.max(p.t, tMin), tEnd: Math.min(segEnd, tMax), action: p.action });
+    // Split goal step-function into on-peak/off-peak colored segments
+    let goalLineSvg = "";
+    let hasOnPeakGoal = false;
+    if (goalSteps.length > 0) {
+      const goalPaths = [];
+      for (const step of goalSteps) {
+        // Collect sub-interval boundaries within this step from on-peak windows
+        const bounds = new Set([step.tStart, step.tEnd]);
+        for (const [opS, opE] of onPeakIntervals) {
+          if (opS > step.tStart && opS < step.tEnd) bounds.add(opS);
+          if (opE > step.tStart && opE < step.tEnd) bounds.add(opE);
         }
-      });
+        const bArr = [...bounds].sort((a, b) => a - b);
+        for (let i = 0; i < bArr.length - 1; i++) {
+          const tS = bArr[i], tE = bArr[i + 1];
+          const onPeak = isOnPeakTime((tS + tE) / 2);
+          if (onPeak) hasOnPeakGoal = true;
+          const x1 = xScale(tS).toFixed(1), x2 = xScale(tE).toFixed(1);
+          const y = yScale(step.temp).toFixed(1);
+          if (onPeak) {
+            goalPaths.push(`<path d="M${x1},${y} L${x2},${y}" fill="none" stroke="#e53935" stroke-width="2.5" stroke-dasharray="6,4" opacity="0.95"/>`);
+          } else {
+            goalPaths.push(`<path d="M${x1},${y} L${x2},${y}" fill="none" stroke="var(--success-color,#43a047)" stroke-width="2" stroke-dasharray="6,4" opacity="0.9"/>`);
+          }
+        }
+      }
+      // Vertical connectors between adjacent steps
+      for (let i = 0; i < goalSteps.length - 1; i++) {
+        const curr = goalSteps[i], next = goalSteps[i + 1];
+        if (Math.abs(curr.tEnd - next.tStart) < 60000) {
+          const x = xScale(curr.tEnd).toFixed(1);
+          const onPeak = isOnPeakTime(curr.tEnd);
+          goalPaths.push(`<line x1="${x}" y1="${yScale(curr.temp).toFixed(1)}" x2="${x}" y2="${yScale(next.temp).toFixed(1)}" stroke="${onPeak ? "#e53935" : "var(--success-color,#43a047)"}" stroke-width="1.5" opacity="0.7"/>`);
+        }
+      }
+      goalLineSvg = goalPaths.join("");
     }
-    const hvacHasHeating = hvacSegments.some(s => s.action === "heating");
-    const hvacHasCooling = hvacSegments.some(s => s.action === "cooling");
-    const hvacBandsSvg = hvacSegments.map(s => {
-      const hx1 = xScale(s.tStart).toFixed(1);
-      const hx2 = xScale(s.tEnd).toFixed(1);
-      const hw = (parseFloat(hx2) - parseFloat(hx1)).toFixed(1);
-      if (parseFloat(hw) <= 0) return "";
-      const fill = s.action === "heating" ? "rgba(245,124,0,0.15)" : "rgba(2,136,209,0.15)";
-      return `<rect x="${hx1}" y="${PAD.top}" width="${hw}" height="${innerH}" fill="${fill}"/>`;
-    }).join("");
 
     // Y-axis ticks
     const yTicks = [];
@@ -1928,8 +1936,7 @@ class GttcPanel extends HTMLElement {
           Zone Temperature — last 24h
           <span class="chart-legend"><span class="legend-dot actual"></span> Actual</span>
           ${goalSteps.length > 0 ? `<span class="chart-legend"><span class="legend-dot goal"></span> Schedule goal</span>` : ""}
-          ${goalLegendParts.join("")}
-          ${onPeakRects.length > 0 ? `<span class="chart-legend"><span class="legend-dot on-peak"></span> On-Peak</span>` : ""}
+          ${hasOnPeakGoal ? `<span class="chart-legend"><span class="legend-dot on-peak"></span> On-Peak goal</span>` : ""}
           ${hvacHasHeating ? `<span class="chart-legend"><span class="legend-dot hvac-heat"></span> Heating</span>` : ""}
           ${hvacHasCooling ? `<span class="chart-legend"><span class="legend-dot hvac-cool"></span> Cooling</span>` : ""}
         </div>
@@ -1940,12 +1947,6 @@ class GttcPanel extends HTMLElement {
               <stop offset="100%" stop-color="var(--primary-color,#03a9f4)" stop-opacity="0.02"/>
             </linearGradient>
           </defs>
-          <!-- On-peak bands -->
-          ${onPeakSvg}
-          <!-- HVAC state bands -->
-          ${hvacBandsSvg}
-          <!-- Zone bands -->
-          ${zoneBands}
           <!-- Grid lines -->
           ${yTicks.map(v => `
             <line x1="${PAD.left}" y1="${yScale(v).toFixed(1)}" x2="${PAD.left + innerW}" y2="${yScale(v).toFixed(1)}"
@@ -1954,10 +1955,10 @@ class GttcPanel extends HTMLElement {
           `).join("")}
           <!-- Area fill -->
           <path d="${areaD}" fill="url(#areaGrad)"/>
-          <!-- Actual zone temp line -->
-          <path d="${pathD}" fill="none" stroke="var(--primary-color,#03a9f4)" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>
-          <!-- Schedule goal step-function -->
-          ${goalPathD ? `<path d="${goalPathD}" fill="none" stroke="var(--success-color,#43a047)" stroke-width="2" stroke-dasharray="6,4" opacity="0.9"/>` : ""}
+          <!-- Schedule goal (green off-peak, red on-peak) -->
+          ${goalLineSvg}
+          <!-- Actual temp line (colored by HVAC state) -->
+          ${actualLineSvg}
           <!-- X-axis ticks -->
           ${xTicks.map(t => {
             const x = xScale(t).toFixed(1);
