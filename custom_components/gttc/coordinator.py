@@ -334,6 +334,21 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug(
                     "Window open detected — suspending thermostat control"
                 )
+                # Actively park the thermostat so it doesn't keep running on
+                # its last setpoint. Cooling: push to max_temp so the AC
+                # won't kick on. Heating: push to min_temp so heat won't run.
+                if self.hvac_mode == HVACMode.COOL:
+                    park_temp = self.get_thermostat_max_temp()
+                elif self.hvac_mode in (HVACMode.HEAT, HVACMode.HEAT_COOL):
+                    park_temp = self.get_thermostat_min_temp()
+                else:
+                    park_temp = None
+                if park_temp is not None and (
+                    self._last_thermostat_temp is None
+                    or abs(park_temp - self._last_thermostat_temp) >= TEMP_HYSTERESIS
+                ):
+                    await self._set_thermostat_temp(park_temp)
+                    self._last_thermostat_temp = park_temp
                 return self._build_state_dict()
 
             # Auto-switch active zone when the current schedule entry
