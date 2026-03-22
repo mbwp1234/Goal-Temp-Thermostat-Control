@@ -395,10 +395,10 @@ class GttcPanel extends HTMLElement {
         <div class="timeline-block ${compact ? "compact" : ""}"
              style="left:${leftPct}%;width:${widthPct}%;background:${color};color:${textColor}"
              data-day="${day}" data-index="${i}"
-             title="${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}: ${entry.target_temp}\u00b0F${zoneLabel}">
+             title="${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}: ${entry.target_temp}\u00b0F${entry.cooling_temp != null ? ` / \u2744\ufe0f${entry.cooling_temp}\u00b0F` : ""}${zoneLabel}">
           ${compact
-            ? `<span class="block-temp">${entry.target_temp}\u00b0</span>`
-            : `<span class="block-temp">${entry.target_temp}\u00b0F</span>
+            ? `<span class="block-temp">${entry.target_temp}\u00b0${entry.cooling_temp != null ? `<span class="block-cool"> \u2744${entry.cooling_temp}\u00b0</span>` : ""}</span>`
+            : `<span class="block-temp">${entry.target_temp}\u00b0F${entry.cooling_temp != null ? `<span class="block-cool"> / \u2744${entry.cooling_temp}\u00b0F</span>` : ""}</span>
                <span class="block-time">${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}</span>`
           }
           ${!compact ? `
@@ -3214,6 +3214,7 @@ class GttcPanel extends HTMLElement {
       .timeline-block.compact .block-temp { font-size: 11px; }
       .block-temp { font-size: 13px; font-weight: 600; text-shadow: 0 1px 2px rgba(0,0,0,0.3); }
       .block-time { font-size: 10px; opacity: 0.85; text-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+      .block-cool { color: rgba(100,220,255,0.95); font-weight: 600; }
 
       /* Drag handles */
       .drag-handle {
@@ -3248,6 +3249,7 @@ class GttcPanel extends HTMLElement {
       .day-timeline .timeline-block { top: 4px; bottom: 4px; }
       .day-timeline .block-temp { font-size: 14px; }
       .day-timeline .block-time { font-size: 11px; }
+      .day-timeline .block-cool { font-size: 12px; }
 
       /* Entry cards */
       .entries-list { display: flex; flex-direction: column; gap: 8px; }
