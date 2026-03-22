@@ -15,6 +15,7 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    CONF_AUTO_SEASON_SWITCH,
     CONF_AWAY_TEMP,
     CONF_COOLING_AWAY_TEMP,
     CONF_COOLING_COMFORT,
@@ -33,6 +34,7 @@ from .const import (
     CONF_TOU_ENABLED,
     CONF_TOU_PROVIDER,
     CONF_WINDOW_SENSORS,
+    DEFAULT_AUTO_SEASON_SWITCH,
     DEFAULT_AWAY_TEMP,
     DEFAULT_COOLING_AWAY,
     DEFAULT_COOLING_COMFORT,
@@ -117,9 +119,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self._outdoor_temp: float | None = None
 
         # Season management — Heating or Cooling.
-        # Controlled manually via SeasonModeSelect; the system only recommends
-        # when to switch (via SeasonSwitchRecommendedBinarySensor) and never
-        # auto-switches to avoid mid-season oscillation.
+        # When auto_season_switch is True the coordinator automatically calls
+        # async_set_season once suggest_season_switch fires, instead of only
+        # surfacing it as a recommendation.
         self.season: str = SEASON_HEATING
         self.cooling_comfort: float = float(
             data.get(CONF_COOLING_COMFORT, DEFAULT_COOLING_COMFORT)
@@ -130,11 +132,16 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self.seasonal_recommend_hours: float = float(
             data.get(CONF_SEASONAL_RECOMMEND_HOURS, SEASONAL_RECOMMEND_HOURS)
         )
+        self.auto_season_switch: bool = bool(
+            data.get(CONF_AUTO_SEASON_SWITCH, DEFAULT_AUTO_SEASON_SWITCH)
+        )
         # Timestamps tracking how long opposite-season conditions have held.
         # Not persisted — reset on restart so the recommendation countdown
         # starts fresh rather than triggering on stale pre-restart data.
         self._cooling_conditions_since: datetime | None = None
         self._heating_conditions_since: datetime | None = None
+        # Guards against scheduling multiple auto-switch tasks simultaneously.
+        self._auto_switch_pending: bool = False
 
         # Sub-managers
         self.zone_manager = ZoneManager(hass, config_entry.entry_id)
@@ -259,6 +266,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     self.seasonal_recommend_hours = float(data["seasonal_recommend_hours"])
                 except (ValueError, TypeError):
                     pass
+            if "auto_season_switch" in data:
+                self.auto_season_switch = bool(data["auto_season_switch"])
         except Exception as err:
             _LOGGER.error("Error restoring state: %s", err)
 
@@ -282,6 +291,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 "cooling_comfort": self.cooling_comfort,
                 "cooling_away_temp": self.cooling_away_temp,
                 "seasonal_recommend_hours": self.seasonal_recommend_hours,
+                "auto_season_switch": self.auto_season_switch,
             }
             await self._store.async_save(data)
         except Exception as err:
@@ -450,6 +460,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
             "season": self.season,
             "suggest_season_switch": self.suggest_season_switch,
             "season_conditions_hours": self.season_conditions_hours,
+            "auto_season_switch": self.auto_season_switch,
         }
 
     def _read_thermostat_state(self) -> None:
@@ -1281,6 +1292,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
             self.cooling_away_temp = float(updates["cooling_away_temp"])
         if "seasonal_recommend_hours" in updates:
             self.seasonal_recommend_hours = float(updates["seasonal_recommend_hours"])
+        if "auto_season_switch" in updates:
+            self.auto_season_switch = bool(updates["auto_season_switch"])
 
         await self.async_save()
         self.async_set_updated_data(self._build_state_dict())
@@ -1372,6 +1385,30 @@ class GTTCCoordinator(DataUpdateCoordinator):
                         self.season_conditions_hours,
                     )
                 self._heating_conditions_since = None
+
+        # Auto-switch: if enabled and the recommendation threshold has been
+        # reached, trigger a season change instead of just surfacing it.
+        if (
+            self.auto_season_switch
+            and self.suggest_season_switch
+            and not self._auto_switch_pending
+        ):
+            target = SEASON_COOLING if self.season == SEASON_HEATING else SEASON_HEATING
+            _LOGGER.info(
+                "Auto-switching season %s → %s after %.1fh of sustained conditions",
+                self.season,
+                target,
+                self.season_conditions_hours,
+            )
+            self._auto_switch_pending = True
+            self.hass.async_create_task(self._do_auto_season_switch(target))
+
+    async def _do_auto_season_switch(self, target_season: str) -> None:
+        """Execute the auto season switch and clear the pending guard."""
+        try:
+            await self.async_set_season(target_season)
+        finally:
+            self._auto_switch_pending = False
 
     async def async_set_season(self, season: str) -> None:
         """Switch season and immediately update the real thermostat's HVAC mode.

@@ -87,11 +87,17 @@ SEASON_COOLING = "cooling"
 CONF_COOLING_COMFORT = "cooling_comfort"
 CONF_COOLING_AWAY_TEMP = "cooling_away_temp"
 CONF_SEASONAL_RECOMMEND_HOURS = "seasonal_recommend_hours"
+CONF_AUTO_SEASON_SWITCH = "auto_season_switch"
 
 # Warm-weather (cooling season) defaults (°F)
-DEFAULT_COOLING_COMFORT = 75.0   # comfort setpoint when AC is running
+DEFAULT_COOLING_COMFORT = 74.0   # comfort setpoint when AC is running (daytime)
 DEFAULT_COOLING_SLEEP = 72.0     # overnight cooling target
-DEFAULT_COOLING_AWAY = 78.0      # nobody-home setback (UP, not down, in summer)
+DEFAULT_COOLING_AWAY = 76.0      # nobody-home setback (UP, not down, in summer)
+
+# Whether to automatically switch season when recommend threshold is reached.
+# When enabled the system acts on suggest_season_switch rather than just
+# surfacing it as a recommendation.
+DEFAULT_AUTO_SEASON_SWITCH = False
 
 # Outdoor temp must exceed indoor temp by this many °F before the season
 # switch recommendation countdown starts.
