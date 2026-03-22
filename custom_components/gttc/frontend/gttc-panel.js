@@ -421,7 +421,7 @@ class GttcPanel extends HTMLElement {
         <div class="entry-color" style="background:${color}"></div>
         <div class="entry-info">
           <span class="entry-time">${formatTime12(entry.time_start)} \u2014 ${formatTime12(entry.time_end)}</span>
-          <span class="entry-temp">${entry.target_temp}\u00b0F</span>
+          <span class="entry-temp">${entry.target_temp}\u00b0F${entry.cooling_temp != null ? ` / \u2744\uFE0F${entry.cooling_temp}\u00b0F` : ""}</span>
           ${zoneLabel ? `<span class="entry-zone">${zoneLabel}</span>` : ""}
         </div>
         <div class="entry-actions">
@@ -466,7 +466,7 @@ class GttcPanel extends HTMLElement {
               <input type="time" id="editEnd" value="${entry.time_end || "17:00"}" required>
             </div>
             <div class="form-row">
-              <label>Temperature (\u00b0F)</label>
+              <label>Heating Target (\u00b0F)</label>
               <div class="temp-input-row">
                 <input type="range" id="editTempRange" min="${s.temp_min}" max="${s.temp_max}" step="1"
                        value="${entry.target_temp || 70}">
@@ -477,6 +477,17 @@ class GttcPanel extends HTMLElement {
               <div class="temp-preview" id="tempPreview"
                    style="background:${tempColor(entry.target_temp || 70, s.temp_min, s.temp_max)}">
                 ${entry.target_temp || 70}\u00b0F
+              </div>
+            </div>
+            <div class="form-row">
+              <label>Cooling Target (\u00b0F) <span class="form-label-hint">leave blank to use global comfort</span></label>
+              <div class="temp-input-row">
+                <input type="range" id="editCoolingTempRange" min="${s.temp_min}" max="${s.temp_max}" step="1"
+                       value="${entry.cooling_temp != null ? entry.cooling_temp : 74}">
+                <input type="number" id="editCoolingTemp" min="${s.temp_min}" max="${s.temp_max}" step="0.5"
+                       placeholder="global default"
+                       value="${entry.cooling_temp != null ? entry.cooling_temp : ""}">
+                <span class="temp-unit">\u00b0F</span>
               </div>
             </div>
             ${hasZones ? `
@@ -903,6 +914,18 @@ class GttcPanel extends HTMLElement {
       tempInput.addEventListener("input", () => syncTemp(tempInput.value));
     }
 
+    // Cooling temp slider/input sync
+    const coolingRange = root.getElementById("editCoolingTempRange");
+    const coolingInput = root.getElementById("editCoolingTemp");
+    if (coolingRange && coolingInput) {
+      coolingRange.addEventListener("input", () => {
+        coolingInput.value = coolingRange.value;
+      });
+      coolingInput.addEventListener("input", () => {
+        if (coolingInput.value !== "") coolingRange.value = coolingInput.value;
+      });
+    }
+
     // Conflict detection on time change
     const editStart = root.getElementById("editStart");
     const editEnd = root.getElementById("editEnd");
@@ -1115,11 +1138,14 @@ class GttcPanel extends HTMLElement {
     const start = root.getElementById("editStart").value;
     const end = root.getElementById("editEnd").value;
     const temp = parseFloat(root.getElementById("editTemp").value);
+    const coolingTempVal = root.getElementById("editCoolingTemp")?.value.trim();
+    const coolingTemp = coolingTempVal !== "" ? parseFloat(coolingTempVal) : undefined;
     const zoneSelect = root.getElementById("editZone");
     const zoneId = zoneSelect ? zoneSelect.value || undefined : undefined;
     const e = this._editingEntry;
 
     const msg = { type: "gttc/update_entry", day: e.day, time_start: start, time_end: end, target_temp: temp };
+    if (coolingTemp !== undefined && !isNaN(coolingTemp)) msg.cooling_temp = coolingTemp;
     if (zoneId) msg.zone_id = zoneId;
     if (!e.isNew && e.entry) {
       msg.old_time_start = e.entry.time_start;
@@ -1149,6 +1175,8 @@ class GttcPanel extends HTMLElement {
     const start = root.getElementById("editStart").value;
     const end = root.getElementById("editEnd").value;
     const temp = parseFloat(root.getElementById("editTemp").value);
+    const coolingTempVal = root.getElementById("editCoolingTemp")?.value.trim();
+    const coolingTemp = coolingTempVal !== "" ? parseFloat(coolingTempVal) : undefined;
     const zoneSelect = root.getElementById("editZone");
     const zoneId = zoneSelect ? zoneSelect.value || undefined : undefined;
 
@@ -1160,6 +1188,7 @@ class GttcPanel extends HTMLElement {
     if (days.length === 0) { alert("Please select at least one day."); return; }
 
     const msg = { type: "gttc/bulk_add_entry", days, time_start: start, time_end: end, target_temp: temp };
+    if (coolingTemp !== undefined && !isNaN(coolingTemp)) msg.cooling_temp = coolingTemp;
     if (zoneId) msg.zone_id = zoneId;
     if (this._schedule.active_preset) msg.preset = this._schedule.active_preset;
 
@@ -2210,12 +2239,72 @@ class GttcPanel extends HTMLElement {
     return `
       <div class="settings-tab">
         <div class="settings-sections">
+          ${this._renderSettingsSeasonCard(d)}
           ${this._renderSettingsTemperatureCard(d)}
           ${this._renderSettingsLearningCard(d)}
           ${this._renderSettingsOccupancyCard(d)}
           ${this._renderSettingsEnergyCard(d)}
           ${this._renderSettingsWindowsCard(d)}
           ${this._renderSettingsZonesCard(d)}
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSettingsSeasonCard(d) {
+    const isHeating = d.season === "heating";
+    const suggestHint = d.suggest_season_switch
+      ? `<div class="settings-hint settings-hint-warn">Switch recommended — opposite-season conditions sustained for ${d.season_conditions_hours}h</div>`
+      : d.season_conditions_hours > 0
+        ? `<div class="settings-hint">Opposite-season conditions: ${d.season_conditions_hours}h / ${d.seasonal_recommend_hours}h threshold</div>`
+        : "";
+    return `
+      <div class="settings-card">
+        <div class="settings-card-title">
+          <ha-icon icon="mdi:weather-partly-cloudy"></ha-icon> Season &amp; Cooling
+        </div>
+        <div class="settings-card-body">
+          <div class="settings-field">
+            <label>Current season</label>
+            <div class="season-toggle-row">
+              <button class="btn season-mode-btn ${isHeating ? "season-mode-btn-active" : ""}" id="seasonHeatingBtn">
+                <ha-icon icon="mdi:fire"></ha-icon> Heating
+              </button>
+              <button class="btn season-mode-btn ${!isHeating ? "season-mode-btn-active" : ""}" id="seasonCoolingBtn">
+                <ha-icon icon="mdi:snowflake"></ha-icon> Cooling
+              </button>
+            </div>
+            ${suggestHint}
+          </div>
+          <div class="settings-field settings-field-toggle">
+            <div>
+              <label>Auto-switch season</label>
+              <div class="settings-hint">Automatically switches heating ↔ cooling once the threshold is reached.</div>
+            </div>
+            <label class="toggle-switch">
+              <input type="checkbox" id="cfg-auto-season-switch" ${d.auto_season_switch ? "checked" : ""} />
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+          <div class="settings-row">
+            <div class="settings-field">
+              <label>Cooling comfort temp (°F)</label>
+              <input type="number" id="cfg-cooling-comfort" value="${d.cooling_comfort}" min="60" max="85" step="0.5" />
+              <div class="settings-hint">Global fallback when no per-entry cooling temp is set.</div>
+            </div>
+            <div class="settings-field">
+              <label>Cooling away temp (°F)</label>
+              <input type="number" id="cfg-cooling-away" value="${d.cooling_away_temp}" min="60" max="90" step="0.5" />
+              <div class="settings-hint">Used when nobody is home during cooling season.</div>
+            </div>
+          </div>
+          <div class="settings-field">
+            <label>Season switch threshold — <strong id="cfg-season-hours-label">${d.seasonal_recommend_hours}</strong>h of sustained opposite-season conditions</label>
+            <input type="range" id="cfg-season-hours-range" min="1" max="48" step="1" value="${d.seasonal_recommend_hours}" />
+          </div>
+        </div>
+        <div class="settings-card-footer">
+          <button class="btn btn-primary" id="saveSeasonBtn">Save</button>
         </div>
       </div>
     `;
@@ -2579,6 +2668,47 @@ class GttcPanel extends HTMLElement {
     const root = this.shadowRoot;
 
     this._addClick("settingsRetryBtn", () => this._loadSettingsData());
+
+    // Season section
+    const seasonHoursRange = root.getElementById("cfg-season-hours-range");
+    const seasonHoursLabel = root.getElementById("cfg-season-hours-label");
+    if (seasonHoursRange && seasonHoursLabel) {
+      seasonHoursRange.addEventListener("input", () => {
+        seasonHoursLabel.textContent = seasonHoursRange.value;
+      });
+    }
+    this._addClick("seasonHeatingBtn", async () => {
+      try {
+        await this._hass.callWS({ type: "gttc/set_season", season: "heating" });
+        this._settingsData = { ...this._settingsData, season: "heating" };
+        this._showToast("Switched to heating season.");
+        this._loadSettingsData();
+      } catch (err) { this._showToast(err.message || "Failed to switch season.", "error"); }
+    });
+    this._addClick("seasonCoolingBtn", async () => {
+      try {
+        await this._hass.callWS({ type: "gttc/set_season", season: "cooling" });
+        this._settingsData = { ...this._settingsData, season: "cooling" };
+        this._showToast("Switched to cooling season.");
+        this._loadSettingsData();
+      } catch (err) { this._showToast(err.message || "Failed to switch season.", "error"); }
+    });
+    this._addClick("saveSeasonBtn", async () => {
+      const autoSwitch = root.getElementById("cfg-auto-season-switch")?.checked ?? false;
+      const coolingComfort = parseFloat(root.getElementById("cfg-cooling-comfort")?.value);
+      const coolingAway = parseFloat(root.getElementById("cfg-cooling-away")?.value);
+      const seasonHours = parseFloat(root.getElementById("cfg-season-hours-range")?.value);
+      if (isNaN(coolingComfort) || isNaN(coolingAway) || isNaN(seasonHours)) return;
+      try {
+        await this._hass.callWS({ type: "gttc/set_config",
+          auto_season_switch: autoSwitch, cooling_comfort: coolingComfort,
+          cooling_away_temp: coolingAway, seasonal_recommend_hours: seasonHours });
+        this._settingsData = { ...this._settingsData,
+          auto_season_switch: autoSwitch, cooling_comfort: coolingComfort,
+          cooling_away_temp: coolingAway, seasonal_recommend_hours: seasonHours };
+        this._showToast("Season settings saved.");
+      } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
+    });
 
     // Temperature section
     const overrideRange = root.getElementById("cfg-override-range");
@@ -3437,6 +3567,11 @@ class GttcPanel extends HTMLElement {
       .settings-field { display: flex; flex-direction: column; gap: 6px; }
       .settings-field label { font-size: 13px; font-weight: 500; color: var(--primary-text); }
       .settings-hint { font-size: 12px; color: var(--secondary-text); }
+      .settings-hint-warn { color: var(--warning-color, #f59e0b); font-weight: 500; }
+      .season-toggle-row { display: flex; gap: 8px; flex-wrap: wrap; }
+      .season-mode-btn { display: flex; align-items: center; gap: 6px; padding: 8px 16px; border-radius: 20px; font-size: 14px; }
+      .season-mode-btn-active { background: var(--primary); color: var(--text-primary-color, #fff); border-color: var(--primary); }
+      .form-label-hint { font-size: 11px; color: var(--secondary-text); font-weight: 400; }
       .settings-field-toggle {
         flex-direction: row; align-items: flex-start; justify-content: space-between; gap: 16px;
       }

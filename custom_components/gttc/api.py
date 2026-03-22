@@ -64,6 +64,7 @@ def async_register_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_list_window_sensors)
     websocket_api.async_register_command(hass, ws_get_config)
     websocket_api.async_register_command(hass, ws_set_config)
+    websocket_api.async_register_command(hass, ws_set_season)
     websocket_api.async_register_command(hass, ws_list_zones)
     websocket_api.async_register_command(hass, ws_save_zone)
     websocket_api.async_register_command(hass, ws_delete_zone)
@@ -163,6 +164,7 @@ async def ws_get_schedule(
         vol.Required("time_start"): str,
         vol.Required("time_end"): str,
         vol.Required("target_temp"): vol.Coerce(float),
+        vol.Optional("cooling_temp"): vol.Coerce(float),
         vol.Optional("zone_id"): str,
         vol.Optional("old_time_start"): str,
         vol.Optional("old_time_end"): str,
@@ -192,6 +194,7 @@ async def ws_update_entry(
         time_start=msg["time_start"],
         time_end=msg["time_end"],
         target_temp=msg["target_temp"],
+        cooling_temp=msg.get("cooling_temp"),
         zone_id=msg.get("zone_id"),
     )
 
@@ -323,6 +326,7 @@ async def ws_get_status(
         vol.Required("time_start"): str,
         vol.Required("time_end"): str,
         vol.Required("target_temp"): vol.Coerce(float),
+        vol.Optional("cooling_temp"): vol.Coerce(float),
         vol.Optional("zone_id"): str,
         vol.Optional("preset"): str,
         vol.Optional("entry_id"): str,
@@ -352,6 +356,7 @@ async def ws_bulk_add_entry(
             time_start=msg["time_start"],
             time_end=msg["time_end"],
             target_temp=msg["target_temp"],
+            cooling_temp=msg.get("cooling_temp"),
             zone_id=msg.get("zone_id"),
         )
         entries_list = _get_entries_list(scheduler, preset_name, day)
@@ -941,6 +946,29 @@ async def ws_list_window_sensors(
     )
 
 
+# ── Set season ────────────────────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/set_season",
+        vol.Required("season"): vol.In(["heating", "cooling"]),
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_season(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Immediately switch the season and update the real thermostat's HVAC mode."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    await coordinator.async_set_season(msg["season"])
+    connection.send_result(msg["id"], {"success": True, "season": coordinator.season})
+
+
 # ── Get / Set configuration ────────────────────────────────────────────────────
 
 @websocket_api.websocket_command(
@@ -981,6 +1009,13 @@ async def ws_get_config(
             "window_sensors": list(coordinator.window_sensors),
             "windows_open_override": coordinator.windows_open_override,
             "tracked_persons": list(coordinator.zone_manager.tracked_persons),
+            "season": coordinator.season,
+            "cooling_comfort": coordinator.cooling_comfort,
+            "cooling_away_temp": coordinator.cooling_away_temp,
+            "seasonal_recommend_hours": coordinator.seasonal_recommend_hours,
+            "auto_season_switch": coordinator.auto_season_switch,
+            "suggest_season_switch": coordinator.suggest_season_switch,
+            "season_conditions_hours": coordinator.season_conditions_hours,
         },
     )
 
@@ -1008,6 +1043,12 @@ async def ws_get_config(
         vol.Optional("tou_provider"): vol.In(["none", "dominion_virginia"]),
         vol.Optional("outdoor_temp_sensor"): str,
         vol.Optional("tracked_persons"): [str],
+        vol.Optional("cooling_comfort"): vol.Coerce(float),
+        vol.Optional("cooling_away_temp"): vol.Coerce(float),
+        vol.Optional("seasonal_recommend_hours"): vol.All(
+            vol.Coerce(float), vol.Range(min=1, max=48)
+        ),
+        vol.Optional("auto_season_switch"): bool,
     }
 )
 @websocket_api.async_response
