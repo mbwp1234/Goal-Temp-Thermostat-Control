@@ -105,6 +105,12 @@ class GttcPanel extends HTMLElement {
     // Zone management
     this._editingZoneId = null;
     this._zoneFormData = null;
+    // Runtime / analytics
+    this._runtimeData = null;
+    this._runtimeRange = 30; // days: 7 | 30 | 90
+    this._actionLog = null;
+    // Vacation modal
+    this._showVacationModal = false;
   }
 
   set hass(hass) {
@@ -121,16 +127,18 @@ class GttcPanel extends HTMLElement {
   async _loadData() {
     if (!this._hass) return;
     try {
-      const [schedule, status, diagData, configData] = await Promise.all([
+      const [schedule, status, diagData, configData, runtimeData] = await Promise.all([
         this._hass.callWS({ type: "gttc/get_schedule" }),
         this._hass.callWS({ type: "gttc/get_status" }),
         this._hass.callWS({ type: "gttc/get_diagnostics" }).catch(() => null),
         this._hass.callWS({ type: "gttc/get_config" }).catch(() => null),
+        this._hass.callWS({ type: "gttc/get_runtime_history", days: 90 }).catch(() => null),
       ]);
       this._schedule = schedule;
       this._status = status;
       this._diagData = diagData;
       this._configData = configData;
+      this._runtimeData = runtimeData;
       this._activePreset = schedule.active_preset;
       if (!this._selectedDay) {
         const today = DAYS_ORDERED[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
@@ -213,6 +221,7 @@ class GttcPanel extends HTMLElement {
         ${this._showPresetModal ? this._renderPresetModal() : ""}
         ${this._showExportModal ? this._renderExportModal() : ""}
         ${this._showImportModal ? this._renderImportModal() : ""}
+        ${this._showVacationModal ? this._renderVacationModal() : ""}
         ${this._toast ? this._renderToast() : ""}
       </div>
     `;
@@ -391,14 +400,18 @@ class GttcPanel extends HTMLElement {
       const color = tempColor(entry.target_temp, s.temp_min, s.temp_max);
       const textColor = "rgba(255,255,255,0.95)";
       const zoneLabel = entry.zone_id ? ` [${this._getZoneName(entry.zone_id)}]` : "";
+      const extraBadges = [
+        entry.cooling_temp != null ? `<span class="block-badge cool-badge">\u2744${entry.cooling_temp}\u00b0</span>` : "",
+        entry.away_temp != null ? `<span class="block-badge away-badge">\ud83c\udfeb${entry.away_temp}\u00b0</span>` : "",
+      ].filter(Boolean).join("");
       return `
         <div class="timeline-block ${compact ? "compact" : ""}"
              style="left:${leftPct}%;width:${widthPct}%;background:${color};color:${textColor}"
              data-day="${day}" data-index="${i}"
-             title="${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}: ${entry.target_temp}\u00b0F${entry.cooling_temp != null ? ` / \u2744\ufe0f${entry.cooling_temp}\u00b0F` : ""}${zoneLabel}">
+             title="${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}: ${entry.target_temp}\u00b0F${entry.cooling_temp != null ? ` / \u2744${entry.cooling_temp}\u00b0F` : ""}${entry.away_temp != null ? ` / away ${entry.away_temp}\u00b0F` : ""}${zoneLabel}">
           ${compact
-            ? `<span class="block-temp">${entry.target_temp}\u00b0${entry.cooling_temp != null ? `<span class="block-cool"> \u2744${entry.cooling_temp}\u00b0</span>` : ""}</span>`
-            : `<span class="block-temp">${entry.target_temp}\u00b0F${entry.cooling_temp != null ? `<span class="block-cool"> / \u2744${entry.cooling_temp}\u00b0F</span>` : ""}</span>
+            ? `<span class="block-temp">${entry.target_temp}\u00b0${extraBadges}</span>`
+            : `<span class="block-temp">${entry.target_temp}\u00b0F${extraBadges}</span>
                <span class="block-time">${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}</span>`
           }
           ${!compact ? `
@@ -421,7 +434,7 @@ class GttcPanel extends HTMLElement {
         <div class="entry-color" style="background:${color}"></div>
         <div class="entry-info">
           <span class="entry-time">${formatTime12(entry.time_start)} \u2014 ${formatTime12(entry.time_end)}</span>
-          <span class="entry-temp">${entry.target_temp}\u00b0F${entry.cooling_temp != null ? ` / \u2744\uFE0F${entry.cooling_temp}\u00b0F` : ""}</span>
+          <span class="entry-temp">${entry.target_temp}\u00b0F${entry.cooling_temp != null ? ` / \u2744\uFE0F${entry.cooling_temp}\u00b0F` : ""}${entry.away_temp != null ? ` / \ud83c\udfeb${entry.away_temp}\u00b0F` : ""}</span>
           ${zoneLabel ? `<span class="entry-zone">${zoneLabel}</span>` : ""}
         </div>
         <div class="entry-actions">
@@ -487,6 +500,15 @@ class GttcPanel extends HTMLElement {
                 <input type="number" id="editCoolingTemp" min="${s.temp_min}" max="${s.temp_max}" step="0.5"
                        placeholder="global default"
                        value="${entry.cooling_temp != null ? entry.cooling_temp : ""}">
+                <span class="temp-unit">\u00b0F</span>
+              </div>
+            </div>
+            <div class="form-row">
+              <label>Away Temp (\u00b0F) <span class="form-label-hint">setback when nobody home — leave blank to use global away</span></label>
+              <div class="temp-input-row">
+                <input type="number" id="editAwayTemp" min="${s.temp_min}" max="${s.temp_max}" step="0.5"
+                       placeholder="global away"
+                       value="${entry.away_temp != null ? entry.away_temp : ""}">
                 <span class="temp-unit">\u00b0F</span>
               </div>
             </div>
@@ -717,6 +739,34 @@ class GttcPanel extends HTMLElement {
     this._addClick("goToWindowSettings", () => {
       this._activeMainTab = "settings";
       this._loadSettingsData();
+    });
+
+    // Boost buttons
+    root.querySelectorAll(".boost-btn").forEach(btn => {
+      btn.addEventListener("click", () => this._activateBoost(btn.dataset.boostType));
+    });
+
+    // Vacation mode
+    this._addClick("setVacationBtn", () => {
+      this._showVacationModal = true;
+      this._render();
+    });
+    this._addClick("clearVacationBtn", () => this._clearVacation());
+    this._addClick("cancelVacation", () => { this._showVacationModal = false; this._render(); });
+    this._addClick("confirmVacation", () => this._saveVacation());
+    const vacModalOverlay = root.getElementById("vacationModalOverlay");
+    if (vacModalOverlay) {
+      vacModalOverlay.addEventListener("click", (e) => {
+        if (e.target === vacModalOverlay) { this._showVacationModal = false; this._render(); }
+      });
+    }
+
+    // Runtime range selector
+    root.querySelectorAll(".range-btn").forEach(btn => {
+      btn.addEventListener("click", () => {
+        this._runtimeRange = parseInt(btn.dataset.range);
+        this._render();
+      });
     });
 
     this._attachSettingsListeners();
@@ -1144,8 +1194,12 @@ class GttcPanel extends HTMLElement {
     const zoneId = zoneSelect ? zoneSelect.value || undefined : undefined;
     const e = this._editingEntry;
 
+    const awayTempVal = root.getElementById("editAwayTemp")?.value.trim();
+    const awayTemp = awayTempVal !== "" ? parseFloat(awayTempVal) : undefined;
+
     const msg = { type: "gttc/update_entry", day: e.day, time_start: start, time_end: end, target_temp: temp };
     if (coolingTemp !== undefined && !isNaN(coolingTemp)) msg.cooling_temp = coolingTemp;
+    if (awayTemp !== undefined && !isNaN(awayTemp)) msg.away_temp = awayTemp;
     if (zoneId) msg.zone_id = zoneId;
     if (!e.isNew && e.entry) {
       msg.old_time_start = e.entry.time_start;
@@ -1299,6 +1353,57 @@ class GttcPanel extends HTMLElement {
     }
   }
 
+  // ── Boost / Timed presets ─────────────────────────────────────────────────
+
+  async _activateBoost(boostType) {
+    try {
+      const result = await this._hass.callWS({ type: "gttc/activate_timed_preset", boost_type: boostType });
+      const label = result.label || boostType;
+      const temp = result.target_temp;
+      const dur = result.duration_minutes;
+      this._showToast(`${label}: ${temp}° for ${dur} min`);
+      await this._loadData();
+    } catch (err) {
+      this._showToast("Boost failed: " + (err.message || err), "error");
+    }
+  }
+
+  // ── Vacation mode actions ─────────────────────────────────────────────────
+
+  async _saveVacation() {
+    const root = this.shadowRoot;
+    const temp = parseFloat(root.getElementById("vacationTemp")?.value);
+    const start = root.getElementById("vacationStart")?.value;
+    const end = root.getElementById("vacationEnd")?.value;
+    const label = root.getElementById("vacationLabel")?.value.trim() || "Vacation";
+    if (!start || !end || isNaN(temp)) { this._showToast("Please fill in all fields.", "error"); return; }
+    if (new Date(end) <= new Date(start)) { this._showToast("Return date must be after departure.", "error"); return; }
+    try {
+      await this._hass.callWS({
+        type: "gttc/set_vacation",
+        setback_temp: temp,
+        start_dt: new Date(start + "T00:00:00").toISOString(),
+        end_dt: new Date(end + "T23:59:59").toISOString(),
+        label,
+      });
+      this._showVacationModal = false;
+      this._showToast(`Vacation mode set — returns ${new Date(end).toLocaleDateString()}`);
+      await this._loadData();
+    } catch (err) {
+      this._showToast("Failed to set vacation: " + (err.message || err), "error");
+    }
+  }
+
+  async _clearVacation() {
+    try {
+      await this._hass.callWS({ type: "gttc/clear_vacation" });
+      this._showToast("Vacation mode cancelled");
+      await this._loadData();
+    } catch (err) {
+      this._showToast("Failed to clear vacation: " + (err.message || err), "error");
+    }
+  }
+
   // ── Undo / Redo ───────────────────────────────────────────────────────────
 
   async _undo() {
@@ -1420,6 +1525,24 @@ class GttcPanel extends HTMLElement {
     return "rgba(255,255,255,0.95)";
   }
 
+  _actionReasonLabel(d) {
+    if (!d) return "—";
+    const reason = d.hvac_action_reason;
+    const map = {
+      manual_override: `Override · ${d.override_remaining_minutes || 0}m left`,
+      vacation: "Vacation mode",
+      occupancy_away: "Nobody home",
+      schedule: "Schedule",
+      precondition: "Pre-conditioning",
+      tou_adjustment: "TOU optimization",
+      heat_pump_step: "Heat pump step",
+      fan_precool: "Fan pre-cool",
+      window_open: "Windows open",
+      fallback: "Fallback",
+    };
+    return map[reason] || (d.schedule_enabled ? "Schedule" : "Manual");
+  }
+
   // ── Command Center ────────────────────────────────────────────────────────
 
   _renderCommandCenterTab() {
@@ -1430,11 +1553,13 @@ class GttcPanel extends HTMLElement {
     return `
       <div class="command-center">
         ${d ? this._renderStatCards(d) : ""}
+        ${this._renderBoostButtons()}
         <div class="cc-main-row">
           ${this._renderAutomationToggles()}
           ${this._renderQuickPanel()}
         </div>
         ${this._renderTempChart()}
+        ${this._renderRuntimeChart()}
         <div class="schedule-section">
           <div class="schedule-section-header">
             <div class="section-label"><ha-icon icon="mdi:calendar-clock"></ha-icon> Schedule</div>
@@ -1587,6 +1712,24 @@ class GttcPanel extends HTMLElement {
             <button class="btn-cancel-override" id="cancelOverrideBtn" title="Cancel">&#x2715;</button>
           </div>
         ` : ""}
+        ${this._diagData?.vacation_mode ? (() => {
+          const vm = this._diagData.vacation_mode;
+          return `
+          <div class="vacation-banner">
+            <ha-icon icon="mdi:airplane"></ha-icon>
+            <div class="override-info">
+              <span class="override-label">${vm.label || "Vacation"} — ${vm.setback_temp}°</span>
+              <span class="override-sub">${new Date(vm.end_dt).toLocaleDateString()} return</span>
+            </div>
+            <button class="btn-cancel-override" id="clearVacationBtn" title="Cancel vacation">&#x2715;</button>
+          </div>`;
+        })() : `
+          <div class="qp-section">
+            <button class="btn btn-outline btn-sm vacation-btn" id="setVacationBtn">
+              <ha-icon icon="mdi:airplane"></ha-icon> Set Vacation Mode
+            </button>
+          </div>
+        `}
         ${d?.zones?.length > 0 ? `
           <div class="qp-section">
             <div class="qp-label">Zone Temperatures</div>
@@ -1650,6 +1793,106 @@ class GttcPanel extends HTMLElement {
     if (rate === "on_peak") return "danger";
     if (rate === "super_off_peak") return "info";
     return "success";
+  }
+
+  _renderBoostButtons() {
+    const boosts = [
+      { id: "boost",     icon: "mdi:fire",         label: "Boost +4°",     delta: "+4", color: "#f57c00" },
+      { id: "warm_up",   icon: "mdi:thermometer-plus", label: "Warm Up +3°", delta: "+3", color: "#e64a19" },
+      { id: "cool_down", icon: "mdi:snowflake",     label: "Cool Down −3°", delta: "−3", color: "#0288d1" },
+    ];
+    return `
+      <div class="boost-row">
+        ${boosts.map(b => `
+          <button class="boost-btn" data-boost-type="${b.id}" style="--boost-color:${b.color}" title="${b.label}">
+            <ha-icon icon="${b.icon}"></ha-icon>
+            <span class="boost-label">${b.label}</span>
+          </button>
+        `).join("")}
+      </div>
+    `;
+  }
+
+  _renderRuntimeChart() {
+    const rd = this._runtimeData;
+    if (!rd || !rd.history || rd.history.length === 0) return "";
+    const days = this._runtimeRange;
+    const history = rd.history.slice(-days);
+    // Include today's partial data
+    const today = rd.today;
+    const allData = today && today.date
+      ? [...history.filter(d => d.date !== today.date), today]
+      : history;
+
+    const maxRuntime = Math.max(1, ...allData.map(d => (d.heating_min || 0) + (d.cooling_min || 0)));
+
+    const rangeOptions = [7, 30, 90];
+    return `
+      <div class="chart-card runtime-chart">
+        <div class="chart-title">
+          HVAC Runtime History
+          <span class="chart-legend"><span class="legend-dot hvac-heat"></span> Heating</span>
+          <span class="chart-legend"><span class="legend-dot hvac-cool"></span> Cooling</span>
+          <div class="range-selector">
+            ${rangeOptions.map(r => `
+              <button class="range-btn ${this._runtimeRange === r ? "active" : ""}" data-range="${r}">${r}d</button>
+            `).join("")}
+          </div>
+        </div>
+        <div class="runtime-bars">
+          ${allData.map(d => {
+            const heatPct = ((d.heating_min || 0) / maxRuntime * 100).toFixed(1);
+            const coolPct = ((d.cooling_min || 0) / maxRuntime * 100).toFixed(1);
+            const dateLabel = new Date(d.date + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric" });
+            const totalMin = Math.round((d.heating_min || 0) + (d.cooling_min || 0));
+            return `
+              <div class="runtime-bar-col" title="${dateLabel}: ${totalMin} min total">
+                <div class="runtime-bar-stack">
+                  ${heatPct > 0 ? `<div class="runtime-bar heat-bar" style="height:${heatPct}%" title="Heating: ${Math.round(d.heating_min)}m"></div>` : ""}
+                  ${coolPct > 0 ? `<div class="runtime-bar cool-bar" style="height:${coolPct}%" title="Cooling: ${Math.round(d.cooling_min)}m"></div>` : ""}
+                </div>
+                ${d.avg_outdoor != null ? `<div class="runtime-outdoor" style="bottom:${((d.avg_outdoor - 20) / 80 * 100).toFixed(1)}%"></div>` : ""}
+                <div class="runtime-date">${dateLabel.split(" ")[1]}</div>
+              </div>
+            `;
+          }).join("")}
+        </div>
+        ${rd.learned_ramp_minutes ? `<div class="runtime-note">Adaptive lead time: ${rd.learned_ramp_minutes.toFixed(0)} min</div>` : ""}
+      </div>
+    `;
+  }
+
+  _renderVacationModal() {
+    const today = new Date().toISOString().slice(0, 10);
+    const nextWeek = new Date(Date.now() + 7 * 86400000).toISOString().slice(0, 10);
+    return `
+      <div class="modal-overlay" id="vacationModalOverlay">
+        <div class="modal">
+          <h3>Set Vacation Mode</h3>
+          <p class="modal-hint">GTTC will hold a setback temperature until your return date, then resume normal scheduling.</p>
+          <div class="form-row">
+            <label>Setback Temperature (°F)</label>
+            <input type="number" id="vacationTemp" min="50" max="80" step="1" value="62">
+          </div>
+          <div class="form-row">
+            <label>Departure Date</label>
+            <input type="date" id="vacationStart" value="${today}">
+          </div>
+          <div class="form-row">
+            <label>Return Date</label>
+            <input type="date" id="vacationEnd" value="${nextWeek}">
+          </div>
+          <div class="form-row">
+            <label>Label (optional)</label>
+            <input type="text" id="vacationLabel" value="Vacation" maxlength="40">
+          </div>
+          <div class="form-actions">
+            <button type="button" class="btn btn-cancel" id="cancelVacation">Cancel</button>
+            <button type="button" class="btn btn-save" id="confirmVacation">Set Vacation</button>
+          </div>
+        </div>
+      </div>
+    `;
   }
 
   async _handleAutomationToggle(toggleId, enabled) {
@@ -1766,7 +2009,7 @@ class GttcPanel extends HTMLElement {
           <div class="stat-body">
             <div class="stat-label">Goal</div>
             <div class="stat-value">${d.target_temp != null ? d.target_temp.toFixed(1) + "°" : "—"}</div>
-            <div class="stat-sub">${d.override_active ? `Override · ${d.override_remaining_minutes}m left` : (d.schedule_enabled ? "Schedule" : "Manual")}</div>
+            <div class="stat-sub">${this._actionReasonLabel(d)}</div>
           </div>
         </div>
         <div class="stat-card">
@@ -3802,6 +4045,78 @@ class GttcPanel extends HTMLElement {
 
       /* Command center footer */
       .cc-footer { display: flex; align-items: center; gap: 12px; padding-top: 4px; }
+
+      /* ── Boost buttons ─────────────────────────────────────────────────── */
+      .boost-row {
+        display: flex; gap: 10px; padding: 12px 16px 4px; flex-wrap: wrap;
+      }
+      .boost-btn {
+        display: flex; align-items: center; gap: 6px;
+        padding: 8px 16px; border-radius: 20px; border: 2px solid var(--boost-color, #888);
+        background: transparent; color: var(--boost-color, #888);
+        font-size: 13px; font-weight: 600; cursor: pointer;
+        transition: background 0.15s, color 0.15s;
+      }
+      .boost-btn:hover { background: var(--boost-color, #888); color: #fff; }
+      .boost-btn ha-icon { --mdc-icon-size: 18px; }
+
+      /* ── Vacation banner ─────────────────────────────────────────────────── */
+      .vacation-banner {
+        display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+        background: #e3f2fd; border-left: 3px solid #1976d2; border-radius: 6px;
+        margin: 4px 0;
+      }
+      .vacation-banner ha-icon { color: #1976d2; }
+      .vacation-btn {
+        width: 100%; justify-content: center; margin-top: 4px;
+      }
+
+      /* ── Block badges ────────────────────────────────────────────────────── */
+      .block-badge {
+        display: inline-block; font-size: 10px; padding: 1px 4px; border-radius: 3px;
+        margin-left: 3px; opacity: 0.9; font-weight: 600;
+      }
+      .cool-badge { background: rgba(2,136,209,0.7); }
+      .away-badge { background: rgba(100,100,100,0.6); }
+
+      /* ── Runtime chart ───────────────────────────────────────────────────── */
+      .runtime-chart { margin-top: 0; }
+      .runtime-bars {
+        display: flex; align-items: flex-end; gap: 3px;
+        height: 140px; padding: 8px 8px 28px;
+        border-bottom: 1px solid var(--divider-color, #e0e0e0);
+        position: relative; overflow-x: auto;
+      }
+      .runtime-bar-col {
+        display: flex; flex-direction: column; align-items: center; flex: 1;
+        min-width: 18px; max-width: 36px; position: relative; height: 100%;
+        justify-content: flex-end;
+      }
+      .runtime-bar-stack { display: flex; flex-direction: column-reverse; width: 100%; max-height: 100%; }
+      .runtime-bar { width: 100%; border-radius: 3px 3px 0 0; min-height: 2px; }
+      .heat-bar { background: #f57c00; }
+      .cool-bar { background: #0288d1; }
+      .runtime-outdoor {
+        position: absolute; width: 6px; height: 6px; border-radius: 50%;
+        background: #888; left: 50%; transform: translateX(-50%);
+      }
+      .runtime-date {
+        position: absolute; bottom: -22px; font-size: 9px;
+        color: var(--secondary-text-color, #727272); white-space: nowrap;
+        transform: rotate(-30deg); transform-origin: top center;
+      }
+      .runtime-note {
+        font-size: 11px; color: var(--secondary-text-color, #888); padding: 4px 8px;
+      }
+      .range-selector { display: flex; gap: 4px; margin-left: auto; }
+      .range-btn {
+        padding: 2px 8px; border-radius: 12px; border: 1px solid var(--divider-color, #ccc);
+        background: transparent; font-size: 11px; cursor: pointer;
+        color: var(--secondary-text-color, #555);
+      }
+      .range-btn.active {
+        background: var(--primary-color, #03a9f4); color: #fff; border-color: var(--primary-color, #03a9f4);
+      }
     `;
   }
 }

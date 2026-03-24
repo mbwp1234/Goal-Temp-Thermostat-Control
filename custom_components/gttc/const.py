@@ -129,6 +129,49 @@ HEAT_PUMP_RECOVERY_STEP = 2.0
 LEARNING_TIME_WINDOW_MINUTES = 30
 LEARNING_TEMP_TOLERANCE = 2.0
 
+# Action reason tags — attached to every setpoint decision for "why" history
+ACTION_REASON_SCHEDULE = "schedule"
+ACTION_REASON_OVERRIDE = "manual_override"
+ACTION_REASON_VACATION = "vacation"
+ACTION_REASON_OCCUPANCY = "occupancy_away"
+ACTION_REASON_PRECONDITION = "precondition"
+ACTION_REASON_TOU = "tou_adjustment"
+ACTION_REASON_HEAT_PUMP = "heat_pump_step"
+ACTION_REASON_FAN_PRECOOL = "fan_precool"
+ACTION_REASON_FALLBACK = "fallback"
+ACTION_REASON_WINDOW = "window_open"
+
+# In-memory ring buffer size for the action log
+ACTION_LOG_MAX = 200
+
+# Adaptive lead time (precondition)
+RAMP_HISTORY_MAX = 50          # how many RampRecord observations to keep
+RAMP_EMA_ALPHA = 0.25          # EMA smoothing factor for learned ramp time
+RAMP_DEFAULT_MINUTES = 30      # fallback when no history exists
+
+# Fan pre-cooling: run fan-only to pull in cool outdoor air before AC engages
+# Engage fan-only mode when outdoor temp is at least this many °F below indoor
+FAN_PRECOOL_MARGIN = 3.0
+# Only attempt fan pre-cooling when outdoor temp is below this threshold (°F)
+FAN_PRECOOL_MAX_OUTDOOR = 75.0
+# Switch from fan-only to AC when indoor temp is still this many °F above goal
+FAN_PRECOOL_COMFORT_MARGIN = 1.5
+
+# Heating failure detection
+HEATING_FAILURE_RUN_MINUTES = 20   # HVAC must run this long before we check
+HEATING_FAILURE_TEMP_DELTA = 0.5   # minimum expected temperature change (°F)
+BRIAN_NOTIFY_SERVICE = "mobile_app_brians_iphone_2"
+
+# Timed presets / boost buttons
+BOOST_TYPES = {
+    "boost": {"label": "Boost +4°", "delta": 4.0, "minutes": 90, "icon": "🔥"},
+    "warm_up": {"label": "Warm Up +3°", "delta": 3.0, "minutes": 60, "icon": "🌡"},
+    "cool_down": {"label": "Cool Down -3°", "delta": -3.0, "minutes": 60, "icon": "❄️"},
+}
+
+# Daily runtime history
+RUNTIME_HISTORY_MAX_DAYS = 90
+
 # Storage keys
 STORAGE_KEY = f"{DOMAIN}_data"
 STORAGE_VERSION = 1

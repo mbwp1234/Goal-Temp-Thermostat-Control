@@ -70,6 +70,11 @@ def async_register_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_delete_zone)
     websocket_api.async_register_command(hass, ws_set_active_zone)
     websocket_api.async_register_command(hass, ws_list_persons)
+    websocket_api.async_register_command(hass, ws_set_vacation)
+    websocket_api.async_register_command(hass, ws_clear_vacation)
+    websocket_api.async_register_command(hass, ws_activate_timed_preset)
+    websocket_api.async_register_command(hass, ws_get_runtime_history)
+    websocket_api.async_register_command(hass, ws_get_action_log)
 
 
 def _get_coordinator(hass: HomeAssistant, entry_id: str | None = None):
@@ -165,6 +170,7 @@ async def ws_get_schedule(
         vol.Required("time_end"): str,
         vol.Required("target_temp"): vol.Coerce(float),
         vol.Optional("cooling_temp"): vol.Coerce(float),
+        vol.Optional("away_temp"): vol.Coerce(float),
         vol.Optional("zone_id"): str,
         vol.Optional("old_time_start"): str,
         vol.Optional("old_time_end"): str,
@@ -195,6 +201,7 @@ async def ws_update_entry(
         time_end=msg["time_end"],
         target_temp=msg["target_temp"],
         cooling_temp=msg.get("cooling_temp"),
+        away_temp=msg.get("away_temp"),
         zone_id=msg.get("zone_id"),
     )
 
@@ -1357,5 +1364,143 @@ def _get_entries_list(scheduler, preset_name, day):
         return scheduler.schedule.weekday.entries
     if day_lower in ("weekend",) or day_lower in WEEKEND:
         return scheduler.schedule.weekend.entries
+
+
+# ── Vacation mode ──────────────────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/set_vacation",
+        vol.Required("setback_temp"): vol.Coerce(float),
+        vol.Required("start_dt"): str,
+        vol.Required("end_dt"): str,
+        vol.Optional("label"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_vacation(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Activate vacation mode with a return date."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+    await coordinator.async_set_vacation(
+        setback_temp=msg["setback_temp"],
+        start_dt=msg["start_dt"],
+        end_dt=msg["end_dt"],
+        label=msg.get("label", "Vacation"),
+    )
+    connection.send_result(msg["id"], {"success": True})
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/clear_vacation",
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_clear_vacation(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Cancel vacation mode."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+    await coordinator.async_clear_vacation()
+    connection.send_result(msg["id"], {"success": True})
+
+
+# ── Timed presets / boost buttons ─────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/activate_timed_preset",
+        vol.Required("boost_type"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_activate_timed_preset(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Activate a boost/warm-up/cool-down timed temperature adjustment."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+    from .const import BOOST_TYPES
+    if msg["boost_type"] not in BOOST_TYPES:
+        connection.send_error(msg["id"], "invalid_type", f"Unknown boost type: {msg['boost_type']}")
+        return
+    await coordinator.async_activate_timed_preset(msg["boost_type"])
+    cfg = BOOST_TYPES[msg["boost_type"]]
+    connection.send_result(msg["id"], {
+        "success": True,
+        "label": cfg["label"],
+        "target_temp": coordinator.manual_override.target_temp if coordinator.manual_override else None,
+        "duration_minutes": cfg["minutes"],
+    })
+
+
+# ── Runtime history ───────────────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/get_runtime_history",
+        vol.Optional("days"): int,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_get_runtime_history(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Return daily HVAC runtime history."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+    days = msg.get("days", 30)
+    history = coordinator.runtime_history[-days:]
+    connection.send_result(msg["id"], {
+        "history": history,
+        "today": {
+            "date": coordinator._today_date,
+            "heating_min": round(coordinator._today_heating_min, 1),
+            "cooling_min": round(coordinator._today_cooling_min, 1),
+            "avg_outdoor": coordinator._outdoor_temp,
+        },
+        "learned_ramp_minutes": round(coordinator._learned_ramp_minutes, 1),
+    })
+
+
+# ── Action log ────────────────────────────────────────────────────────────────
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/get_action_log",
+        vol.Optional("limit"): int,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_get_action_log(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Return the why-based action log."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+    limit = msg.get("limit", 100)
+    connection.send_result(msg["id"], {
+        "log": list(coordinator.action_log[-limit:]),
+        "current_reason": coordinator._last_action_reason,
+    })
 
     return None

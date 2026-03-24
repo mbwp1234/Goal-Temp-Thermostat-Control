@@ -15,6 +15,19 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    ACTION_LOG_MAX,
+    ACTION_REASON_FALLBACK,
+    ACTION_REASON_FAN_PRECOOL,
+    ACTION_REASON_HEAT_PUMP,
+    ACTION_REASON_OCCUPANCY,
+    ACTION_REASON_OVERRIDE,
+    ACTION_REASON_PRECONDITION,
+    ACTION_REASON_SCHEDULE,
+    ACTION_REASON_TOU,
+    ACTION_REASON_VACATION,
+    ACTION_REASON_WINDOW,
+    BOOST_TYPES,
+    BRIAN_NOTIFY_SERVICE,
     CONF_AUTO_SEASON_SWITCH,
     CONF_AWAY_TEMP,
     CONF_COOLING_AWAY_TEMP,
@@ -40,16 +53,24 @@ from .const import (
     DEFAULT_COOLING_COMFORT,
     DEFAULT_LEARNING_THRESHOLD,
     DEFAULT_MANUAL_OVERRIDE_MINUTES,
-    DEFAULT_PRECONDITION_MINUTES,
     DEFAULT_PRESENCE_MODE,
     DEFAULT_TEMP_MAX,
     DEFAULT_TEMP_MIN,
     DOMAIN,
+    FAN_PRECOOL_COMFORT_MARGIN,
+    FAN_PRECOOL_MARGIN,
+    FAN_PRECOOL_MAX_OUTDOOR,
     HEAT_PUMP_MAX_SETBACK,
     HEAT_PUMP_RECOVERY_STEP,
+    HEATING_FAILURE_RUN_MINUTES,
+    HEATING_FAILURE_TEMP_DELTA,
     LEARNING_TEMP_TOLERANCE,
     OUTDOOR_COLD_THRESHOLD,
     OUTDOOR_MILD_THRESHOLD,
+    RAMP_DEFAULT_MINUTES,
+    RAMP_EMA_ALPHA,
+    RAMP_HISTORY_MAX,
+    RUNTIME_HISTORY_MAX_DAYS,
     SEASON_COOLING,
     SEASON_HEATING,
     SEASONAL_RECOMMEND_HOURS,
@@ -58,7 +79,7 @@ from .const import (
     STORAGE_VERSION,
 )
 from .learning import LearningEngine
-from .models import ManualOverride, ScheduleEntry
+from .models import ManualOverride, RampRecord, ScheduleEntry, VacationMode
 from .scheduler import Scheduler
 from .tou import (
     RatePeriod,
@@ -188,6 +209,27 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self.window_sensors: list[str] = []
         self.windows_open_override: bool = False
 
+        # Vacation mode — time-bounded global setback with auto-revert
+        self.vacation_mode: VacationMode | None = None
+
+        # Adaptive lead time — EMA of observed ramp times
+        self.ramp_history: list[RampRecord] = []
+        self._learned_ramp_minutes: float = RAMP_DEFAULT_MINUTES
+        # Track the ramp currently in progress: (start_time, start_temp, target_temp)
+        self._ramp_start: tuple[datetime, float, float] | None = None
+
+        # Why-based action log — ring buffer of {ts, reason, target_temp}
+        self.action_log: list[dict] = []
+        self._last_action_reason: str = ACTION_REASON_FALLBACK
+
+        # Daily runtime history — list of {date, heating_min, cooling_min, avg_outdoor}
+        self.runtime_history: list[dict] = []
+        self._hvac_run_start: datetime | None = None
+        self._hvac_run_start_temp: float | None = None
+        self._today_heating_min: float = 0.0
+        self._today_cooling_min: float = 0.0
+        self._today_date: str = ""
+
     @property
     def available(self) -> bool:
         """Whether the real thermostat is reachable."""
@@ -268,6 +310,23 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     pass
             if "auto_season_switch" in data:
                 self.auto_season_switch = bool(data["auto_season_switch"])
+            if "vacation_mode" in data and data["vacation_mode"]:
+                try:
+                    vm = VacationMode.from_dict(data["vacation_mode"])
+                    if not vm.is_expired:
+                        self.vacation_mode = vm
+                except Exception:
+                    pass
+            if "ramp_history" in data and isinstance(data["ramp_history"], list):
+                try:
+                    self.ramp_history = [
+                        RampRecord.from_dict(r) for r in data["ramp_history"]
+                    ]
+                    self._recalculate_learned_ramp()
+                except Exception:
+                    pass
+            if "runtime_history" in data and isinstance(data["runtime_history"], list):
+                self.runtime_history = data["runtime_history"]
         except Exception as err:
             _LOGGER.error("Error restoring state: %s", err)
 
@@ -292,6 +351,11 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 "cooling_away_temp": self.cooling_away_temp,
                 "seasonal_recommend_hours": self.seasonal_recommend_hours,
                 "auto_season_switch": self.auto_season_switch,
+                "vacation_mode": (
+                    self.vacation_mode.to_dict() if self.vacation_mode else None
+                ),
+                "ramp_history": [r.to_dict() for r in self.ramp_history],
+                "runtime_history": self.runtime_history[-RUNTIME_HISTORY_MAX_DAYS:],
             }
             await self._store.async_save(data)
         except Exception as err:
@@ -328,6 +392,14 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Manual override expired, resuming automation")
                 self.manual_override = None
 
+            # Clear expired vacation mode
+            if self.vacation_mode and self.vacation_mode.is_expired:
+                _LOGGER.info("Vacation mode expired — resuming normal schedule")
+                self.vacation_mode = None
+
+            # Track HVAC runtime and check for heating failure
+            await self._update_runtime_tracking()
+
             # Suspend thermostat control when a window is open — running
             # heating/cooling against an open window wastes energy.
             if self._are_windows_open():
@@ -349,6 +421,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 ):
                     await self._set_thermostat_temp(park_temp)
                     self._last_thermostat_temp = park_temp
+                self._log_action(ACTION_REASON_WINDOW, park_temp or self.target_temp or 0)
                 return self._build_state_dict()
 
             # Auto-switch active zone when the current schedule entry
@@ -390,25 +463,37 @@ class GTTCCoordinator(DataUpdateCoordinator):
             # Update season switch recommendation tracking (never auto-switches)
             self._update_season_recommendation()
 
-            # Determine target temperature
-            desired_temp = self._calculate_desired_temp()
+            # Determine target temperature (priority hierarchy)
+            desired_temp, action_reason = self._calculate_desired_temp()
 
             # Pre-conditioning: if a schedule transition is approaching,
             # start ramping toward the next entry's target now so it's
             # reached on time instead of playing catch-up.
-            desired_temp = self._apply_precondition(desired_temp)
+            precon_temp = self._apply_precondition(desired_temp)
+            if precon_temp != desired_temp:
+                action_reason = ACTION_REASON_PRECONDITION
+                desired_temp = precon_temp
 
             # TOU rate optimization: shift setpoint during on-peak to
             # reduce energy cost, and pre-condition before on-peak starts.
-            desired_temp = self._apply_tou_adjustment(desired_temp)
+            tou_temp = self._apply_tou_adjustment(desired_temp)
+            if tou_temp != desired_temp:
+                action_reason = ACTION_REASON_TOU
+                desired_temp = tou_temp
 
             # For heat pumps, ramp the target gradually to avoid aux heat
-            desired_temp = self._apply_gradual_recovery(desired_temp)
+            hp_temp = self._apply_gradual_recovery(desired_temp)
+            if hp_temp != desired_temp:
+                action_reason = ACTION_REASON_HEAT_PUMP
+                desired_temp = hp_temp
+
+            # Fan pre-cooling: use fan-only mode before engaging AC compressor
+            desired_temp = await self._apply_fan_precool(desired_temp)
+
+            # Log the reason for this setpoint decision
+            self._log_action(action_reason, desired_temp)
 
             # Calculate offset-adjusted target for the real thermostat.
-            # Instead of blindly setting the thermostat to the desired temp,
-            # use zone sensor feedback to compensate for the difference
-            # between the thermostat's own sensor and the zone sensors.
             thermostat_target = self._calculate_thermostat_target(
                 desired_temp, active_zone
             )
@@ -476,6 +561,11 @@ class GTTCCoordinator(DataUpdateCoordinator):
             "suggest_season_switch": self.suggest_season_switch,
             "season_conditions_hours": self.season_conditions_hours,
             "auto_season_switch": self.auto_season_switch,
+            "vacation_mode": (
+                self.vacation_mode.to_dict() if self.vacation_mode else None
+            ),
+            "hvac_action_reason": self._last_action_reason,
+            "action_log": list(self.action_log[-50:]),  # last 50 entries for UI
         }
 
     def _read_thermostat_state(self) -> None:
@@ -603,25 +693,24 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 pass
         return self.temp_max
 
-    def _calculate_desired_temp(self) -> float:
-        """Determine target temp: manual > occupancy > schedule > last setting > comfort default.
+    def _calculate_desired_temp(self) -> tuple[float, str]:
+        """Determine target temp and the reason for it.
 
-        In cooling season, all temperature sources use their cooling counterparts:
-        schedule entries use cooling_temp, away uses cooling_away_temp, and the
-        fallback uses cooling_comfort.  Heat-pump setback limiting is bypassed in
-        cooling season (it is a heating-only protection).
-
-        For heat pump systems in heating season, setbacks are capped to avoid
-        triggering expensive auxiliary/strip heat during the recovery phase.
+        Priority: manual_override > vacation > occupancy > schedule > fallback.
+        Returns (temperature, action_reason).
         """
         comfort = self._get_comfort_reference()
         in_cooling = self.season == SEASON_COOLING
 
-        # 1. Manual override (highest priority — season doesn't affect overrides)
+        # 1. Manual override (highest priority)
         if self.manual_override and not self.manual_override.is_expired:
-            return self.manual_override.target_temp
+            return self.manual_override.target_temp, ACTION_REASON_OVERRIDE
 
-        # 2. Occupancy check (only when sensors are explicitly reporting)
+        # 2. Vacation mode — global setback while away on vacation
+        if self.vacation_mode and self.vacation_mode.is_active:
+            return self.vacation_mode.setback_temp, ACTION_REASON_VACATION
+
+        # 3. Occupancy check (only when sensors are explicitly reporting)
         if self.occupancy_enabled:
             active_zone = self.zone_manager.active_zone
             # Per-zone occupancy: only trigger if sensors exist and report unoccupied
@@ -632,32 +721,50 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 and active_zone.is_occupied is False
             ):
                 if in_cooling:
-                    return self.cooling_away_temp
+                    return self.cooling_away_temp, ACTION_REASON_OCCUPANCY
                 zone_away = active_zone.away_temp or self.away_temp
-                return self._apply_heat_pump_setback_limit(zone_away, comfort)
+                return (
+                    self._apply_heat_pump_setback_limit(zone_away, comfort),
+                    ACTION_REASON_OCCUPANCY,
+                )
 
             # Global: nobody home
             if not self.zone_manager.is_anyone_home():
                 if in_cooling:
-                    return self.cooling_away_temp
-                return self._apply_heat_pump_setback_limit(self.away_temp, comfort)
+                    return self.cooling_away_temp, ACTION_REASON_OCCUPANCY
+                return (
+                    self._apply_heat_pump_setback_limit(self.away_temp, comfort),
+                    ACTION_REASON_OCCUPANCY,
+                )
 
-        # 3. Schedule
+        # 4. Schedule
         if self.schedule_enabled:
             entry = self.scheduler.get_current_entry()
             if entry:
                 if in_cooling:
-                    return (
+                    temp = (
                         entry.cooling_temp
                         if entry.cooling_temp is not None
                         else self.cooling_comfort
                     )
-                return entry.target_temp
+                    return temp, ACTION_REASON_SCHEDULE
+                # Use per-entry away_temp when presence says nobody's home
+                if (
+                    entry.away_temp is not None
+                    and self.occupancy_enabled
+                    and not self.zone_manager.is_anyone_home()
+                ):
+                    return (
+                        self._apply_heat_pump_setback_limit(entry.away_temp, comfort),
+                        ACTION_REASON_OCCUPANCY,
+                    )
+                return entry.target_temp, ACTION_REASON_SCHEDULE
 
-        # 4. Fall back to seasonal comfort or last known target
+        # 5. Fall back to seasonal comfort or last known target
         if in_cooling:
-            return self.cooling_comfort
-        return self.target_temp if self.target_temp is not None else self._default_comfort_temp
+            return self.cooling_comfort, ACTION_REASON_FALLBACK
+        temp = self.target_temp if self.target_temp is not None else self._default_comfort_temp
+        return temp, ACTION_REASON_FALLBACK
 
     def _get_comfort_reference(self) -> float:
         """Return the current comfort temperature for setback calculations.
@@ -790,25 +897,18 @@ class GTTCCoordinator(DataUpdateCoordinator):
         next_entry, minutes_until = self.scheduler.get_next_entry()
         if next_entry is None:
             return False
-        return 0 < minutes_until <= DEFAULT_PRECONDITION_MINUTES
+        return 0 < minutes_until <= self._learned_ramp_minutes
 
     def _apply_precondition(self, desired_temp: float) -> float:
-        """Start ramping toward the next schedule entry's target before
-        it officially starts.
+        """Start ramping toward the next schedule entry's target before it starts.
 
-        This avoids the catch-up spike that happens when the schedule
-        switches from a setback (e.g. sleep 62°F) to comfort (68°F) —
-        by starting early, the house reaches the target on time and the
-        HVAC system runs at a moderate, efficient load instead of running
-        flat-out (or triggering aux heat).
-
-        The ramp is linear: if 30 minutes remain and the gap is 6°F,
-        the target moves 1°F every 5 minutes.
+        Uses an adaptively learned lead time (EMA of past ramp durations) instead
+        of the old fixed 30-minute window, so the pre-conditioning window matches
+        how quickly the house actually responds.
         """
         if not self.precondition_enabled or not self.schedule_enabled:
             return desired_temp
 
-        # Don't pre-condition during a manual override
         if self.manual_override and not self.manual_override.is_expired:
             return desired_temp
 
@@ -816,7 +916,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
         if next_entry is None or minutes_until <= 0:
             return desired_temp
 
-        if minutes_until > DEFAULT_PRECONDITION_MINUTES:
+        lead_time = self._learned_ramp_minutes
+        if minutes_until > lead_time:
             return desired_temp
 
         next_temp = (
@@ -826,16 +927,27 @@ class GTTCCoordinator(DataUpdateCoordinator):
         )
         gap = next_temp - desired_temp
         if abs(gap) < 1.0:
-            return desired_temp  # already close enough
+            # Close enough — record that we arrived on time
+            self._finish_ramp_observation(next_temp)
+            return desired_temp
 
-        # Linear interpolation: how far through the precondition window are we?
-        progress = 1.0 - (minutes_until / DEFAULT_PRECONDITION_MINUTES)
+        # Track ramp start for learning
+        if self._ramp_start is None and self.current_temp is not None:
+            self._ramp_start = (
+                datetime.now(timezone.utc),
+                self.current_temp,
+                next_temp,
+            )
+
+        # Linear interpolation through the learned lead-time window
+        progress = 1.0 - (minutes_until / lead_time)
         progress = max(0.0, min(1.0, progress))
         ramped = desired_temp + (gap * progress)
 
         _LOGGER.info(
-            "Pre-conditioning: next entry at %s (%.1f°) in %d min, "
+            "Pre-conditioning (%.0f-min window): next entry at %s (%.1f°) in %d min, "
             "current target %.1f°, ramped to %.1f° (%.0f%% progress)",
+            lead_time,
             next_entry.time_start,
             next_temp,
             minutes_until,
@@ -844,6 +956,46 @@ class GTTCCoordinator(DataUpdateCoordinator):
             progress * 100,
         )
         return ramped
+
+    def _finish_ramp_observation(self, target_temp: float) -> None:
+        """Record a completed ramp and update the EMA lead time."""
+        if self._ramp_start is None:
+            return
+        start_time, start_temp, intended_target = self._ramp_start
+        if abs(intended_target - target_temp) > 1.0:
+            self._ramp_start = None
+            return  # different target — discard
+        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
+        temp_delta = abs(target_temp - start_temp)
+        if elapsed < 1 or temp_delta < 0.5:
+            self._ramp_start = None
+            return
+        record = RampRecord(
+            temp_delta=temp_delta,
+            outdoor_temp=self._outdoor_temp,
+            actual_minutes=int(elapsed),
+            recorded_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self.ramp_history.append(record)
+        if len(self.ramp_history) > RAMP_HISTORY_MAX:
+            self.ramp_history.pop(0)
+        self._recalculate_learned_ramp()
+        self._ramp_start = None
+        _LOGGER.info(
+            "Ramp observation recorded: %.1f° in %d min — learned lead time now %.0f min",
+            temp_delta, int(elapsed), self._learned_ramp_minutes,
+        )
+
+    def _recalculate_learned_ramp(self) -> None:
+        """Recompute EMA of observed ramp times weighted by temp_delta."""
+        if not self.ramp_history:
+            self._learned_ramp_minutes = RAMP_DEFAULT_MINUTES
+            return
+        ema = float(self.ramp_history[0].actual_minutes)
+        for rec in self.ramp_history[1:]:
+            ema = RAMP_EMA_ALPHA * rec.actual_minutes + (1 - RAMP_EMA_ALPHA) * ema
+        # Clamp to a sane range: 10–90 minutes
+        self._learned_ramp_minutes = max(10.0, min(90.0, ema))
 
     # ------------------------------------------------------------------
     # Time-of-Use rate optimization
@@ -1530,3 +1682,215 @@ class GTTCCoordinator(DataUpdateCoordinator):
             if self.hass.states.get(entity_id) is not None
             and self.hass.states.get(entity_id).state == "on"
         ]
+
+    # ------------------------------------------------------------------
+    # Action log
+    # ------------------------------------------------------------------
+
+    def _log_action(self, reason: str, target_temp: float) -> None:
+        """Append a setpoint decision to the ring buffer."""
+        self._last_action_reason = reason
+        entry = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "reason": reason,
+            "target_temp": round(target_temp, 1),
+        }
+        self.action_log.append(entry)
+        if len(self.action_log) > ACTION_LOG_MAX:
+            self.action_log.pop(0)
+
+    # ------------------------------------------------------------------
+    # Vacation mode
+    # ------------------------------------------------------------------
+
+    async def async_set_vacation(
+        self,
+        setback_temp: float,
+        start_dt: str,
+        end_dt: str,
+        label: str = "Vacation",
+    ) -> None:
+        """Activate vacation mode with a return date."""
+        self.vacation_mode = VacationMode(
+            setback_temp=setback_temp,
+            start_dt=start_dt,
+            end_dt=end_dt,
+            label=label,
+        )
+        await self.async_save()
+        self.async_set_updated_data(self._build_state_dict())
+        _LOGGER.info(
+            "Vacation mode set: %.1f° from %s to %s",
+            setback_temp, start_dt, end_dt,
+        )
+
+    async def async_clear_vacation(self) -> None:
+        """Cancel vacation mode immediately."""
+        self.vacation_mode = None
+        await self.async_save()
+        self.async_set_updated_data(self._build_state_dict())
+        _LOGGER.info("Vacation mode cleared")
+
+    # ------------------------------------------------------------------
+    # Timed presets / boost buttons
+    # ------------------------------------------------------------------
+
+    async def async_activate_timed_preset(self, boost_type: str) -> None:
+        """Activate a boost/warm-up/cool-down timed temperature adjustment."""
+        if boost_type not in BOOST_TYPES:
+            _LOGGER.warning("Unknown boost type: %s", boost_type)
+            return
+        cfg = BOOST_TYPES[boost_type]
+        base = self.target_temp or self._default_comfort_temp
+        target = base + cfg["delta"]
+        target = max(self.temp_min, min(self.temp_max, target))
+        self.manual_override = ManualOverride(
+            target_temp=target,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            duration_minutes=cfg["minutes"],
+            zone_id=self.zone_manager.active_zone_id,
+        )
+        await self._set_thermostat_temp(target)
+        self._last_thermostat_temp = target
+        await self.async_save()
+        self.async_set_updated_data(self._build_state_dict())
+        _LOGGER.info(
+            "Timed preset '%s': %.1f° for %d min",
+            cfg["label"], target, cfg["minutes"],
+        )
+
+    # ------------------------------------------------------------------
+    # Fan pre-cooling
+    # ------------------------------------------------------------------
+
+    async def _apply_fan_precool(self, desired_temp: float) -> float:
+        """Use fan-only ventilation when outdoor air is cooler than indoor.
+
+        When in cooling season and outdoor temp is below indoor temp by at least
+        FAN_PRECOOL_MARGIN degrees, run the fan without engaging the AC compressor.
+        This is free cooling — it uses ~10% the energy of active AC.
+
+        If the indoor temp is still well above goal (> FAN_PRECOOL_COMFORT_MARGIN),
+        let the AC take over.
+        """
+        if self.season != SEASON_COOLING:
+            return desired_temp
+        if self._outdoor_temp is None or self.current_temp is None:
+            return desired_temp
+        if self._outdoor_temp > FAN_PRECOOL_MAX_OUTDOOR:
+            return desired_temp
+
+        outdoor_is_cooler = (
+            self._outdoor_temp < self.current_temp - FAN_PRECOOL_MARGIN
+        )
+        if not outdoor_is_cooler:
+            return desired_temp
+
+        gap = self.current_temp - desired_temp  # how far above goal we are
+        if gap <= FAN_PRECOOL_COMFORT_MARGIN:
+            # Already close enough — fan alone can handle this
+            try:
+                await self.hass.services.async_call(
+                    "climate",
+                    "set_fan_mode",
+                    {"entity_id": self.thermostat_entity, "fan_mode": "on"},
+                    blocking=False,
+                )
+            except Exception:
+                pass  # fan mode may not be supported
+            _LOGGER.debug(
+                "Fan pre-cool: outdoor %.1f° < indoor %.1f°, gap=%.1f°, fan-only",
+                self._outdoor_temp, self.current_temp, gap,
+            )
+            # Inflate setpoint slightly so AC doesn't engage
+            return min(self.temp_max, desired_temp + FAN_PRECOOL_COMFORT_MARGIN)
+
+        return desired_temp
+
+    # ------------------------------------------------------------------
+    # Runtime tracking & heating failure detection
+    # ------------------------------------------------------------------
+
+    async def _update_runtime_tracking(self) -> None:
+        """Accumulate daily HVAC runtime and detect heating failures."""
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+
+        # Roll over to a new day
+        if self._today_date != today:
+            if self._today_date:
+                self._save_daily_runtime(self._today_date)
+            self._today_date = today
+            self._today_heating_min = 0.0
+            self._today_cooling_min = 0.0
+
+        is_heating = self.hvac_action in (HVACAction.HEATING,)
+        is_cooling = self.hvac_action in (HVACAction.COOLING,)
+        is_active = is_heating or is_cooling
+
+        # Accumulate runtime (30s update cycle → 0.5 min per cycle)
+        if is_heating:
+            self._today_heating_min += 0.5
+        elif is_cooling:
+            self._today_cooling_min += 0.5
+
+        # Track start of HVAC run for failure detection
+        if is_active and self._hvac_run_start is None:
+            self._hvac_run_start = now
+            self._hvac_run_start_temp = self.current_temp
+        elif not is_active:
+            self._hvac_run_start = None
+            self._hvac_run_start_temp = None
+
+        # Heating failure check: if heating has run for HEATING_FAILURE_RUN_MINUTES
+        # without the temperature rising, notify Brian
+        if (
+            is_heating
+            and self._hvac_run_start is not None
+            and self._hvac_run_start_temp is not None
+            and self.current_temp is not None
+        ):
+            run_minutes = (now - self._hvac_run_start).total_seconds() / 60
+            if run_minutes >= HEATING_FAILURE_RUN_MINUTES:
+                temp_change = self.current_temp - self._hvac_run_start_temp
+                if temp_change < HEATING_FAILURE_TEMP_DELTA:
+                    _LOGGER.warning(
+                        "Heating failure detected: ran %.0f min, temp changed only %.1f°",
+                        run_minutes, temp_change,
+                    )
+                    await self._notify_heating_failure(run_minutes, temp_change)
+                    # Reset so we don't spam — check again after another full window
+                    self._hvac_run_start = now
+                    self._hvac_run_start_temp = self.current_temp
+
+    def _save_daily_runtime(self, date: str) -> None:
+        """Append the current day's runtime totals to the history."""
+        self.runtime_history.append({
+            "date": date,
+            "heating_min": round(self._today_heating_min, 1),
+            "cooling_min": round(self._today_cooling_min, 1),
+            "avg_outdoor": self._outdoor_temp,
+        })
+        if len(self.runtime_history) > RUNTIME_HISTORY_MAX_DAYS:
+            self.runtime_history.pop(0)
+
+    async def _notify_heating_failure(
+        self, run_minutes: float, temp_change: float
+    ) -> None:
+        """Send a heating-failure notification to Brian only."""
+        try:
+            await self.hass.services.async_call(
+                "notify",
+                BRIAN_NOTIFY_SERVICE,
+                {
+                    "title": "⚠️ GTTC: Heating May Be Failing",
+                    "message": (
+                        f"Heating has run for {run_minutes:.0f} min but the temperature "
+                        f"has only changed {temp_change:+.1f}°F. "
+                        "Check filters, vents, or the furnace."
+                    ),
+                },
+                blocking=False,
+            )
+        except Exception as err:
+            _LOGGER.warning("Could not send heating failure notification: %s", err)

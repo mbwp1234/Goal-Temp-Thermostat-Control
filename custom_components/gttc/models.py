@@ -88,6 +88,7 @@ class ScheduleEntry:
     target_temp: float
     zone_id: str | None = None
     cooling_temp: float | None = None  # target temp when in cooling season
+    away_temp: float | None = None  # setback when nobody home (overrides global away)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -96,6 +97,7 @@ class ScheduleEntry:
             "target_temp": self.target_temp,
             "zone_id": self.zone_id,
             "cooling_temp": self.cooling_temp,
+            "away_temp": self.away_temp,
         }
 
     @classmethod
@@ -106,6 +108,7 @@ class ScheduleEntry:
             target_temp=data.get("target_temp", 70),
             zone_id=data.get("zone_id"),
             cooling_temp=data.get("cooling_temp"),
+            away_temp=data.get("away_temp"),
         )
 
     @property
@@ -278,3 +281,74 @@ class ManualOverride:
         end = started + timedelta(minutes=self.duration_minutes)
         remaining = (end - _utcnow()).total_seconds() / 60
         return max(0, int(remaining))
+
+
+@dataclass
+class VacationMode:
+    """Time-bounded global temperature setback for extended absences."""
+
+    setback_temp: float
+    start_dt: str  # ISO format
+    end_dt: str  # ISO format — auto-reverts when passed
+    label: str = "Vacation"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "setback_temp": self.setback_temp,
+            "start_dt": self.start_dt,
+            "end_dt": self.end_dt,
+            "label": self.label,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> VacationMode:
+        return cls(
+            setback_temp=data.get("setback_temp", 62.0),
+            start_dt=data.get("start_dt", _utcnow().isoformat()),
+            end_dt=data.get("end_dt", (_utcnow() + timedelta(days=7)).isoformat()),
+            label=data.get("label", "Vacation"),
+        )
+
+    @property
+    def is_active(self) -> bool:
+        now = _utcnow()
+        start = _parse_iso(self.start_dt)
+        end = _parse_iso(self.end_dt)
+        return start <= now <= end
+
+    @property
+    def is_expired(self) -> bool:
+        return _utcnow() > _parse_iso(self.end_dt)
+
+    @property
+    def days_remaining(self) -> float:
+        end = _parse_iso(self.end_dt)
+        remaining = (end - _utcnow()).total_seconds() / 86400
+        return max(0.0, round(remaining, 1))
+
+
+@dataclass
+class RampRecord:
+    """A recorded thermal ramp observation for adaptive lead-time learning."""
+
+    temp_delta: float  # degrees of temperature change needed
+    outdoor_temp: float | None  # outdoor temp at time of ramp (°F)
+    actual_minutes: int  # how long the ramp actually took
+    recorded_at: str  # ISO format
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "temp_delta": self.temp_delta,
+            "outdoor_temp": self.outdoor_temp,
+            "actual_minutes": self.actual_minutes,
+            "recorded_at": self.recorded_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> RampRecord:
+        return cls(
+            temp_delta=data.get("temp_delta", 0.0),
+            outdoor_temp=data.get("outdoor_temp"),
+            actual_minutes=data.get("actual_minutes", 30),
+            recorded_at=data.get("recorded_at", _utcnow().isoformat()),
+        )
