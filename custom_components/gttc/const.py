@@ -160,7 +160,7 @@ FAN_PRECOOL_COMFORT_MARGIN = 1.5
 # Heating failure detection
 HEATING_FAILURE_RUN_MINUTES = 20   # HVAC must run this long before we check
 HEATING_FAILURE_TEMP_DELTA = 0.5   # minimum expected temperature change (°F)
-BRIAN_NOTIFY_SERVICE = "mobile_app_brians_iphone_2"
+BRIAN_NOTIFY_SERVICE = "mobile_app_brians_iphone"
 
 # Timed presets / boost buttons
 BOOST_TYPES = {
