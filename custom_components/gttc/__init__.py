@@ -38,6 +38,11 @@ PANEL_ICON = "mdi:calendar-clock"
 PANEL_TITLE = "GTTC"
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 
+# aiohttp static-path routes cannot be deregistered — they survive for the
+# lifetime of the HA process.  Track registration at module level so reloads
+# never attempt to re-register them (which raises RuntimeError).
+_STATIC_PATH_REGISTERED = False
+
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up GTTC from a config entry."""
@@ -134,6 +139,8 @@ def _get_coordinator(
 
 async def _async_register_panel(hass: HomeAssistant) -> None:
     """Register the sidebar panel and WebSocket API (idempotent)."""
+    global _STATIC_PATH_REGISTERED
+
     # Register WebSocket commands (safe to call multiple times)
     async_register_api(hass)
 
@@ -142,10 +149,15 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
     if hass.data.get(f"{DOMAIN}_panel_registered"):
         return
 
-    # Serve the frontend JS file
-    await hass.http.async_register_static_paths(
-        [StaticPathConfig(PANEL_URL, str(FRONTEND_DIR / "gttc-panel.js"), False)]
-    )
+    # Static paths survive config-entry reloads within the same HA process
+    # (aiohttp routes cannot be deregistered).  Use a module-level flag so we
+    # never attempt to re-register them even after an unload/reload cycle clears
+    # hass.data.
+    if not _STATIC_PATH_REGISTERED:
+        await hass.http.async_register_static_paths(
+            [StaticPathConfig(PANEL_URL, str(FRONTEND_DIR / "gttc-panel.js"), False)]
+        )
+        _STATIC_PATH_REGISTERED = True
 
     # Register the sidebar panel
     async_register_built_in_panel(
