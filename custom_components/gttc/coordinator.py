@@ -409,9 +409,15 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 # Actively park the thermostat so it doesn't keep running on
                 # its last setpoint. Cooling: push to max_temp so the AC
                 # won't kick on. Heating: push to min_temp so heat won't run.
-                if self.hvac_mode == HVACMode.COOL:
+                if self.hvac_mode == HVACMode.COOL or (
+                    self.hvac_mode in (HVACMode.OFF, None)
+                    and self.season == SEASON_COOLING
+                ):
                     park_temp = self.get_thermostat_max_temp()
-                elif self.hvac_mode in (HVACMode.HEAT, HVACMode.HEAT_COOL):
+                elif self.hvac_mode in (HVACMode.HEAT, HVACMode.HEAT_COOL) or (
+                    self.hvac_mode in (HVACMode.OFF, None)
+                    and self.season == SEASON_HEATING
+                ):
                     park_temp = self.get_thermostat_min_temp()
                 else:
                     park_temp = None

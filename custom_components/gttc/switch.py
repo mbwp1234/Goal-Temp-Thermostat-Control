@@ -190,7 +190,8 @@ class WindowsOpenSwitch(CoordinatorEntity, SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        return self.coordinator.windows_open_override
+        data = self.coordinator.data or {}
+        return bool(data.get("windows_open", False))
 
     @property
     def extra_state_attributes(self):
