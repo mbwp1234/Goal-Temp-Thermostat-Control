@@ -494,7 +494,10 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 desired_temp = hp_temp
 
             # Fan pre-cooling: use fan-only mode before engaging AC compressor
-            desired_temp = await self._apply_fan_precool(desired_temp)
+            fan_precool_temp = await self._apply_fan_precool(desired_temp)
+            if fan_precool_temp != desired_temp:
+                action_reason = ACTION_REASON_FAN_PRECOOL
+                desired_temp = fan_precool_temp
 
             # Log the reason for this setpoint decision
             self._log_action(action_reason, desired_temp)
