@@ -319,7 +319,47 @@ class GttcPanel extends HTMLElement {
 
   // ── Week overview ─────────────────────────────────────────────────────────
 
+  _getDayGroups() {
+    const s = this._schedule;
+    if (!s) return DAYS_ORDERED.map(d => ({ days: [d], label: DAY_LABELS[d], representative: d }));
+
+    // In weekday_weekend mode the days already share two templates — no need to compare
+    if (s.mode === "weekday_weekend" && !s.active_preset) {
+      const wdStr = JSON.stringify(s.weekday || []);
+      const weStr = JSON.stringify(s.weekend || []);
+      if (wdStr === weStr) {
+        return [{ days: DAYS_ORDERED, label: "All Days", representative: "monday" }];
+      }
+      return [
+        { days: ["monday","tuesday","wednesday","thursday","friday"], label: "Mon–Fri", representative: "monday" },
+        { days: ["saturday","sunday"], label: "Sat–Sun", representative: "saturday" },
+      ];
+    }
+
+    // per_day mode (or active preset): detect identical day groups
+    const groups = [];
+    const used = new Set();
+    for (const day of DAYS_ORDERED) {
+      if (used.has(day)) continue;
+      const sig = JSON.stringify(this._getEntriesForDay(day));
+      const matching = DAYS_ORDERED.filter(d => !used.has(d) && JSON.stringify(this._getEntriesForDay(d)) === sig);
+      groups.push({ days: matching, label: this._groupLabel(matching), representative: day });
+      matching.forEach(d => used.add(d));
+    }
+    return groups;
+  }
+
+  _groupLabel(days) {
+    if (days.length === 7) return "All Days";
+    if (days.length === 1) return DAY_LABELS[days[0]];
+    const joined = days.join(",");
+    if (joined === "monday,tuesday,wednesday,thursday,friday") return "Mon–Fri";
+    if (joined === "saturday,sunday") return "Sat–Sun";
+    return days.map(d => DAY_LABELS[d]).join(", ");
+  }
+
   _renderWeekOverview() {
+    const groups = this._getDayGroups();
     return `
       <div class="week-overview">
         <div class="time-axis">
@@ -330,15 +370,17 @@ class GttcPanel extends HTMLElement {
             </div>
           `).join("")}
         </div>
-        ${DAYS_ORDERED.map(day => {
-          const entries = this._getEntriesForDay(day);
-          const isSelected = day === this._selectedDay;
+        ${groups.map(group => {
+          const rep = group.representative;
+          const entries = this._getEntriesForDay(rep);
+          const isSelected = group.days.includes(this._selectedDay);
           return `
-            <div class="week-row ${isSelected ? "selected" : ""}" data-day="${day}">
-              <div class="week-row-label">${DAY_LABELS[day]}</div>
+            <div class="week-row ${isSelected ? "selected" : ""}" data-day="${rep}"
+                 title="${group.days.map(d => DAY_LABELS_FULL[d]).join(', ')}">
+              <div class="week-row-label">${group.label}</div>
               <div class="week-row-timeline">
-                ${this._renderOnPeakOverlay(day)}
-                ${this._renderTimelineBlocks(entries, day, true)}
+                ${this._renderOnPeakOverlay(rep)}
+                ${this._renderTimelineBlocks(entries, rep, true)}
                 <div class="now-line" style="left:${this._nowPercent()}%"></div>
               </div>
             </div>
@@ -354,10 +396,19 @@ class GttcPanel extends HTMLElement {
     const day = this._selectedDay;
     if (!day) return "";
     const entries = this._getEntriesForDay(day);
+    const groups = this._getDayGroups();
+    const group = groups.find(g => g.days.includes(day)) || { label: DAY_LABELS_FULL[day], days: [day] };
+    const titleStr = group.days.length > 1 ? `${group.label} Schedule` : `${DAY_LABELS_FULL[day]} Schedule`;
+    const subtitleStr = group.days.length > 1
+      ? `<span class="day-group-subtitle">${group.days.map(d => DAY_LABELS_FULL[d]).join(' · ')}</span>`
+      : "";
     return `
       <div class="day-detail">
         <div class="day-detail-header">
-          <h2>${day.charAt(0).toUpperCase() + day.slice(1)} Schedule</h2>
+          <div class="day-detail-title">
+            <h2>${titleStr}</h2>
+            ${subtitleStr}
+          </div>
           <div class="day-actions">
             <button class="btn btn-add" id="addEntryBtn">+ Add Entry</button>
             <button class="btn btn-outline" id="bulkAddBtn">+ Bulk Add</button>
@@ -2090,7 +2141,7 @@ class GttcPanel extends HTMLElement {
     };
 
     // Split actual temp line into colored segments by HVAC state
-    const COLOR_IDLE = "var(--primary-color,#03a9f4)";
+    const COLOR_IDLE = "#9e9e9e";
     const COLOR_HEATING = "#f57c00";
     const COLOR_COOLING = "#0288d1";
     const getLineColor = (action) => action === "heating" ? COLOR_HEATING : action === "cooling" ? COLOR_COOLING : COLOR_IDLE;
@@ -3435,16 +3486,17 @@ class GttcPanel extends HTMLElement {
         background: var(--card-bg); border-radius: 12px; padding: 16px;
         margin-bottom: 20px; border: 1px solid var(--divider);
       }
-      .time-axis { position: relative; height: 20px; margin-left: 48px; margin-bottom: 4px; font-size: 11px; color: var(--secondary-text); }
+      .time-axis { position: relative; height: 20px; margin-left: 72px; margin-bottom: 4px; font-size: 11px; color: var(--secondary-text); }
       .time-mark { position: absolute; transform: translateX(-50%); }
       .week-row {
-        display: flex; align-items: center; height: 36px; margin-bottom: 2px;
+        display: flex; align-items: center; height: 40px; margin-bottom: 2px;
         cursor: pointer; border-radius: 6px; transition: background 0.1s;
       }
       .week-row:hover { background: rgba(0,0,0,0.04); }
       .week-row.selected { background: rgba(3,169,244,0.08); }
-      .week-row-label { width: 48px; font-size: 13px; font-weight: 500; color: var(--secondary-text); flex-shrink: 0; text-align: right; padding-right: 8px; }
-      .week-row-timeline { flex: 1; position: relative; height: 28px; background: var(--bg); border-radius: 4px; overflow: hidden; }
+      .week-row-label { width: 72px; font-size: 12px; font-weight: 600; color: var(--secondary-text); flex-shrink: 0; text-align: right; padding-right: 10px; white-space: nowrap; }
+      .week-row.selected .week-row-label { color: var(--primary); }
+      .week-row-timeline { flex: 1; position: relative; height: 32px; background: var(--bg); border-radius: 4px; overflow: hidden; }
 
       /* Timeline blocks */
       .timeline-block {
@@ -3481,29 +3533,36 @@ class GttcPanel extends HTMLElement {
 
       /* Day detail */
       .day-detail { background: var(--card-bg); border-radius: 12px; padding: 16px; border: 1px solid var(--divider); }
-      .day-detail-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+      .day-detail-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; gap: 12px; }
+      .day-detail-title { display: flex; flex-direction: column; gap: 3px; }
       .day-detail h2 { margin: 0; font-size: 18px; font-weight: 500; }
-      .day-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+      .day-group-subtitle { font-size: 12px; color: var(--secondary-text); letter-spacing: 0.2px; }
+      .day-actions { display: flex; gap: 8px; flex-wrap: wrap; flex-shrink: 0; }
       .day-timeline-container { position: relative; margin-bottom: 20px; }
       .day-timeline-hours { position: relative; height: 20px; font-size: 11px; color: var(--secondary-text); }
       .hour-mark { position: absolute; transform: translateX(-50%); }
       .hour-label { white-space: nowrap; }
-      .day-timeline { position: relative; height: 48px; background: var(--bg); border-radius: 8px; overflow: hidden; margin-top: 4px; }
-      .day-timeline .timeline-block { top: 4px; bottom: 4px; }
+      .day-timeline { position: relative; height: 56px; background: var(--bg); border-radius: 8px; overflow: hidden; margin-top: 4px; }
+      .day-timeline .timeline-block { top: 5px; bottom: 5px; }
       .day-timeline .block-temp { font-size: 14px; }
       .day-timeline .block-time { font-size: 11px; }
       .day-timeline .block-cool { font-size: 12px; }
 
       /* Entry cards */
-      .entries-list { display: flex; flex-direction: column; gap: 8px; }
+      .entries-list { display: flex; flex-direction: column; gap: 6px; margin-top: 12px; }
       .no-entries { color: var(--secondary-text); font-style: italic; text-align: center; padding: 20px; }
-      .entry-card { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--divider); background: var(--bg); }
-      .entry-color { width: 6px; height: 32px; border-radius: 3px; flex-shrink: 0; }
-      .entry-info { flex: 1; display: flex; gap: 16px; align-items: center; }
-      .entry-time { font-size: 14px; font-weight: 500; }
-      .entry-temp { font-size: 16px; font-weight: 600; }
-      .entry-zone { font-size: 12px; color: var(--secondary-text); background: var(--card-bg); padding: 2px 8px; border-radius: 10px; border: 1px solid var(--divider); }
-      .entry-actions { display: flex; gap: 6px; }
+      .entry-card {
+        display: flex; align-items: center; gap: 12px; padding: 10px 12px;
+        border-radius: 8px; border: 1px solid var(--divider); background: var(--card-bg);
+        transition: box-shadow 0.15s;
+      }
+      .entry-card:hover { box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+      .entry-color { width: 5px; align-self: stretch; border-radius: 3px; flex-shrink: 0; min-height: 32px; }
+      .entry-info { flex: 1; display: flex; gap: 16px; align-items: center; min-width: 0; }
+      .entry-time { font-size: 13px; font-weight: 500; white-space: nowrap; }
+      .entry-temp { font-size: 16px; font-weight: 700; }
+      .entry-zone { font-size: 12px; color: var(--secondary-text); background: var(--bg); padding: 2px 8px; border-radius: 10px; border: 1px solid var(--divider); }
+      .entry-actions { display: flex; gap: 6px; flex-shrink: 0; }
 
       /* Buttons */
       .btn {
@@ -3657,7 +3716,7 @@ class GttcPanel extends HTMLElement {
       }
       .chart-legend { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--secondary-text); font-weight: 400; }
       .legend-dot { width: 12px; height: 2px; display: inline-block; border-radius: 1px; }
-      .legend-dot.actual { background: var(--primary-color, #03a9f4); }
+      .legend-dot.actual { background: #9e9e9e; }
       .legend-dot.goal { background: var(--success-color, #43a047); }
       .legend-dot.on-peak { background: rgba(219,68,55,0.55); width: 10px; height: 10px; border-radius: 2px; }
       .legend-dot.hvac-heat { background: rgba(245,124,0,0.7); width: 10px; height: 10px; border-radius: 2px; }
@@ -4083,7 +4142,7 @@ class GttcPanel extends HTMLElement {
       .runtime-chart { margin-top: 0; }
       .runtime-bars {
         display: flex; align-items: flex-end; gap: 3px;
-        height: 140px; padding: 8px 8px 28px;
+        height: 180px; padding: 8px 8px 28px;
         border-bottom: 1px solid var(--divider-color, #e0e0e0);
         position: relative; overflow-x: auto;
       }
@@ -4092,7 +4151,7 @@ class GttcPanel extends HTMLElement {
         min-width: 18px; max-width: 36px; position: relative; height: 100%;
         justify-content: flex-end;
       }
-      .runtime-bar-stack { display: flex; flex-direction: column-reverse; width: 100%; max-height: 100%; }
+      .runtime-bar-stack { display: flex; flex-direction: column-reverse; width: 100%; height: 100%; max-height: 100%; }
       .runtime-bar { width: 100%; border-radius: 3px 3px 0 0; min-height: 2px; }
       .heat-bar { background: #f57c00; }
       .cool-bar { background: #0288d1; }
