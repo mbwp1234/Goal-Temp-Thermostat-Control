@@ -156,6 +156,10 @@ FAN_PRECOOL_MARGIN = 3.0
 FAN_PRECOOL_MAX_OUTDOOR = 75.0
 # Switch from fan-only to AC when indoor temp is still this many °F above goal
 FAN_PRECOOL_COMFORT_MARGIN = 1.5
+# Minutes fan must run before we test whether it is working
+FAN_PRECOOL_CHECK_WINDOW = 15
+# Minimum °F drop required within the check window to keep fan pre-cool active
+FAN_PRECOOL_MIN_DROP = 0.5
 
 # Heating failure detection
 HEATING_FAILURE_RUN_MINUTES = 20   # HVAC must run this long before we check

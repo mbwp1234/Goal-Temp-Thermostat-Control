@@ -57,9 +57,11 @@ from .const import (
     DEFAULT_TEMP_MAX,
     DEFAULT_TEMP_MIN,
     DOMAIN,
+    FAN_PRECOOL_CHECK_WINDOW,
     FAN_PRECOOL_COMFORT_MARGIN,
     FAN_PRECOOL_MARGIN,
     FAN_PRECOOL_MAX_OUTDOOR,
+    FAN_PRECOOL_MIN_DROP,
     HEAT_PUMP_MAX_SETBACK,
     HEAT_PUMP_RECOVERY_STEP,
     HEATING_FAILURE_RUN_MINUTES,
@@ -229,6 +231,12 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self._today_heating_min: float = 0.0
         self._today_cooling_min: float = 0.0
         self._today_date: str = ""
+
+        # Fan pre-cool effectiveness tracking
+        self._fan_precool_start_time: datetime | None = None
+        self._fan_precool_start_temp: float | None = None
+        self._fan_precool_disengaged: bool = False
+        self._fan_precool_fan_on: bool = False
 
     @property
     def available(self) -> bool:
@@ -1772,49 +1780,114 @@ class GTTCCoordinator(DataUpdateCoordinator):
     # Fan pre-cooling
     # ------------------------------------------------------------------
 
+    async def _fan_precool_set_fan(self, mode: str) -> None:
+        """Set thermostat fan mode and track whether fan-only is active."""
+        try:
+            await self.hass.services.async_call(
+                "climate",
+                "set_fan_mode",
+                {"entity_id": self.thermostat_entity, "fan_mode": mode},
+                blocking=False,
+            )
+            self._fan_precool_fan_on = mode == "on"
+        except Exception:
+            pass  # fan mode may not be supported
+
+    def _reset_fan_precool_state(self) -> None:
+        """Clear the effectiveness-tracking window (does NOT change fan mode)."""
+        self._fan_precool_start_time = None
+        self._fan_precool_start_temp = None
+        self._fan_precool_disengaged = False
+
     async def _apply_fan_precool(self, desired_temp: float) -> float:
         """Use fan-only ventilation when outdoor air is cooler than indoor.
 
-        When in cooling season and outdoor temp is below indoor temp by at least
-        FAN_PRECOOL_MARGIN degrees, run the fan without engaging the AC compressor.
-        This is free cooling — it uses ~10% the energy of active AC.
-
-        If the indoor temp is still well above goal (> FAN_PRECOOL_COMFORT_MARGIN),
-        let the AC take over.
+        State machine:
+        1. Conditions not met → restore fan to Auto, reset state, pass through.
+        2. Disengaged (proven ineffective) → wait until zone reaches goal,
+           then reset so fan pre-cool can try again next cooling call.
+        3. Zone already at/below goal (gap ≤ 0) → fan maintenance, no inflation.
+        4. First activation or new window → record baseline, fan on, inflate.
+        5. Within check window → continue inflating to hold off AC.
+        6. Window expired:
+           - Dropped ≥ FAN_PRECOOL_MIN_DROP → reset window, keep going.
+           - Dropped < FAN_PRECOOL_MIN_DROP → disengage: restore fan, pass through.
         """
-        if self.season != SEASON_COOLING:
-            return desired_temp
-        if self._outdoor_temp is None or self.current_temp is None:
-            return desired_temp
-        if self._outdoor_temp > FAN_PRECOOL_MAX_OUTDOOR:
-            return desired_temp
+        now = datetime.now(timezone.utc)
 
-        outdoor_is_cooler = (
-            self._outdoor_temp < self.current_temp - FAN_PRECOOL_MARGIN
+        # ── Precondition checks ──────────────────────────────────────────────
+        conditions_met = (
+            self.season == SEASON_COOLING
+            and self._outdoor_temp is not None
+            and self.current_temp is not None
+            and self._outdoor_temp <= FAN_PRECOOL_MAX_OUTDOOR
+            and self._outdoor_temp < self.current_temp - FAN_PRECOOL_MARGIN
         )
-        if not outdoor_is_cooler:
+
+        if not conditions_met:
+            if self._fan_precool_fan_on:
+                await self._fan_precool_set_fan("Auto low")
+            self._reset_fan_precool_state()
             return desired_temp
 
-        gap = self.current_temp - desired_temp  # how far above goal we are
-        if gap <= FAN_PRECOOL_COMFORT_MARGIN:
-            # Already close enough — fan alone can handle this
-            try:
-                await self.hass.services.async_call(
-                    "climate",
-                    "set_fan_mode",
-                    {"entity_id": self.thermostat_entity, "fan_mode": "on"},
-                    blocking=False,
-                )
-            except Exception:
-                pass  # fan mode may not be supported
-            _LOGGER.debug(
-                "Fan pre-cool: outdoor %.1f° < indoor %.1f°, gap=%.1f°, fan-only",
-                self._outdoor_temp, self.current_temp, gap,
-            )
-            # Inflate setpoint slightly so AC doesn't engage
-            return min(self.temp_max, desired_temp + FAN_PRECOOL_COMFORT_MARGIN)
+        # ── Disengaged: ineffective this cycle, wait for recovery ───────────
+        if self._fan_precool_disengaged:
+            if self.current_temp <= desired_temp:
+                # Zone finally reached goal; allow fan pre-cool to try again
+                self._reset_fan_precool_state()
+            return desired_temp
 
-        return desired_temp
+        gap = self.current_temp - desired_temp  # °F above goal
+
+        # ── Already at or below goal: gentle maintenance, no AC inflation ───
+        if gap <= 0:
+            if not self._fan_precool_fan_on:
+                await self._fan_precool_set_fan("on")
+            _LOGGER.debug(
+                "Fan pre-cool: maintenance — indoor %.1f° at goal %.1f°, outdoor %.1f°",
+                self.current_temp, desired_temp, self._outdoor_temp,
+            )
+            return desired_temp
+
+        # ── Active cooling needed (gap > 0) ─────────────────────────────────
+        if self._fan_precool_start_time is None:
+            # First activation — start effectiveness window
+            self._fan_precool_start_time = now
+            self._fan_precool_start_temp = self.current_temp
+            await self._fan_precool_set_fan("on")
+            _LOGGER.debug(
+                "Fan pre-cool: START — indoor %.1f°, goal %.1f°, outdoor %.1f°",
+                self.current_temp, desired_temp, self._outdoor_temp,
+            )
+        else:
+            elapsed = (now - self._fan_precool_start_time).total_seconds() / 60.0
+            if elapsed >= FAN_PRECOOL_CHECK_WINDOW:
+                drop = (self._fan_precool_start_temp or self.current_temp) - self.current_temp
+                if drop >= FAN_PRECOOL_MIN_DROP:
+                    # Working — reset window and keep going
+                    _LOGGER.debug(
+                        "Fan pre-cool: effective (dropped %.2f°F in %.0f min), continuing",
+                        drop, elapsed,
+                    )
+                    self._fan_precool_start_time = now
+                    self._fan_precool_start_temp = self.current_temp
+                else:
+                    # Not working — disengage and let AC handle it
+                    _LOGGER.debug(
+                        "Fan pre-cool: DISENGAGE — only %.2f°F drop in %.0f min, handing off to AC",
+                        drop, elapsed,
+                    )
+                    await self._fan_precool_set_fan("Auto low")
+                    self._fan_precool_disengaged = True
+                    return desired_temp
+
+        # Inflate setpoint to hold AC off while fan-only runs
+        inflated = min(self.temp_max, desired_temp + FAN_PRECOOL_COMFORT_MARGIN)
+        _LOGGER.debug(
+            "Fan pre-cool: active — indoor %.1f°, goal %.1f°, inflated to %.1f°, outdoor %.1f°",
+            self.current_temp, desired_temp, inflated, self._outdoor_temp,
+        )
+        return inflated
 
     # ------------------------------------------------------------------
     # Runtime tracking & heating failure detection
