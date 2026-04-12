@@ -501,11 +501,19 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 action_reason = ACTION_REASON_HEAT_PUMP
                 desired_temp = hp_temp
 
-            # Fan pre-cooling: use fan-only mode before engaging AC compressor
-            fan_precool_temp = await self._apply_fan_precool(desired_temp)
-            if fan_precool_temp != desired_temp:
-                action_reason = ACTION_REASON_FAN_PRECOOL
-                desired_temp = fan_precool_temp
+            # Fan pre-cooling: use fan-only mode before engaging AC compressor.
+            # Skip entirely when manual override is active — the user wants the
+            # AC/heat to respond to the override immediately, not be held off by
+            # fan-only ventilation.
+            if self.manual_override and not self.manual_override.is_expired:
+                if self._fan_precool_fan_on:
+                    await self._fan_precool_set_fan("Auto low")
+                self._reset_fan_precool_state()
+            else:
+                fan_precool_temp = await self._apply_fan_precool(desired_temp)
+                if fan_precool_temp != desired_temp:
+                    action_reason = ACTION_REASON_FAN_PRECOOL
+                    desired_temp = fan_precool_temp
 
             # Log the reason for this setpoint decision
             self._log_action(action_reason, desired_temp)
@@ -1396,6 +1404,13 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 blocking=True,
             )
             self.hvac_mode = hvac_mode
+            # Fan pre-cool state is mode-specific; reset so it starts fresh
+            # in the new mode rather than acting on stale heat-mode context.
+            self._reset_fan_precool_state()
+            # Invalidate the last-sent setpoint so the next update always
+            # pushes the correct temp to the thermostat (old heat setpoint
+            # is meaningless in cool mode and vice-versa).
+            self._last_thermostat_temp = None
         except Exception as err:
             _LOGGER.error("Failed to set HVAC mode to %s: %s", hvac_mode, err)
 
@@ -1825,6 +1840,13 @@ class GTTCCoordinator(DataUpdateCoordinator):
         )
 
         if not conditions_met:
+            if self._fan_precool_fan_on:
+                await self._fan_precool_set_fan("Auto low")
+            self._reset_fan_precool_state()
+            return desired_temp
+
+        # ── Manual override: user has explicit control — don't inflate ───────
+        if self.manual_override and not self.manual_override.is_expired:
             if self._fan_precool_fan_on:
                 await self._fan_precool_set_fan("Auto low")
             self._reset_fan_precool_state()
