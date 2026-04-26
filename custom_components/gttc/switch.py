@@ -26,6 +26,7 @@ async def async_setup_entry(
         TOUSwitch(coordinator, config_entry, name),
         PreconditionSwitch(coordinator, config_entry, name),
         WindowsOpenSwitch(coordinator, config_entry, name),
+        AutoSeasonSwitch(coordinator, config_entry, name),
     ])
 
 
@@ -216,4 +217,45 @@ class WindowsOpenSwitch(CoordinatorEntity, SwitchEntity):
         self.coordinator.async_set_updated_data(
             self.coordinator._build_state_dict()
         )
+        self.async_write_ha_state()
+
+
+class AutoSeasonSwitch(CoordinatorEntity, SwitchEntity):
+    """Allow GTTC to automatically switch heating/cooling season.
+
+    When on, the coordinator will switch the season once outdoor conditions
+    have been opposite to the current season for at least the configured
+    threshold (default 3 hours), instead of only surfacing a recommendation.
+    """
+
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:autorenew"
+
+    def __init__(self, coordinator, config_entry, name):
+        super().__init__(coordinator)
+        self._attr_name = f"{name} Auto Season Switch"
+        self._attr_unique_id = f"{DOMAIN}_{config_entry.entry_id}_auto_season_switch"
+
+    @property
+    def is_on(self) -> bool:
+        return self.coordinator.auto_season_switch
+
+    @property
+    def extra_state_attributes(self):
+        data = self.coordinator.data or {}
+        return {
+            "current_season": data.get("season"),
+            "suggest_switch": data.get("suggest_season_switch", False),
+            "conditions_sustained_hours": data.get("season_conditions_hours", 0),
+            "threshold_hours": self.coordinator.seasonal_recommend_hours,
+        }
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.coordinator.auto_season_switch = True
+        await self.coordinator.async_save()
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.coordinator.auto_season_switch = False
+        await self.coordinator.async_save()
         self.async_write_ha_state()

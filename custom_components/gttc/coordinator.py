@@ -474,7 +474,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
             # Read outdoor temperature sensor (if configured)
             self._outdoor_temp = self._read_outdoor_temp()
 
-            # Update season switch recommendation tracking (never auto-switches)
+            # Update season switch recommendation; auto-switches if enabled
             self._update_season_recommendation()
 
             # Determine target temperature (priority hierarchy)
@@ -1534,9 +1534,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
     def _update_season_recommendation(self) -> None:
         """Track how long outdoor conditions have been opposite to the current season.
 
-        Never changes the season automatically — that is always a deliberate
-        user action via SeasonModeSelect.  Updates the internal timestamps that
-        power SeasonSwitchRecommendedBinarySensor and SeasonRecommendationSensor.
+        Updates the internal timestamps that power SeasonSwitchRecommendedBinarySensor
+        and SeasonRecommendationSensor.  If auto_season_switch is enabled, triggers
+        an automatic season change once the threshold is reached.
 
         Resets the countdown whenever conditions reverse, so a brief warm day
         in winter doesn't linger in the counter.
