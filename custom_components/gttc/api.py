@@ -317,6 +317,11 @@ async def ws_get_status(
             if coordinator.manual_override and not coordinator.manual_override.is_expired
             else 0
         ),
+        "override_source": (
+            coordinator.manual_override.source
+            if coordinator.manual_override and not coordinator.manual_override.is_expired
+            else None
+        ),
         "current_entry": current_entry.to_dict() if current_entry else None,
         "schedule_enabled": coordinator.schedule_enabled,
         "windows_open": coordinator._are_windows_open(),
@@ -811,6 +816,7 @@ async def ws_get_diagnostics(
         "override_remaining_minutes": override.remaining_minutes if override_active else 0,
         "override_target_temp": override.target_temp if override_active else None,
         "override_started_at": override.started_at if override_active else None,
+        "override_source": override.source if override_active else None,
         "schedule_enabled": coordinator.schedule_enabled,
         "current_entry": current_entry.to_dict() if current_entry else None,
         "active_zone_name": coordinator.zone_manager.active_zone.name if coordinator.zone_manager.active_zone else None,

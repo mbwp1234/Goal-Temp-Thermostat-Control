@@ -20,6 +20,7 @@ from .const import (
     DOMAIN,
     OUTDOOR_COLD_THRESHOLD,
     OUTDOOR_MILD_THRESHOLD,
+    OVERRIDE_SOURCE_PHYSICAL,
     SEASON_COOLING,
     SEASON_HEATING,
     SEASONAL_SWITCH_MARGIN,
@@ -116,6 +117,16 @@ class OverrideRemainingSensor(CoordinatorEntity, SensorEntity):
     def native_value(self) -> int:
         data = self.coordinator.data or {}
         return data.get("override_remaining", 0)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """Expose where the override came from so cards can label it."""
+        data = self.coordinator.data or {}
+        source = data.get("override_source")
+        return {
+            "override_source": source,
+            "from_thermostat": source == OVERRIDE_SOURCE_PHYSICAL,
+        }
 
 
 class LearnedPatternsSensor(CoordinatorEntity, SensorEntity):

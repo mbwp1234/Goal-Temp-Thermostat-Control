@@ -7,8 +7,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from custom_components.gttc.const import ACTION_REASON_PHYSICAL_OVERRIDE
+from custom_components.gttc.const import (
+    ACTION_REASON_OVERRIDE,
+    ACTION_REASON_PHYSICAL_OVERRIDE,
+    OVERRIDE_SOURCE_MANUAL,
+    OVERRIDE_SOURCE_PHYSICAL,
+)
 from custom_components.gttc.coordinator import PHYSICAL_ECHO_WINDOW, GTTCCoordinator
+from custom_components.gttc.models import ManualOverride
 
 
 # ---------------------------------------------------------------------------
@@ -212,3 +218,92 @@ class TestEchoSuppression:
     @pytest.mark.asyncio
     async def test_echo_window_constant_is_sane(self):
         assert timedelta(seconds=30) < PHYSICAL_ECHO_WINDOW <= timedelta(minutes=5)
+
+
+class TestOverrideSource:
+    """The source flag must survive for the override's whole life."""
+
+    @pytest.mark.asyncio
+    async def test_physical_override_is_tagged(self):
+        coord = _make_coordinator()
+        coord._known_thermostat_setpoint = 68.0
+
+        await _dispatch(coord, 72.0)
+
+        assert coord.manual_override.source == OVERRIDE_SOURCE_PHYSICAL
+        assert coord.manual_override.is_physical is True
+
+    @pytest.mark.asyncio
+    async def test_dashboard_override_is_not_physical(self):
+        coord = _make_coordinator()
+        coord.schedule_enabled = False
+
+        await coord.async_set_temperature(70.0)
+
+        assert coord.manual_override.source == OVERRIDE_SOURCE_MANUAL
+        assert coord.manual_override.is_physical is False
+
+    @pytest.mark.asyncio
+    async def test_reason_stays_physical_on_later_cycles(self):
+        """The chip must keep saying 'thermostat' for the full duration."""
+        coord = _make_coordinator()
+        coord._known_thermostat_setpoint = 68.0
+
+        await _dispatch(coord, 72.0)
+        # Simulate a later coordinator cycle recomputing the setpoint
+        _, reason = coord._calculate_desired_temp()
+
+        assert reason == ACTION_REASON_PHYSICAL_OVERRIDE
+
+    @pytest.mark.asyncio
+    async def test_reason_is_manual_for_dashboard_override(self):
+        coord = _make_coordinator()
+        coord.schedule_enabled = False
+
+        await coord.async_set_temperature(70.0)
+        _, reason = coord._calculate_desired_temp()
+
+        assert reason == ACTION_REASON_OVERRIDE
+
+    @pytest.mark.asyncio
+    async def test_source_exposed_in_state_dict(self):
+        coord = _make_coordinator()
+        coord._known_thermostat_setpoint = 68.0
+
+        await _dispatch(coord, 72.0)
+        data = coord._build_state_dict()
+
+        assert data["override_source"] == OVERRIDE_SOURCE_PHYSICAL
+
+    @pytest.mark.asyncio
+    async def test_source_is_none_when_no_override(self):
+        coord = _make_coordinator()
+
+        data = coord._build_state_dict()
+
+        assert data["override_source"] is None
+
+    def test_source_round_trips_through_storage(self):
+        override = ManualOverride(
+            target_temp=72.0,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            duration_minutes=120,
+            source=OVERRIDE_SOURCE_PHYSICAL,
+        )
+
+        restored = ManualOverride.from_dict(override.to_dict())
+
+        assert restored.source == OVERRIDE_SOURCE_PHYSICAL
+        assert restored.is_physical is True
+
+    def test_pre_2_1_0_stored_override_defaults_to_manual(self):
+        """Overrides persisted before the source field existed."""
+        restored = ManualOverride.from_dict({
+            "target_temp": 70.0,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "duration_minutes": 120,
+            "zone_id": None,
+        })
+
+        assert restored.source == OVERRIDE_SOURCE_MANUAL
+        assert restored.is_physical is False

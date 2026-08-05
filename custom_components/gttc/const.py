@@ -133,6 +133,10 @@ LEARNING_TEMP_TOLERANCE = 2.0
 ACTION_REASON_SCHEDULE = "schedule"
 ACTION_REASON_OVERRIDE = "manual_override"
 ACTION_REASON_PHYSICAL_OVERRIDE = "physical_override"
+
+# Where a ManualOverride originated
+OVERRIDE_SOURCE_MANUAL = "manual"  # Dashboard / climate entity
+OVERRIDE_SOURCE_PHYSICAL = "physical"  # Setpoint changed on the wall unit
 ACTION_REASON_VACATION = "vacation"
 ACTION_REASON_OCCUPANCY = "occupancy_away"
 ACTION_REASON_PRECONDITION = "precondition"
@@ -201,6 +205,7 @@ ATTR_PRESENCE_HOME = "presence_home"
 ATTR_LEARNING_STATUS = "learning_status"
 ATTR_OVERRIDE_ACTIVE = "override_active"
 ATTR_OVERRIDE_REMAINING = "override_remaining_minutes"
+ATTR_OVERRIDE_SOURCE = "override_source"
 ATTR_ALL_ZONES = "all_zones"
 ATTR_ZONE_DETAILS = "zone_details"
 ATTR_WINDOWS_OPEN = "windows_open"

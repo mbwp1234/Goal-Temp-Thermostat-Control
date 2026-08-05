@@ -71,6 +71,7 @@ from .const import (
     LEARNING_TEMP_TOLERANCE,
     OUTDOOR_COLD_THRESHOLD,
     OUTDOOR_MILD_THRESHOLD,
+    OVERRIDE_SOURCE_PHYSICAL,
     RAMP_DEFAULT_MINUTES,
     RAMP_EMA_ALPHA,
     RAMP_HISTORY_MAX,
@@ -392,6 +393,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
             started_at=datetime.now(timezone.utc).isoformat(),
             duration_minutes=self.manual_override_minutes,
             zone_id=self.zone_manager.active_zone_id,
+            source=OVERRIDE_SOURCE_PHYSICAL,
         )
         self.target_temp = temperature
         # During an override the zone offset is skipped, so the thermostat
@@ -715,6 +717,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
             "override_remaining": (
                 self.manual_override.remaining_minutes if override_active else 0
             ),
+            "override_source": (
+                self.manual_override.source if override_active else None
+            ),
             "heat_pump_detected": self.is_heat_pump,
             "outdoor_temp": self._outdoor_temp,
             "tou_rate_period": (
@@ -878,7 +883,12 @@ class GTTCCoordinator(DataUpdateCoordinator):
 
         # 1. Manual override (highest priority)
         if self.manual_override and not self.manual_override.is_expired:
-            return self.manual_override.target_temp, ACTION_REASON_OVERRIDE
+            reason = (
+                ACTION_REASON_PHYSICAL_OVERRIDE
+                if self.manual_override.is_physical
+                else ACTION_REASON_OVERRIDE
+            )
+            return self.manual_override.target_temp, reason
 
         # 2. Vacation mode — global setback while away on vacation
         if self.vacation_mode and self.vacation_mode.is_active:

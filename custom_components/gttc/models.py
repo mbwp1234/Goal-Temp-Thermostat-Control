@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
+from .const import OVERRIDE_SOURCE_MANUAL, OVERRIDE_SOURCE_PHYSICAL
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -252,6 +254,9 @@ class ManualOverride:
     started_at: str  # ISO format
     duration_minutes: int
     zone_id: str | None = None
+    # Where the override came from: "manual" (dashboard/climate entity) or
+    # "physical" (setpoint changed directly on the real thermostat).
+    source: str = OVERRIDE_SOURCE_MANUAL
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -259,6 +264,7 @@ class ManualOverride:
             "started_at": self.started_at,
             "duration_minutes": self.duration_minutes,
             "zone_id": self.zone_id,
+            "source": self.source,
         }
 
     @classmethod
@@ -268,7 +274,15 @@ class ManualOverride:
             started_at=data.get("started_at", _utcnow().isoformat()),
             duration_minutes=data.get("duration_minutes", 120),
             zone_id=data.get("zone_id"),
+            # Overrides stored before v2.1.0 have no source — they predate
+            # physical detection, so they can only have been manual.
+            source=data.get("source", OVERRIDE_SOURCE_MANUAL),
         )
+
+    @property
+    def is_physical(self) -> bool:
+        """Whether this override came from the physical thermostat."""
+        return self.source == OVERRIDE_SOURCE_PHYSICAL
 
     @property
     def is_expired(self) -> bool:
