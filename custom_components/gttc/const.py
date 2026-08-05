@@ -132,6 +132,7 @@ LEARNING_TEMP_TOLERANCE = 2.0
 # Action reason tags — attached to every setpoint decision for "why" history
 ACTION_REASON_SCHEDULE = "schedule"
 ACTION_REASON_OVERRIDE = "manual_override"
+ACTION_REASON_PHYSICAL_OVERRIDE = "physical_override"
 ACTION_REASON_VACATION = "vacation"
 ACTION_REASON_OCCUPANCY = "occupancy_away"
 ACTION_REASON_PRECONDITION = "precondition"

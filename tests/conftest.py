@@ -13,6 +13,7 @@ sys.modules["homeassistant.components.select"] = ha.components.select
 sys.modules["homeassistant.const"] = ha.const
 sys.modules["homeassistant.core"] = ha.core
 sys.modules["homeassistant.helpers"] = ha.helpers
+sys.modules["homeassistant.helpers.event"] = ha.helpers.event
 sys.modules["homeassistant.helpers.storage"] = ha.helpers.storage
 sys.modules["homeassistant.helpers.update_coordinator"] = ha.helpers.update_coordinator
 sys.modules["homeassistant.helpers.entity_platform"] = ha.helpers.entity_platform
@@ -25,6 +26,9 @@ ha.components.climate.HVACMode = MagicMock()
 ha.components.climate.ClimateEntity = MagicMock
 ha.components.climate.ClimateEntityFeature = MagicMock()
 ha.const.ATTR_TEMPERATURE = "temperature"
+# @callback must be a pass-through decorator, not a MagicMock that would
+# replace the decorated method with a mock object.
+ha.core.callback = lambda func: func
 ha.const.UnitOfTemperature = MagicMock()
 ha.helpers.storage.Store = MagicMock
 ha.helpers.update_coordinator.DataUpdateCoordinator = type(

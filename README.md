@@ -9,7 +9,7 @@ A smart, zone-aware thermostat integration for Home Assistant (HACS). Control yo
 - **Smart Scheduling** — Weekday/weekend schedules, per-day schedules, and built-in presets (Home, Away, Work From Home, Sleep). Drag-to-resize blocks, bulk add, copy entries or entire days, import/export as JSON, undo/redo
 - **Pattern Learning** — Automatically detects when you make similar temperature adjustments at similar times and creates schedule entries for you (configurable threshold, default: 3 similar events)
 - **Presence Detection** — Uses HA's built-in `person` entities (zone.home) and/or room occupancy sensors to detect if anyone is home. Three modes: Person entities only, Occupancy sensors only, or Both (recommended). Drops to away temperature when nobody is home, with per-zone overrides
-- **Manual Override** — Any manual temperature change takes priority for a configurable period (default: 2 hours, configurable 15–480 min), then resumes automation
+- **Manual Override** — Any manual temperature change takes priority for a configurable period (default: 2 hours, configurable 15–480 min), then resumes automation. This includes changes made directly on the physical thermostat — turning the dial at the wall holds for the same duration instead of being overwritten on the next update cycle
 - **TOU Rate Optimization** — Adjusts the thermostat setpoint during on-peak electricity hours to reduce energy cost. Supports Dominion Energy Virginia's Off-Peak Plan schedule with correct summer/winter windows
 - **Pre-conditioning** — Starts ramping toward the next schedule entry before it begins, so the house reaches comfort temperature right on time
 - **Window/Door Sensors** — Automatically pauses heating and cooling when a window or door is detected open. Supports multiple sensors and a manual suspend toggle
@@ -122,7 +122,7 @@ service: gttc.clear_learned_schedule
 ### Priority System
 Temperature decisions follow this priority (highest first):
 1. **Windows Open** — If a window/door sensor is open (or manual suspend is on), HVAC is paused entirely
-2. **Manual Override** — Any temp change you make holds for the override duration (default 2hr, configurable 15–480 min)
+2. **Manual Override** — Any temp change you make holds for the override duration (default 2hr, configurable 15–480 min). Changes made on the physical thermostat count too — GTTC watches the real thermostat's setpoint and promotes any change it didn't make into a full override
 3. **Presence/Occupancy** — If enabled and nobody is detected home, drops to away temperature
 4. **Schedule** — Follows the active schedule/preset
 5. **Last Setting** — Maintains the last known target temperature

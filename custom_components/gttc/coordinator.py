@@ -10,7 +10,8 @@ from homeassistant.components.climate import (
     HVACMode,
 )
 from homeassistant.const import ATTR_TEMPERATURE
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, HomeAssistant, callback
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
@@ -21,6 +22,7 @@ from .const import (
     ACTION_REASON_HEAT_PUMP,
     ACTION_REASON_OCCUPANCY,
     ACTION_REASON_OVERRIDE,
+    ACTION_REASON_PHYSICAL_OVERRIDE,
     ACTION_REASON_PRECONDITION,
     ACTION_REASON_SCHEDULE,
     ACTION_REASON_TOU,
@@ -98,6 +100,15 @@ _LOGGER = logging.getLogger(__name__)
 UPDATE_INTERVAL = timedelta(seconds=30)
 TEMP_HYSTERESIS = 0.5  # Minimum change (degrees) before updating thermostat
 MAX_TEMP_OFFSET = 5.0  # Maximum offset correction between zone and thermostat sensors
+
+# Physical (at-the-wall) setpoint change detection.
+# A Z-Wave thermostat echoes our own writes back as a state change, often a
+# second or two later and sometimes rounded to its own resolution. We only
+# treat a setpoint change as user-initiated when it neither matches a value
+# we recently wrote nor arrives inside the echo window.
+PHYSICAL_CHANGE_THRESHOLD = 0.5  # Minimum delta to count as a real change
+PHYSICAL_ECHO_WINDOW = timedelta(seconds=90)  # How long our own write may echo
+PHYSICAL_ECHO_TOLERANCE = 1.0  # Rounding slack when matching our echoed write
 
 
 class GTTCCoordinator(DataUpdateCoordinator):
@@ -232,6 +243,16 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self._today_cooling_min: float = 0.0
         self._today_date: str = ""
 
+        # Physical override detection — setpoint changes made at the wall unit
+        # (or by anything other than GTTC) are promoted to a full manual
+        # override so they aren't silently stomped on the next update cycle.
+        # _pending_write_* records our own most recent write so its echo back
+        # from the thermostat isn't mistaken for a user action.
+        self._known_thermostat_setpoint: float | None = None
+        self._pending_write_temp: float | None = None
+        self._pending_write_until: datetime | None = None
+        self._unsub_thermostat_listener = None
+
         # Fan pre-cool effectiveness tracking
         self._fan_precool_start_time: datetime | None = None
         self._fan_precool_start_temp: float | None = None
@@ -262,8 +283,136 @@ class GTTCCoordinator(DataUpdateCoordinator):
             self.schedule_enabled = True
             self.scheduler.enabled = True
 
+        # Watch the real thermostat for setpoint changes we didn't make
+        self._start_physical_override_watch()
+
         self._initialized = True
         _LOGGER.info("GTTC coordinator initialized")
+
+    # ------------------------------------------------------------------
+    # Physical override detection
+    # ------------------------------------------------------------------
+
+    def _start_physical_override_watch(self) -> None:
+        """Listen for setpoint changes made directly on the real thermostat."""
+        if self._unsub_thermostat_listener is not None:
+            return
+
+        # Seed the known setpoint from the current state so the first event
+        # after a restart doesn't look like a user change.
+        self._known_thermostat_setpoint = self._read_thermostat_setpoint()
+
+        self._unsub_thermostat_listener = async_track_state_change_event(
+            self.hass,
+            [self.thermostat_entity],
+            self._handle_thermostat_state_event,
+        )
+
+    def async_shutdown_physical_override_watch(self) -> None:
+        """Remove the thermostat state listener (called on unload)."""
+        if self._unsub_thermostat_listener is not None:
+            self._unsub_thermostat_listener()
+            self._unsub_thermostat_listener = None
+
+    def _read_thermostat_setpoint(self) -> float | None:
+        """Read the real thermostat's current target temperature attribute."""
+        state = self.hass.states.get(self.thermostat_entity)
+        if state is None:
+            return None
+        try:
+            value = state.attributes.get(ATTR_TEMPERATURE)
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _note_own_write(self, temperature: float) -> None:
+        """Record a setpoint GTTC is about to write so its echo is ignored."""
+        self._pending_write_temp = temperature
+        self._pending_write_until = datetime.now(timezone.utc) + PHYSICAL_ECHO_WINDOW
+        self._known_thermostat_setpoint = temperature
+
+    def _is_own_write_echo(self, setpoint: float) -> bool:
+        """Whether an observed setpoint is the thermostat echoing our own write."""
+        if self._pending_write_temp is None or self._pending_write_until is None:
+            return False
+        if datetime.now(timezone.utc) > self._pending_write_until:
+            # Echo window elapsed — anything from here on is a real change
+            self._pending_write_temp = None
+            self._pending_write_until = None
+            return False
+        return abs(setpoint - self._pending_write_temp) <= PHYSICAL_ECHO_TOLERANCE
+
+    @callback
+    def _handle_thermostat_state_event(self, event: Event) -> None:
+        """Promote an externally-made setpoint change to a manual override."""
+        new_state = event.data.get("new_state")
+        if new_state is None:
+            return
+
+        try:
+            raw = new_state.attributes.get(ATTR_TEMPERATURE)
+            setpoint = float(raw) if raw is not None else None
+        except (TypeError, ValueError):
+            setpoint = None
+        if setpoint is None:
+            return
+
+        previous = self._known_thermostat_setpoint
+        self._known_thermostat_setpoint = setpoint
+
+        # Nothing to compare against yet (first reading after a restart)
+        if previous is None:
+            return
+
+        if abs(setpoint - previous) < PHYSICAL_CHANGE_THRESHOLD:
+            return
+
+        if self._is_own_write_echo(setpoint):
+            _LOGGER.debug(
+                "Thermostat setpoint %.1f° matches GTTC's own write — not an override",
+                setpoint,
+            )
+            return
+
+        _LOGGER.info(
+            "Physical thermostat change detected: %.1f° → %.1f° — "
+            "holding for %d minutes",
+            previous,
+            setpoint,
+            self.manual_override_minutes,
+        )
+        self.hass.async_create_task(self._async_apply_physical_override(setpoint))
+
+    async def _async_apply_physical_override(self, setpoint: float) -> None:
+        """Create a manual override from a setpoint change made at the wall unit."""
+        temperature = max(self.temp_min, min(self.temp_max, setpoint))
+
+        self.manual_override = ManualOverride(
+            target_temp=temperature,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            duration_minutes=self.manual_override_minutes,
+            zone_id=self.zone_manager.active_zone_id,
+        )
+        self.target_temp = temperature
+        # During an override the zone offset is skipped, so the thermostat
+        # target equals the override temp — record it so the next update
+        # cycle sees no drift and leaves the thermostat alone.
+        self._last_thermostat_temp = temperature
+
+        self._log_action(ACTION_REASON_PHYSICAL_OVERRIDE, temperature)
+
+        # If the requested value fell outside the configured range, write the
+        # clamped value back so the thermostat and GTTC agree.
+        if abs(temperature - setpoint) >= 0.1:
+            _LOGGER.info(
+                "Physical setpoint %.1f° clamped to configured range → %.1f°",
+                setpoint,
+                temperature,
+            )
+            await self._set_thermostat_temp(temperature)
+
+        await self.async_save()
+        self.async_set_updated_data(self._build_state_dict())
 
     def _load_stored_data(self, data: dict[str, Any]) -> None:
         """Restore state from storage with validation."""
@@ -1372,6 +1521,10 @@ class GTTCCoordinator(DataUpdateCoordinator):
         if not self._available:
             _LOGGER.warning("Thermostat %s is not available", self.thermostat_entity)
             return
+
+        # Mark this as our own write before the call so the resulting state
+        # change isn't mistaken for someone changing the wall unit.
+        self._note_own_write(temperature)
 
         try:
             await self.hass.services.async_call(

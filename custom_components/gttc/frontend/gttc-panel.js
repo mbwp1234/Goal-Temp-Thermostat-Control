@@ -1581,6 +1581,7 @@ class GttcPanel extends HTMLElement {
     const reason = d.hvac_action_reason;
     const map = {
       manual_override: `Override · ${d.override_remaining_minutes || 0}m left`,
+      physical_override: `Thermostat override · ${d.override_remaining_minutes || 0}m left`,
       vacation: "Vacation mode",
       occupancy_away: "Nobody home",
       schedule: "Schedule",
