@@ -1313,11 +1313,17 @@ class GTTCCoordinator(DataUpdateCoordinator):
             return None
         entry = self.scheduler.get_current_entry()
         if entry:
-            effective_temp = (
-                entry.cooling_temp
-                if (self.season == SEASON_COOLING and entry.cooling_temp is not None)
-                else entry.target_temp
-            )
+            # Must match _calculate_desired_temp: in cooling season an entry
+            # without its own cooling_temp runs at cooling_comfort, not at its
+            # heating number.
+            if self.season == SEASON_COOLING:
+                effective_temp = (
+                    entry.cooling_temp
+                    if entry.cooling_temp is not None
+                    else self.cooling_comfort
+                )
+            else:
+                effective_temp = entry.target_temp
             return {
                 "time_start": entry.time_start,
                 "time_end": entry.time_end,
