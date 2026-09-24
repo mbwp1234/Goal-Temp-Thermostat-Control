@@ -88,7 +88,7 @@ class GttcPanel extends HTMLElement {
     // Drag state
     this._dragging = null;
     // Status tab
-    this._activeMainTab = "command";
+    this._activeMainTab = "now";
     this._diagData = null;
     this._historyData = null;
     this._hvacHistory = null;
@@ -109,6 +109,9 @@ class GttcPanel extends HTMLElement {
     this._runtimeData = null;
     this._runtimeRange = 30; // days: 7 | 30 | 90
     this._actionLog = null;
+    // Settings: one draft across every section, one save bar
+    this._draft = {};
+    this._settingsSection = "season";
     // Vacation modal
     this._showVacationModal = false;
   }
@@ -270,6 +273,7 @@ class GttcPanel extends HTMLElement {
 
   _render() {
     if (!this._schedule) return;
+    const tab = this._activeMainTab;
     this.shadowRoot.innerHTML = `
       <style>${this._styles()}</style>
       <div class="panel">
@@ -287,10 +291,10 @@ class GttcPanel extends HTMLElement {
         ${this._renderSeasonStrip()}
 
         <div class="content">
-          ${this._activeMainTab === "command"
-            ? this._renderCommandCenterTab()
-            : this._renderSettingsTab()
-          }
+          ${tab === "now" ? this._renderNowTab()
+            : tab === "schedule" ? this._renderScheduleTab()
+            : tab === "history" ? this._renderHistoryTab()
+            : this._renderSettingsTab()}
         </div>
 
         ${this._editingEntry ? this._renderEditModal() : ""}
@@ -310,19 +314,16 @@ class GttcPanel extends HTMLElement {
 
   _renderStatus() {
     const st = this._status;
-    if (!st) return "";
     const parts = [];
-    if (st.current_temp != null) parts.push(`<span class="status-item">Now: ${st.current_temp.toFixed(1)}\u00b0</span>`);
-    if (st.target_temp != null) parts.push(`<span class="status-item">Goal: ${st.target_temp.toFixed(1)}\u00b0</span>`);
-    if (st.active_zone) parts.push(`<span class="status-item">${st.active_zone}</span>`);
-    if (st.override_active) {
+    if (st && st.override_active && this._activeMainTab !== "now") {
       const label = st.override_source === "physical" ? "Thermostat hold" : "Override";
-      parts.push(`<span class="status-item override">${label}: ${st.override_remaining}m
-        <button class="btn-cancel-override js-cancel-override" title="Resume schedule">\u2715</button>
+      parts.push(`<span class="status-item override">${label} · ${st.override_remaining}m
+        <button class="btn-cancel-override js-cancel-override" title="Resume schedule">✕</button>
       </span>`);
     }
-    if (st.windows_open) {
-      parts.push(`<span class="status-item windows-open"><ha-icon icon="mdi:window-open-variant"></ha-icon> Windows open</span>`);
+    if (this._lastFetchAt) {
+      const t = new Date(this._lastFetchAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      parts.push(`<button class="status-item status-live" id="statusRefreshBtn" title="Fetch now"><span class="live-dot"></span>Live · ${t}</button>`);
     }
     return `<div class="status-bar">${parts.join("")}</div>`;
   }
@@ -360,22 +361,16 @@ class GttcPanel extends HTMLElement {
 
   _renderPresetSelector() {
     const s = this._schedule;
-    const presets = s.preset_labels || {};
     const presetData = s.presets || {};
+    const custom = s.active_preset && presetData[s.active_preset] && !presetData[s.active_preset].is_builtin;
     return `
       <div class="preset-group">
-        <select class="preset-select" id="presetSelect">
-          <option value="" ${!s.active_preset ? "selected" : ""}>No preset (base fallback)</option>
-          ${Object.entries(presets).map(([key, label]) =>
-            `<option value="${key}" ${s.active_preset === key ? "selected" : ""}>${label}</option>`
-          ).join("")}
-        </select>
-        <button class="btn btn-icon btn-small" id="createPresetBtn" title="Create Custom Preset">+</button>
-        ${s.active_preset && presetData[s.active_preset] && !presetData[s.active_preset].is_builtin ? `
-          <button class="btn btn-icon btn-small btn-danger" id="deletePresetBtn" title="Delete This Preset">\u2715</button>
-          <button class="btn btn-icon btn-small" id="renamePresetBtn" title="Rename This Preset">
+        <button class="btn btn-outline btn-small" id="createPresetBtn" title="Create a preset">+ New preset</button>
+        ${custom ? `
+          <button class="btn btn-icon btn-small" id="renamePresetBtn" title="Rename this preset">
             <ha-icon icon="mdi:pencil"></ha-icon>
           </button>
+          <button class="btn btn-icon btn-small btn-danger" id="deletePresetBtn" title="Delete this preset">✕</button>
         ` : ""}
       </div>
     `;
@@ -649,6 +644,7 @@ class GttcPanel extends HTMLElement {
   _renderSeasonStrip() {
     const d = this._diagData;
     if (!d) return "";
+    const s = this._schedule;
     const cooling = this._isCooling();
     const other = cooling ? "heating" : "cooling";
     const otherLabel = cooling ? "Heating" : "Cooling";
@@ -664,6 +660,7 @@ class GttcPanel extends HTMLElement {
     } else {
       meta = `<b>No switch recommended</b>${outdoor != null ? ` · outside ${outdoor.toFixed(1)}°` : ""}`;
     }
+    const labels = s.preset_labels || {};
     return `
       <div class="season-strip ${d.suggest_season_switch ? "season-strip-suggest" : ""}">
         <div class="season-seg" role="group" aria-label="Season">
@@ -681,6 +678,15 @@ class GttcPanel extends HTMLElement {
         ${d.suggest_season_switch ? `
           <button class="btn btn-primary season-cta" data-season-switch="${other}">Switch to ${otherLabel}</button>
         ` : ""}
+        <label class="strip-preset">
+          <span>Preset</span>
+          <select class="preset-select" id="presetSelect">
+            ${Object.entries(labels).map(([key, label]) =>
+              `<option value="${key}" ${s.active_preset === key ? "selected" : ""}>${label}</option>`
+            ).join("")}
+            <option value="" ${!s.active_preset ? "selected" : ""}>No preset (base fallback)</option>
+          </select>
+        </label>
       </div>
     `;
   }
@@ -974,7 +980,25 @@ class GttcPanel extends HTMLElement {
           this._loadSettingsData();
         } else {
           this._render();
+          if (tab === "history") this._loadActionLog();
         }
+      });
+    });
+
+    // Now tab
+    this._addClick("goScheduleBtn", () => { this._activeMainTab = "schedule"; this._render(); });
+    root.querySelectorAll("[data-auto-toggle]").forEach(chip => {
+      chip.addEventListener("click", () => {
+        chip.disabled = true;
+        this._handleAutomationToggle(chip.dataset.autoToggle, chip.dataset.on !== "1");
+      });
+    });
+    root.querySelectorAll("[data-now-zone]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        try {
+          await this._hass.callWS({ type: "gttc/set_active_zone", zone_id: btn.dataset.nowZone });
+          await this._loadData();
+        } catch (err) { this._showToast(`Zone not changed: ${err.message || err}`, "error"); }
       });
     });
 
@@ -985,23 +1009,6 @@ class GttcPanel extends HTMLElement {
       this._loadData();
     });
 
-    // Automation toggles
-    root.querySelectorAll(".automation-toggle").forEach(toggle => {
-      toggle.addEventListener("change", () => {
-        this._handleAutomationToggle(toggle.dataset.toggleId, toggle.checked);
-      });
-    });
-
-    // Active zone quick selector
-    const activeZoneSelect = root.getElementById("activeZoneSelect");
-    if (activeZoneSelect) {
-      activeZoneSelect.addEventListener("change", async () => {
-        try {
-          await this._hass.callWS({ type: "gttc/set_active_zone", zone_id: activeZoneSelect.value });
-          await this._loadData();
-        } catch (err) { this._showToast("Failed to change zone.", "error"); }
-      });
-    }
 
     // "Manage in Settings" link
     root.querySelectorAll(".js-window-settings").forEach(btn => btn.addEventListener("click", () => {
@@ -1862,244 +1869,6 @@ class GttcPanel extends HTMLElement {
 
   // ── Command Center ────────────────────────────────────────────────────────
 
-  _renderCommandCenterTab() {
-    if (!this._schedule) {
-      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading...</div>`;
-    }
-    const d = this._diagData;
-    return `
-      <div class="command-center">
-        ${d ? this._renderStatCards(d) : ""}
-        ${this._renderBoostButtons()}
-        <div class="cc-main-row">
-          ${this._renderAutomationToggles()}
-          ${this._renderQuickPanel()}
-        </div>
-        ${this._renderTempChart()}
-        ${this._renderRuntimeChart()}
-        <div class="schedule-section">
-          <div class="schedule-section-header">
-            <div class="section-label"><ha-icon icon="mdi:calendar-clock"></ha-icon> Schedule</div>
-            <div class="schedule-controls-row">
-              ${this._renderUndoRedo()}
-              ${this._renderScheduleMode()}
-              ${this._renderPresetSelector()}
-              ${this._renderToolbar()}
-            </div>
-          </div>
-          <div class="schedule-section-body">
-            <div class="day-tabs">
-              ${DAYS_ORDERED.map(day => `
-                <button class="day-tab ${day === this._selectedDay ? "active" : ""}" data-day="${day}">
-                  <span class="day-short">${DAY_LABELS[day]}</span>
-                </button>
-              `).join("")}
-            </div>
-            <div class="schedule-view">
-              ${this._renderWeekOverview()}
-              ${this._renderDayDetail()}
-            </div>
-          </div>
-        </div>
-        <div class="cc-footer">
-          <button class="btn btn-outline" id="statusRefreshBtn">
-            <ha-icon icon="mdi:refresh"></ha-icon> Refresh
-          </button>
-          ${d && this._lastFetchAt ? `<span class="status-updated">Live · last fetched ${new Date(this._lastFetchAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}</span>` : ""}
-        </div>
-      </div>
-    `;
-  }
-
-  _renderAutomationToggles() {
-    const d = this._diagData;
-    const cfg = this._configData;
-    const f = d?.features || {};
-    const windows = d?.windows || {};
-
-    const toggles = [
-      {
-        id: "schedule",
-        icon: "mdi:calendar-check",
-        label: "Schedule",
-        desc: "Follow temperature time blocks",
-        enabled: d?.schedule_enabled ?? false,
-        badge: null,
-      },
-      {
-        id: "learning",
-        icon: "mdi:brain",
-        label: "Learning",
-        desc: "Auto-adapt from repeated changes",
-        enabled: d?.learning?.enabled ?? cfg?.learning_enabled ?? false,
-        badge: d?.learning?.patterns_learned > 0 ? `${d.learning.patterns_learned} patterns` : null,
-        badgeType: "neutral",
-      },
-      {
-        id: "occupancy",
-        icon: "mdi:account-check",
-        label: "Presence",
-        desc: "Away temp when no one is home",
-        enabled: cfg?.occupancy_enabled ?? false,
-        badge: f.presence_home != null ? (f.presence_home ? "Home" : "Away") : null,
-        badgeType: f.presence_home ? "success" : "warn",
-      },
-      {
-        id: "tou",
-        icon: "mdi:lightning-bolt-circle",
-        label: "TOU Optimization",
-        desc: "Shift setpoint during peak rate hours",
-        enabled: f.tou_enabled ?? cfg?.tou_enabled ?? false,
-        badge: f.tou_enabled && f.tou_rate ? this._touRateLabel(f.tou_rate) : null,
-        badgeType: this._touRateBadgeType(f.tou_rate),
-      },
-      {
-        id: "precondition",
-        icon: "mdi:weather-partly-cloudy",
-        label: "Pre-conditioning",
-        desc: "Ramp toward next schedule entry early",
-        enabled: f.precondition_enabled ?? cfg?.precondition_enabled ?? false,
-        badge: f.precondition_active ? "Active" : null,
-        badgeType: "success",
-      },
-      {
-        id: "windows",
-        icon: "mdi:window-open-variant",
-        label: "Windows Suspend",
-        desc: "Pause HVAC when windows open",
-        enabled: windows.manual_override ?? false,
-        badge: windows.open
-          ? `${windows.open_sensors?.length ?? 1} open`
-          : (windows.sensors?.length > 0 ? "All closed" : null),
-        badgeType: windows.open ? "warn" : "success",
-      },
-    ];
-
-    return `
-      <div class="automation-panel">
-        <div class="panel-title"><ha-icon icon="mdi:tune"></ha-icon> Automation Controls</div>
-        <div class="toggle-grid">
-          ${toggles.map(t => `
-            <div class="toggle-card ${t.enabled ? "toggle-card-on" : "toggle-card-off"}">
-              <div class="toggle-icon-wrap ${t.enabled ? "icon-active" : "icon-idle"}">
-                <ha-icon icon="${t.icon}"></ha-icon>
-              </div>
-              <div class="toggle-card-body">
-                <div class="toggle-card-label">${t.label}</div>
-                <div class="toggle-card-desc">${t.desc}</div>
-                ${t.badge ? `<span class="toggle-badge badge-${t.badgeType || "neutral"}">${t.badge}</span>` : ""}
-              </div>
-              <label class="toggle-switch">
-                <input type="checkbox" class="automation-toggle" data-toggle-id="${t.id}" ${t.enabled ? "checked" : ""} />
-                <span class="toggle-slider"></span>
-              </label>
-            </div>
-          `).join("")}
-        </div>
-      </div>
-    `;
-  }
-
-  _renderQuickPanel() {
-    const d = this._diagData;
-    const sc = this._schedule;
-    if (!d && !sc) return "";
-    const zones = sc?.zones || [];
-    const f = d?.features || {};
-
-    return `
-      <div class="quick-panel">
-        ${zones.length > 1 ? `
-          <div class="qp-section">
-            <div class="qp-label">Active Zone</div>
-            <select class="qp-select" id="activeZoneSelect">
-              ${zones.map(z => `
-                <option value="${z.id}" ${z.is_active ? "selected" : ""}>${z.name}</option>
-              `).join("")}
-            </select>
-          </div>
-        ` : ""}
-        ${d?.override_active ? `
-          <div class="override-banner">
-            <ha-icon icon="mdi:clock-edit"></ha-icon>
-            <div class="override-info">
-              <span class="override-label">${d.override_source === "physical" ? "Held at the thermostat" : "Override active"}</span>
-              <span class="override-sub">${d.override_target_temp}° &middot; ${d.override_remaining_minutes}m left</span>
-            </div>
-            <button class="btn-cancel-override js-cancel-override" title="Resume schedule">&#x2715;</button>
-          </div>
-        ` : ""}
-        ${this._diagData?.vacation_mode ? (() => {
-          const vm = this._diagData.vacation_mode;
-          return `
-          <div class="vacation-banner">
-            <ha-icon icon="mdi:airplane"></ha-icon>
-            <div class="override-info">
-              <span class="override-label">${vm.label || "Vacation"} — ${vm.setback_temp}°</span>
-              <span class="override-sub">${new Date(vm.end_dt).toLocaleDateString()} return</span>
-            </div>
-            <button class="btn-cancel-override" id="clearVacationBtn" title="Cancel vacation">&#x2715;</button>
-          </div>`;
-        })() : `
-          <div class="qp-section">
-            <button class="btn btn-outline btn-sm vacation-btn" id="setVacationBtn">
-              <ha-icon icon="mdi:airplane"></ha-icon> Set Vacation Mode
-            </button>
-          </div>
-        `}
-        ${d?.zones?.length > 0 ? `
-          <div class="qp-section">
-            <div class="qp-label">Zone Temperatures</div>
-            <div class="mini-zones">
-              ${d.zones.map(z => `
-                <div class="mini-zone ${z.is_active ? "mini-zone-active" : ""}">
-                  <span class="mz-dot">${z.is_active ? "&#9679;" : "&#9675;"}</span>
-                  <span class="mz-name">${z.name}</span>
-                  ${z.is_occupied != null ? `<span class="mz-occ ${z.is_occupied ? "occ-yes" : ""}">${z.is_occupied ? "occ" : ""}</span>` : ""}
-                  <span class="mz-temp">${z.current_temp != null ? z.current_temp.toFixed(1) + "°" : "—"}</span>
-                </div>
-              `).join("")}
-            </div>
-          </div>
-        ` : ""}
-        ${f.tou_enabled && f.tou_rate ? `
-          <div class="qp-section">
-            <div class="qp-label">Current Rate Period</div>
-            <div class="tou-rate-row">
-              <span class="tou-rate-badge badge-${this._touRateBadgeType(f.tou_rate)}">${this._touRateLabel(f.tou_rate)}</span>
-              ${f.precondition_active ? `<span class="tou-note">Pre-conditioning active</span>` : ""}
-            </div>
-          </div>
-        ` : ""}
-        ${d ? `
-          <div class="qp-section">
-            <div class="qp-label">System</div>
-            <table class="sys-table">
-              <tr><td class="sys-label">Outdoor</td><td class="sys-val">${f.outdoor_temp != null ? f.outdoor_temp.toFixed(1) + "°" : "—"}</td></tr>
-              <tr><td class="sys-label">Heat pump</td><td class="sys-val">${f.heat_pump_detected ? "Yes" : "No"}</td></tr>
-              <tr><td class="sys-label">Presence</td><td class="sys-val">${f.presence_home != null ? (f.presence_home ? "Home" : "Away") : "—"}</td></tr>
-            </table>
-          </div>
-        ` : ""}
-        ${d?.windows?.sensors?.length > 0 ? `
-          <div class="qp-section">
-            <div class="qp-label">Windows</div>
-            <div class="win-status ${d.windows.open ? "win-open" : "win-closed"}">
-              <ha-icon icon="${d.windows.open ? "mdi:window-open-variant" : "mdi:window-closed-variant"}"></ha-icon>
-              <span>${d.windows.open ? `${d.windows.open_sensors.length} open` : "All closed"}</span>
-              ${d.windows.open ? `<span class="win-badge">HVAC paused</span>` : ""}
-            </div>
-            <div style="margin-top:8px">
-              <button class="btn btn-outline btn-sm js-window-settings">
-                <ha-icon icon="mdi:cog"></ha-icon> Manage
-              </button>
-            </div>
-          </div>
-        ` : ""}
-      </div>
-    `;
-  }
-
   _touRateLabel(rate) {
     if (rate === "on_peak") return "On-Peak";
     if (rate === "super_off_peak") return "Super Off-Peak";
@@ -2112,75 +1881,72 @@ class GttcPanel extends HTMLElement {
     return "success";
   }
 
-  _renderBoostButtons() {
-    // Offer only the direction the season can act on: a +4 boost in cooling
-    // season just lets the house warm up, which is not what "boost" means.
-    const boosts = this._isCooling()
-      ? [
-          { id: "max_cool",  icon: "mdi:snowflake-alert", label: "Max Cool −4° · 90m", color: "#01579b" },
-          { id: "cool_down", icon: "mdi:snowflake",       label: "Cool Down −3° · 60m", color: "#0288d1" },
-        ]
-      : [
-          { id: "boost",   icon: "mdi:fire",             label: "Boost +4° · 90m",   color: "#f57c00" },
-          { id: "warm_up", icon: "mdi:thermometer-plus", label: "Warm Up +3° · 60m", color: "#e64a19" },
-        ];
-    return `
-      <div class="boost-row">
-        ${boosts.map(b => `
-          <button class="boost-btn" data-boost-type="${b.id}" style="--boost-color:${b.color}" title="${b.label}">
-            <ha-icon icon="${b.icon}"></ha-icon>
-            <span class="boost-label">${b.label}</span>
-          </button>
-        `).join("")}
-      </div>
-    `;
-  }
-
   _renderRuntimeChart() {
     const rd = this._runtimeData;
     if (!rd || !rd.history || rd.history.length === 0) return "";
     const days = this._runtimeRange;
-    const history = rd.history.slice(-days);
-    // Include today's partial data
     const today = rd.today;
-    const allData = today && today.date
-      ? [...history.filter(d => d.date !== today.date), today]
-      : history;
+    const daily = (today && today.date
+      ? [...rd.history.filter(x => x.date !== today.date), today]
+      : [...rd.history]).slice(-days);
 
-    const maxRuntime = Math.max(1, ...allData.map(d => (d.heating_min || 0) + (d.cooling_min || 0)));
-
-    const rangeOptions = [7, 30, 90];
+    let bars;
+    if (days <= 7) {
+      bars = daily.map(x => ({
+        label: new Date(x.date + "T12:00:00").toLocaleDateString([], { weekday: "short" }),
+        title: new Date(x.date + "T12:00:00").toLocaleDateString([], { month: "short", day: "numeric" }),
+        heat: x.heating_min || 0, cool: x.cooling_min || 0, outdoor: x.avg_outdoor,
+      }));
+    } else {
+      const weeks = new Map();
+      for (const x of daily) {
+        const dt = new Date(x.date + "T12:00:00");
+        const monday = new Date(dt);
+        monday.setDate(dt.getDate() - ((dt.getDay() + 6) % 7));
+        const key = monday.toISOString().slice(0, 10);
+        if (!weeks.has(key)) weeks.set(key, { start: monday, heat: 0, cool: 0, out: [], n: 0 });
+        const w = weeks.get(key);
+        w.heat += x.heating_min || 0;
+        w.cool += x.cooling_min || 0;
+        w.n += 1;
+        if (x.avg_outdoor != null) w.out.push(x.avg_outdoor);
+      }
+      bars = [...weeks.values()].map(w => ({
+        label: w.start.toLocaleDateString([], { month: "short", day: "numeric" }),
+        title: `Week of ${w.start.toLocaleDateString([], { month: "short", day: "numeric" })}${w.n < 7 ? ` (${w.n} days)` : ""}`,
+        heat: w.heat, cool: w.cool,
+        outdoor: w.out.length ? w.out.reduce((a, b) => a + b, 0) / w.out.length : null,
+      }));
+    }
+    const max = Math.max(1, ...bars.map(b => b.heat + b.cool));
+    const hours = (m) => m >= 60 ? `${(m / 60).toFixed(1)}h` : `${Math.round(m)}m`;
+    const totalHeat = bars.reduce((a, b) => a + b.heat, 0);
+    const totalCool = bars.reduce((a, b) => a + b.cool, 0);
     return `
       <div class="chart-card runtime-chart">
         <div class="chart-title">
-          HVAC Runtime History
-          <span class="chart-legend"><span class="legend-dot hvac-heat"></span> Heating</span>
-          <span class="chart-legend"><span class="legend-dot hvac-cool"></span> Cooling</span>
+          HVAC runtime · ${days <= 7 ? "daily" : "weekly"}
+          <span class="chart-legend"><span class="legend-dot hvac-heat"></span> Heating ${hours(totalHeat)}</span>
+          <span class="chart-legend"><span class="legend-dot hvac-cool"></span> Cooling ${hours(totalCool)}</span>
           <div class="range-selector">
-            ${rangeOptions.map(r => `
-              <button class="range-btn ${this._runtimeRange === r ? "active" : ""}" data-range="${r}">${r}d</button>
+            ${[7, 30, 90].map(r => `
+              <button class="range-btn ${days === r ? "active" : ""}" data-range="${r}">${r}d</button>
             `).join("")}
           </div>
         </div>
-        <div class="runtime-bars">
-          ${allData.map(d => {
-            const heatPct = ((d.heating_min || 0) / maxRuntime * 100).toFixed(1);
-            const coolPct = ((d.cooling_min || 0) / maxRuntime * 100).toFixed(1);
-            const dateLabel = new Date(d.date + "T12:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric" });
-            const totalMin = Math.round((d.heating_min || 0) + (d.cooling_min || 0));
-            return `
-              <div class="runtime-bar-col" title="${dateLabel}: ${totalMin} min total">
-                <div class="runtime-bar-stack">
-                  ${heatPct > 0 ? `<div class="runtime-bar heat-bar" style="height:${heatPct}%" title="Heating: ${Math.round(d.heating_min)}m"></div>` : ""}
-                  ${coolPct > 0 ? `<div class="runtime-bar cool-bar" style="height:${coolPct}%" title="Cooling: ${Math.round(d.cooling_min)}m"></div>` : ""}
-                </div>
-                ${d.avg_outdoor != null ? `<div class="runtime-outdoor" style="bottom:${((d.avg_outdoor - 20) / 80 * 100).toFixed(1)}%"></div>` : ""}
-                <div class="runtime-date">${dateLabel.split(" ")[1]}</div>
+        <div class="rt-bars">
+          ${bars.map(b => `
+            <div class="rt-col" title="${b.title}: heating ${hours(b.heat)}, cooling ${hours(b.cool)}${b.outdoor != null ? `, outside avg ${b.outdoor.toFixed(0)}°` : ""}">
+              <div class="rt-stack">
+                ${b.cool > 0 ? `<div class="rt-bar cool-bar" style="height:${(b.cool / max * 100).toFixed(1)}%"></div>` : ""}
+                ${b.heat > 0 ? `<div class="rt-bar heat-bar" style="height:${(b.heat / max * 100).toFixed(1)}%"></div>` : ""}
               </div>
-            `;
-          }).join("")}
+              <div class="rt-label">${b.label}</div>
+              <div class="rt-out">${b.outdoor != null ? b.outdoor.toFixed(0) + "°" : ""}</div>
+            </div>
+          `).join("")}
         </div>
-        ${rd.learned_ramp_minutes ? `<div class="runtime-note">Adaptive lead time: ${rd.learned_ramp_minutes.toFixed(0)} min</div>` : ""}
+        <div class="runtime-note">Bottom row: average outside temperature${rd.learned_ramp_minutes ? ` · adaptive lead time ${rd.learned_ramp_minutes.toFixed(0)} min` : ""}</div>
       </div>
     `;
   }
@@ -2256,104 +2022,25 @@ class GttcPanel extends HTMLElement {
   // ── Main tab bar ──────────────────────────────────────────────────────────
 
   _renderMainTabBar() {
+    const dirty = Object.keys(this._draft || {}).length > 0;
+    const tabs = [
+      { id: "now", icon: "mdi:home-thermometer", label: "Now" },
+      { id: "schedule", icon: "mdi:calendar-clock", label: "Schedule" },
+      { id: "history", icon: "mdi:chart-line", label: "History" },
+      { id: "settings", icon: "mdi:cog", label: dirty ? "Settings •" : "Settings" },
+    ];
     return `
-      <div class="main-tab-bar">
-        <button class="main-tab ${this._activeMainTab === "command" ? "active" : ""}" data-main-tab="command">
-          <ha-icon icon="mdi:view-dashboard"></ha-icon> Command Center
-        </button>
-        <button class="main-tab ${this._activeMainTab === "settings" ? "active" : ""}" data-main-tab="settings">
-          <ha-icon icon="mdi:cog"></ha-icon> Settings
-        </button>
-      </div>
+      <nav class="main-tab-bar">
+        ${tabs.map(t => `
+          <button class="main-tab ${this._activeMainTab === t.id ? "active" : ""}" data-main-tab="${t.id}">
+            <ha-icon icon="${t.icon}"></ha-icon> ${t.label}
+          </button>
+        `).join("")}
+      </nav>
     `;
   }
 
   // ── Status tab ────────────────────────────────────────────────────────────
-
-  _renderStatusTab() {
-    if (this._statusLoading) {
-      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading...</div>`;
-    }
-    if (!this._diagData) {
-      return `
-        <div class="status-error-box">
-          <div class="status-error-msg">
-            <ha-icon icon="mdi:alert-circle-outline"></ha-icon>
-            ${this._statusError
-              ? `Failed to load: <code>${this._statusError}</code><br><small>If this says "unknown_command", restart Home Assistant to register the new API endpoint.</small>`
-              : "No data available."}
-          </div>
-          <button class="btn btn-outline" id="statusRefreshBtn">Retry</button>
-        </div>`;
-    }
-    const d = this._diagData;
-    return `
-      <div class="status-tab">
-        ${this._renderStatCards(d)}
-        ${this._renderTempChart()}
-        <div class="status-row-2">
-          ${this._renderZonesCard(d)}
-          ${this._renderSystemCard(d)}
-        </div>
-        ${this._renderWindowCard(d)}
-        ${this._renderDebugCard(d)}
-        <div class="status-footer">
-          <button class="btn btn-outline" id="statusRefreshBtn">
-            <ha-icon icon="mdi:refresh"></ha-icon> Refresh
-          </button>
-          <span class="status-updated">Updated ${new Date().toLocaleTimeString()}</span>
-        </div>
-      </div>
-    `;
-  }
-
-  _renderStatCards(d) {
-    const hvacIcon = d.hvac_action === "heating" ? "mdi:fire" : d.hvac_action === "cooling" ? "mdi:snowflake" : "mdi:thermometer-check";
-    const hvacLabel = d.hvac_action ? (d.hvac_action.charAt(0).toUpperCase() + d.hvac_action.slice(1)) : "—";
-    const hvacClass = d.hvac_action === "heating" ? "heating" : d.hvac_action === "cooling" ? "cooling" : "";
-
-    const schedEntry = d.current_entry;
-    const entryLabel = schedEntry
-      ? `${this._fmt12(schedEntry.time_start)}–${this._fmt12(schedEntry.time_end)} @ ${this._fmtTemp(this._seasonTemp(schedEntry))}`
-      : "No active entry";
-
-    return `
-      <div class="stat-cards">
-        <div class="stat-card">
-          <div class="stat-icon"><ha-icon icon="mdi:thermometer"></ha-icon></div>
-          <div class="stat-body">
-            <div class="stat-label">Zone Temp</div>
-            <div class="stat-value">${d.current_temp != null ? d.current_temp.toFixed(1) + "°" : "—"}</div>
-            <div class="stat-sub">${d.active_zone_name || "—"}</div>
-          </div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-icon"><ha-icon icon="mdi:target"></ha-icon></div>
-          <div class="stat-body">
-            <div class="stat-label">Goal</div>
-            <div class="stat-value">${d.target_temp != null ? d.target_temp.toFixed(1) + "°" : "—"}</div>
-            <div class="stat-sub">${this._actionReasonLabel(d)}</div>
-          </div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-icon ${hvacClass}"><ha-icon icon="${hvacIcon}"></ha-icon></div>
-          <div class="stat-body">
-            <div class="stat-label">HVAC</div>
-            <div class="stat-value stat-value-md ${hvacClass}">${hvacLabel}</div>
-            <div class="stat-sub">${d.thermostat_action ? "T-stat: " + d.thermostat_action : ""}</div>
-          </div>
-        </div>
-        <div class="stat-card">
-          <div class="stat-icon"><ha-icon icon="mdi:calendar-check"></ha-icon></div>
-          <div class="stat-body">
-            <div class="stat-label">Schedule</div>
-            <div class="stat-value stat-value-sm">${entryLabel}</div>
-            <div class="stat-sub">${d.schedule_enabled ? "Active" : "Disabled"}</div>
-          </div>
-        </div>
-      </div>
-    `;
-  }
 
   _renderTempChart() {
     const hist = this._historyData;
@@ -2652,93 +2339,43 @@ class GttcPanel extends HTMLElement {
     return steps.sort((a, b) => a.tStart - b.tStart);
   }
 
-  _renderZonesCard(d) {
-    return `
-      <div class="status-card">
-        <div class="status-card-title"><ha-icon icon="mdi:home-thermometer"></ha-icon> Zones</div>
-        ${d.zones.map(z => `
-          <div class="zone-row ${z.is_active ? "zone-active" : ""}">
-            <span class="zone-indicator">${z.is_active ? "●" : "○"}</span>
-            <span class="zone-name">${z.name}</span>
-            <span class="zone-temp">${z.current_temp != null ? z.current_temp.toFixed(1) + "°" : "—"}</span>
-            ${z.is_occupied != null ? `<span class="zone-occ">${z.is_occupied ? "occupied" : "vacant"}</span>` : ""}
-          </div>
-        `).join("")}
-      </div>
-    `;
-  }
-
-  _renderSystemCard(d) {
-    const f = d.features;
-    const rows = [
-      ["Learning", d.learning.enabled ? `${d.learning.events_recorded} events · ${d.learning.patterns_learned} patterns` : "Disabled"],
-      ["Presence", f.presence_home != null ? (f.presence_home ? "Home" : "Away") : "—"],
-      ["Outdoor", f.outdoor_temp != null ? f.outdoor_temp.toFixed(1) + "°" : "—"],
-      ["TOU", f.tou_enabled ? (f.tou_rate || "on") : "Disabled"],
-      ["Pre-cond", f.precondition_enabled ? (f.precondition_active ? "Active" : "Standby") : "Disabled"],
-      ["Heat pump", f.heat_pump_detected ? "Yes" : "No"],
-    ];
-    return `
-      <div class="status-card">
-        <div class="status-card-title"><ha-icon icon="mdi:cog"></ha-icon> System</div>
-        <table class="sys-table">
-          ${rows.map(([label, val]) => `
-            <tr><td class="sys-label">${label}</td><td class="sys-val">${val}</td></tr>
-          `).join("")}
-        </table>
-      </div>
-    `;
-  }
-
   _renderDebugCard(d) {
-    const exp = this._debugExpanded;
+    const row = (k, v, mono) => `<div class="debug-row"><span>${k}</span><span class="debug-val ${mono ? "mono" : ""}">${v}</span></div>`;
+    const e = d.current_entry;
     return `
-      <div class="debug-card">
-        <button class="debug-toggle" id="debugToggleBtn">
-          <ha-icon icon="mdi:${exp ? "chevron-down" : "chevron-right"}"></ha-icon>
-          Debug Info
-        </button>
-        ${exp ? `
-          <div class="debug-body">
-            <div class="debug-grid">
-              <div class="debug-section">
-                <div class="debug-section-title">Thermostat</div>
-                <div class="debug-row"><span>Entity</span><span class="debug-val mono">${d.thermostat_entity}</span></div>
-                <div class="debug-row"><span>T-stat reads</span><span class="debug-val">${d.thermostat_temp != null ? d.thermostat_temp.toFixed(1) + "°" : "—"}</span></div>
-                <div class="debug-row"><span>Setpoint sent</span><span class="debug-val">${d.thermostat_setpoint != null ? d.thermostat_setpoint + "°" : "—"}</span></div>
-                <div class="debug-row"><span>T-stat action</span><span class="debug-val">${d.thermostat_action || "—"}</span></div>
-              </div>
-              <div class="debug-section">
-                <div class="debug-section-title">Override</div>
-                <div class="debug-row"><span>Active</span><span class="debug-val">${d.override_active ? "Yes" : "No"}</span></div>
-                ${d.override_active ? `
-                  <div class="debug-row"><span>Target</span><span class="debug-val">${d.override_target_temp}°</span></div>
-                  <div class="debug-row"><span>Remaining</span><span class="debug-val">${d.override_remaining_minutes} min</span></div>
-                ` : ""}
-              </div>
-              <div class="debug-section">
-                <div class="debug-section-title">Schedule</div>
-                <div class="debug-row"><span>Enabled</span><span class="debug-val">${d.schedule_enabled ? "Yes" : "No"}</span></div>
-                ${d.current_entry ? `
-                  <div class="debug-row"><span>Entry</span><span class="debug-val">${d.current_entry.time_start}–${d.current_entry.time_end}</span></div>
-                  <div class="debug-row"><span>Entry goal</span><span class="debug-val">${d.current_entry.target_temp}°</span></div>
-                ` : `<div class="debug-row"><span>Entry</span><span class="debug-val">None</span></div>`}
-              </div>
-              <div class="debug-section">
-                <div class="debug-section-title">Config</div>
-                <div class="debug-row"><span>Temp range</span><span class="debug-val">${d.config.temp_min}° – ${d.config.temp_max}°</span></div>
-                <div class="debug-row"><span>Away temp</span><span class="debug-val">${d.config.away_temp}°</span></div>
-                <div class="debug-row"><span>Override dur.</span><span class="debug-val">${d.config.override_minutes} min</span></div>
-              </div>
+      <details class="debug-card">
+        <summary class="debug-toggle">Diagnostics</summary>
+        <div class="debug-body">
+          <div class="debug-grid">
+            <div class="debug-section">
+              <div class="debug-section-title">Thermostat</div>
+              ${row("Entity", d.thermostat_entity, true)}
+              ${row("Wall reads", d.thermostat_temp != null ? d.thermostat_temp + "°" : "—")}
+              ${row("Setpoint sent", d.thermostat_setpoint != null ? d.thermostat_setpoint + "°" : "—")}
+              ${row("Wall − zone offset", d.zone_offset != null ? (d.zone_offset > 0 ? "+" : "") + d.zone_offset + "°" : "—")}
+              ${row("Wall action", d.thermostat_action || "—")}
             </div>
-            <div class="debug-entities">
-              <div class="debug-section-title">Entity IDs</div>
-              <div class="debug-row"><span>Climate</span><span class="debug-val mono">${d.entity_ids.climate || "—"}</span></div>
-              <div class="debug-row"><span>Zone temp</span><span class="debug-val mono">${d.entity_ids.active_zone_temp || "—"}</span></div>
+            <div class="debug-section">
+              <div class="debug-section-title">Schedule</div>
+              ${row("Enabled", d.schedule_enabled ? "Yes" : "No")}
+              ${row("Block", e ? `${e.time_start}–${e.time_end}` : "None")}
+              ${row("Block goal", e ? `heat ${e.target_temp}° · cool ${e.cooling_temp != null ? e.cooling_temp + "°" : "default"}` : "—")}
+              ${row("Decision", this._reasonLabel(d.hvac_action_reason || "—"))}
+            </div>
+            <div class="debug-section">
+              <div class="debug-section-title">Config</div>
+              ${row("Temp range", `${d.config.temp_min}° – ${d.config.temp_max}°`)}
+              ${row("Away temp", `${d.config.away_temp}°`)}
+              ${row("Override length", `${d.config.override_minutes} min`)}
+            </div>
+            <div class="debug-section">
+              <div class="debug-section-title">Entities</div>
+              ${row("Climate", d.entity_ids?.climate || "—", true)}
+              ${row("Zone temp", d.entity_ids?.active_zone_temp || "—", true)}
             </div>
           </div>
-        ` : ""}
-      </div>
+        </div>
+      </details>
     `;
   }
 
@@ -2786,303 +2423,44 @@ class GttcPanel extends HTMLElement {
   }
 
   _renderSettingsTab() {
-    if (this._settingsLoading) {
-      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading...</div>`;
+    if (this._settingsLoading && !this._settingsData) {
+      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading…</div>`;
     }
     if (!this._settingsData) {
       return `
         <div class="status-error-box">
           <div class="status-error-msg">
             <ha-icon icon="mdi:alert-circle-outline"></ha-icon>
-            ${this._settingsError
-              ? `Failed to load: <code>${this._settingsError}</code>`
-              : "No config data available."}
+            ${this._settingsError ? `Failed to load: <code>${this._settingsError}</code>` : "No config data available."}
           </div>
           <button class="btn btn-outline" id="settingsRetryBtn">Retry</button>
         </div>`;
     }
-    const d = this._settingsData;
+    const sections = this._settingsSections();
+    const cur = sections.find(x => x.id === this._settingsSection) || sections[0];
+    const n = Object.keys(this._draft).length;
     return `
-      <div class="settings-tab">
-        <div class="settings-sections">
-          ${this._renderSettingsSeasonCard(d)}
-          ${this._renderSettingsTemperatureCard(d)}
-          ${this._renderSettingsLearningCard(d)}
-          ${this._renderSettingsOccupancyCard(d)}
-          ${this._renderSettingsEnergyCard(d)}
-          ${this._renderSettingsWindowsCard(d)}
-          ${this._renderSettingsZonesCard(d)}
+      <div class="settings-layout">
+        <nav class="set-nav">
+          ${sections.map(x => {
+            const dirty = x.keys.some(k => this._isDirty(k));
+            return `<button class="set-nav-item ${x.id === cur.id ? "active" : ""}" data-set-section="${x.id}">
+              <ha-icon icon="${x.icon}"></ha-icon><span>${x.label}</span>
+              <span class="set-nav-dot" data-dirty-for="${x.id}" ${dirty ? "" : "hidden"}></span>
+            </button>`;
+          }).join("")}
+        </nav>
+        <div class="set-pane">
+          <h2 class="set-title">${cur.label}</h2>
+          ${this[`_renderSettings_${cur.id}`]()}
         </div>
       </div>
-    `;
-  }
-
-  _renderSettingsSeasonCard(d) {
-    const isHeating = d.season === "heating";
-    const suggestHint = d.suggest_season_switch
-      ? `<div class="settings-hint settings-hint-warn">Switch recommended — opposite-season conditions sustained for ${d.season_conditions_hours}h</div>`
-      : d.season_conditions_hours > 0
-        ? `<div class="settings-hint">Opposite-season conditions: ${d.season_conditions_hours}h / ${d.seasonal_recommend_hours}h threshold</div>`
-        : "";
-    return `
-      <div class="settings-card">
-        <div class="settings-card-title">
-          <ha-icon icon="mdi:weather-partly-cloudy"></ha-icon> Season &amp; Cooling
-        </div>
-        <div class="settings-card-body">
-          <div class="settings-field">
-            <label>Current season: <strong>${isHeating ? "Heating" : "Cooling"}</strong></label>
-            <div class="settings-hint">Switch it from the Heat / Cool control at the top of the page — it applies immediately. The settings below are rules and need Save.</div>
-            ${suggestHint}
-          </div>
-          <div class="settings-field settings-field-toggle">
-            <div>
-              <label>Auto-switch season</label>
-              <div class="settings-hint">Automatically switches heating ↔ cooling once the threshold is reached.</div>
-            </div>
-            <label class="toggle-switch">
-              <input type="checkbox" id="cfg-auto-season-switch" ${d.auto_season_switch ? "checked" : ""} />
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-          <div class="settings-row">
-            <div class="settings-field">
-              <label>Cooling comfort temp (°F)</label>
-              <input type="number" id="cfg-cooling-comfort" value="${d.cooling_comfort}" min="60" max="85" step="0.5" />
-              <div class="settings-hint">Global fallback when no per-entry cooling temp is set.</div>
-            </div>
-            <div class="settings-field">
-              <label>Cooling away temp (°F)</label>
-              <input type="number" id="cfg-cooling-away" value="${d.cooling_away_temp}" min="60" max="90" step="0.5" />
-              <div class="settings-hint">Used when nobody is home during cooling season.</div>
-            </div>
-          </div>
-          <div class="settings-field">
-            <label>Season switch threshold — <strong id="cfg-season-hours-label">${d.seasonal_recommend_hours}</strong>h of sustained opposite-season conditions</label>
-            <input type="range" id="cfg-season-hours-range" min="1" max="48" step="1" value="${d.seasonal_recommend_hours}" />
-          </div>
-        </div>
-        <div class="settings-card-footer">
-          <button class="btn btn-primary" id="saveSeasonBtn">Save</button>
-        </div>
-      </div>
-    `;
-  }
-
-  _renderSettingsTemperatureCard(d) {
-    return `
-      <div class="settings-card">
-        <div class="settings-card-title">
-          <ha-icon icon="mdi:thermometer-lines"></ha-icon> Temperature &amp; Override
-        </div>
-        <div class="settings-card-body">
-          <div class="settings-row">
-            <div class="settings-field">
-              <label>Minimum temperature (°F)</label>
-              <input type="number" id="cfg-temp-min" value="${d.temp_min}" min="32" max="99" step="0.5" />
-            </div>
-            <div class="settings-field">
-              <label>Maximum temperature (°F)</label>
-              <input type="number" id="cfg-temp-max" value="${d.temp_max}" min="33" max="100" step="0.5" />
-            </div>
-            <div class="settings-field">
-              <label>Away temperature (°F)</label>
-              <input type="number" id="cfg-away-temp" value="${d.away_temp}" min="32" max="100" step="0.5" />
-              <div class="settings-hint">Must be within the min/max range.</div>
-            </div>
-          </div>
-          <div class="settings-field">
-            <label>Manual override duration — <strong id="cfg-override-label">${d.manual_override_minutes} min</strong></label>
-            <input type="range" id="cfg-override-range" min="15" max="480" step="15" value="${d.manual_override_minutes}" />
-          </div>
-        </div>
-        <div class="settings-card-footer">
-          <button class="btn btn-primary" id="saveTemperatureBtn">Save</button>
-        </div>
-      </div>
-    `;
-  }
-
-  _renderSettingsLearningCard(d) {
-    return `
-      <div class="settings-card">
-        <div class="settings-card-title">
-          <ha-icon icon="mdi:brain"></ha-icon> Learning
-        </div>
-        <div class="settings-card-body">
-          <div class="settings-field settings-field-toggle">
-            <div>
-              <label>Enable learning engine</label>
-              <div class="settings-hint">Automatically adapts the schedule based on repeated manual overrides.</div>
-            </div>
-            <label class="toggle-switch">
-              <input type="checkbox" id="cfg-learning-enabled" ${d.learning_enabled ? "checked" : ""} />
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-          <div class="settings-field ${d.learning_enabled ? "" : "settings-field-disabled"}">
-            <label>Threshold — <strong id="cfg-learning-label">${d.learning_threshold}</strong> override${d.learning_threshold !== 1 ? "s" : ""} before schedule adapts</label>
-            <input type="range" id="cfg-learning-range" min="2" max="10" step="1" value="${d.learning_threshold}" ${d.learning_enabled ? "" : "disabled"} />
-          </div>
-        </div>
-        <div class="settings-card-footer">
-          <button class="btn btn-primary" id="saveLearningBtn">Save</button>
-        </div>
-      </div>
-    `;
-  }
-
-  _renderSettingsOccupancyCard(d) {
-    const allPersons = d.all_persons || [];
-    const trackedPersons = new Set(d.tracked_persons || []);
-    const showPersons = d.presence_detection !== "occupancy_sensors";
-
-    return `
-      <div class="settings-card">
-        <div class="settings-card-title">
-          <ha-icon icon="mdi:account-check"></ha-icon> Occupancy
-        </div>
-        <div class="settings-card-body">
-          <div class="settings-field settings-field-toggle">
-            <div>
-              <label>Enable occupancy-based control</label>
-              <div class="settings-hint">Sets away temperature when nobody is home.</div>
-            </div>
-            <label class="toggle-switch">
-              <input type="checkbox" id="cfg-occupancy-enabled" ${d.occupancy_enabled ? "checked" : ""} />
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-          <div class="settings-field ${d.occupancy_enabled ? "" : "settings-field-disabled"}">
-            <label>Presence detection mode</label>
-            <select id="cfg-presence-detection" ${d.occupancy_enabled ? "" : "disabled"}>
-              <option value="both" ${d.presence_detection === "both" ? "selected" : ""}>Person entities + Occupancy sensors (Recommended)</option>
-              <option value="person_entities" ${d.presence_detection === "person_entities" ? "selected" : ""}>Person entities only</option>
-              <option value="occupancy_sensors" ${d.presence_detection === "occupancy_sensors" ? "selected" : ""}>Occupancy sensors only</option>
-            </select>
-          </div>
-          <div class="settings-field ${showPersons ? "" : "settings-field-disabled"}" id="person-entities-field">
-            <label>Tracked person entities</label>
-            <div class="settings-hint">
-              Check the people GTTC should monitor. Leave all unchecked to track everyone.
-            </div>
-            ${allPersons.length === 0
-              ? `<div class="person-empty">No person entities found in Home Assistant.</div>`
-              : `<div class="person-list">
-                  ${allPersons.map(p => `
-                    <label class="person-row ${p.is_home ? "person-home" : ""}">
-                      <input type="checkbox" class="person-chk" data-entity="${p.entity_id}"
-                        ${trackedPersons.has(p.entity_id) ? "checked" : ""}
-                        ${!showPersons ? "disabled" : ""} />
-                      <div class="person-info">
-                        <span class="person-name">${p.name}</span>
-                        <span class="person-entity">${p.entity_id}</span>
-                      </div>
-                      <span class="person-badge ${p.is_home ? "person-badge-home" : "person-badge-away"}">
-                        ${p.is_home ? "home" : p.state}
-                      </span>
-                    </label>
-                  `).join("")}
-                </div>`}
-          </div>
-        </div>
-        <div class="settings-card-footer">
-          <button class="btn btn-primary" id="saveOccupancyBtn">Save</button>
-        </div>
-      </div>
-    `;
-  }
-
-  _renderSettingsEnergyCard(d) {
-    return `
-      <div class="settings-card">
-        <div class="settings-card-title">
-          <ha-icon icon="mdi:lightning-bolt-circle"></ha-icon> Energy &amp; Efficiency
-        </div>
-        <div class="settings-card-body">
-          <div class="settings-field settings-field-toggle">
-            <div>
-              <label>Enable pre-conditioning</label>
-              <div class="settings-hint">Starts ramping toward the next schedule entry before it begins.</div>
-            </div>
-            <label class="toggle-switch">
-              <input type="checkbox" id="cfg-precondition-enabled" ${d.precondition_enabled ? "checked" : ""} />
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-          <div class="settings-field settings-field-toggle">
-            <div>
-              <label>Enable TOU rate optimization</label>
-              <div class="settings-hint">Adjusts setpoint during on-peak electricity hours to reduce cost.</div>
-            </div>
-            <label class="toggle-switch">
-              <input type="checkbox" id="cfg-tou-enabled" ${d.tou_enabled ? "checked" : ""} />
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-          <div class="settings-field ${d.tou_enabled ? "" : "settings-field-disabled"}">
-            <label>TOU provider</label>
-            <select id="cfg-tou-provider" ${d.tou_enabled ? "" : "disabled"}>
-              <option value="none" ${d.tou_provider === "none" ? "selected" : ""}>None (disabled)</option>
-              <option value="dominion_virginia" ${d.tou_provider === "dominion_virginia" ? "selected" : ""}>Dominion Energy Virginia</option>
-            </select>
-          </div>
-          <div class="settings-field">
-            <label>Outdoor temperature sensor</label>
-            <input type="text" id="cfg-outdoor-sensor" value="${d.outdoor_temp_sensor || ""}"
-              placeholder="sensor.openweathermap_temperature" spellcheck="false" autocomplete="off" />
-            <div class="settings-hint">Used for heat pump setback optimization. Leave blank to disable.</div>
-          </div>
-        </div>
-        <div class="settings-card-footer">
-          <button class="btn btn-primary" id="saveEnergyBtn">Save</button>
-        </div>
-      </div>
-    `;
-  }
-
-  _renderSettingsWindowsCard(d) {
-    const sensors = d.window_sensors || [];
-    const openSensors = [];
-    // We don't have live sensor states in settings data; Status tab shows live state
-    return `
-      <div class="settings-card win-card">
-        <div class="settings-card-title">
-          <ha-icon icon="mdi:window-open-variant"></ha-icon> Window Sensors
-        </div>
-        <div class="settings-card-body">
-          <div class="settings-field settings-field-toggle">
-            <div>
-              <label>Manually suspend thermostat</label>
-              <div class="settings-hint">Pauses heating/cooling without needing a physical sensor.</div>
-            </div>
-            <label class="toggle-switch">
-              <input type="checkbox" id="winManualChk" ${d.windows_open_override ? "checked" : ""} />
-              <span class="toggle-slider"></span>
-            </label>
-          </div>
-          <div class="settings-field">
-            <label>Window / door contact sensors</label>
-            <div class="win-sensor-list">
-              ${sensors.length === 0
-                ? `<div class="win-empty">No sensors added yet.</div>`
-                : sensors.map(entityId => `
-                    <div class="win-sensor-row">
-                      <ha-icon icon="mdi:window-closed"></ha-icon>
-                      <span class="win-sensor-id">${entityId}</span>
-                      <button class="win-remove-btn" data-window-sensor="${entityId}" title="Remove">
-                        <ha-icon icon="mdi:close"></ha-icon>
-                      </button>
-                    </div>
-                  `).join("")}
-            </div>
-            <div class="win-add-row">
-              <input class="win-input" id="winSensorInput" type="text"
-                placeholder="binary_sensor.bedroom_window" spellcheck="false" autocomplete="off" />
-              <button class="btn btn-sm" id="winAddBtn">Add Sensor</button>
-            </div>
-          </div>
-        </div>
+      ${this._renderEntityDatalists()}
+      <div class="save-bar" id="saveBar" ${n ? "" : "hidden"}>
+        <span id="saveBarText">${this._saveBarText()}</span>
+        <span class="save-bar-sp"></span>
+        <button class="btn btn-outline" id="discardAllBtn">Discard</button>
+        <button class="btn btn-primary" id="saveAllBtn">Save</button>
       </div>
     `;
   }
@@ -3182,7 +2560,7 @@ class GttcPanel extends HTMLElement {
                   `).join("")}
             </div>
             <div class="win-add-row">
-              <input type="text" id="zone-temp-sensor-input" class="win-input"
+              <input type="text" id="zone-temp-sensor-input" class="win-input" list="dl-temp-sensors"
                 placeholder="sensor.living_room_temp" spellcheck="false" autocomplete="off" />
               <button class="btn btn-sm" id="zone-add-temp-sensor">Add</button>
             </div>
@@ -3203,7 +2581,7 @@ class GttcPanel extends HTMLElement {
                   `).join("")}
             </div>
             <div class="win-add-row">
-              <input type="text" id="zone-occ-sensor-input" class="win-input"
+              <input type="text" id="zone-occ-sensor-input" class="win-input" list="dl-occ-sensors"
                 placeholder="binary_sensor.living_room_motion" spellcheck="false" autocomplete="off" />
               <button class="btn btn-sm" id="zone-add-occ-sensor">Add</button>
             </div>
@@ -3225,162 +2603,30 @@ class GttcPanel extends HTMLElement {
 
   _attachSettingsListeners() {
     const root = this.shadowRoot;
-
     this._addClick("settingsRetryBtn", () => this._loadSettingsData());
 
-    // Season section
-    const seasonHoursRange = root.getElementById("cfg-season-hours-range");
-    const seasonHoursLabel = root.getElementById("cfg-season-hours-label");
-    if (seasonHoursRange && seasonHoursLabel) {
-      seasonHoursRange.addEventListener("input", () => {
-        seasonHoursLabel.textContent = seasonHoursRange.value;
-      });
-    }
-    this._addClick("saveSeasonBtn", async () => {
-      const autoSwitch = root.getElementById("cfg-auto-season-switch")?.checked ?? false;
-      const coolingComfort = parseFloat(root.getElementById("cfg-cooling-comfort")?.value);
-      const coolingAway = parseFloat(root.getElementById("cfg-cooling-away")?.value);
-      const seasonHours = parseFloat(root.getElementById("cfg-season-hours-range")?.value);
-      if (isNaN(coolingComfort) || isNaN(coolingAway) || isNaN(seasonHours)) return;
-      try {
-        await this._hass.callWS({ type: "gttc/set_config",
-          auto_season_switch: autoSwitch, cooling_comfort: coolingComfort,
-          cooling_away_temp: coolingAway, seasonal_recommend_hours: seasonHours });
-        this._settingsData = { ...this._settingsData,
-          auto_season_switch: autoSwitch, cooling_comfort: coolingComfort,
-          cooling_away_temp: coolingAway, seasonal_recommend_hours: seasonHours };
-        this._showToast("Season settings saved.");
-      } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
-    });
+    root.querySelectorAll("[data-set-section]").forEach(btn => btn.addEventListener("click", () => {
+      this._settingsSection = btn.dataset.setSection;
+      this._editingZoneId = null;
+      this._zoneFormData = null;
+      this._render();
+    }));
 
-    // Temperature section
-    const overrideRange = root.getElementById("cfg-override-range");
-    const overrideLabel = root.getElementById("cfg-override-label");
-    if (overrideRange && overrideLabel) {
-      overrideRange.addEventListener("input", () => {
-        overrideLabel.textContent = overrideRange.value + " min";
-      });
-    }
-    this._addClick("saveTemperatureBtn", async () => {
-      const tempMin = parseFloat(root.getElementById("cfg-temp-min")?.value);
-      const tempMax = parseFloat(root.getElementById("cfg-temp-max")?.value);
-      const awayTemp = parseFloat(root.getElementById("cfg-away-temp")?.value);
-      const overrideMins = parseInt(root.getElementById("cfg-override-range")?.value);
-      if (isNaN(tempMin) || isNaN(tempMax) || isNaN(awayTemp) || isNaN(overrideMins)) return;
-      if (tempMin >= tempMax) {
-        this._showToast("Min temperature must be less than max.", "error"); return;
-      }
-      if (awayTemp < tempMin || awayTemp > tempMax) {
-        this._showToast("Away temperature must be within min/max range.", "error"); return;
-      }
-      try {
-        await this._hass.callWS({ type: "gttc/set_config",
-          temp_min: tempMin, temp_max: tempMax, away_temp: awayTemp,
-          manual_override_minutes: overrideMins });
-        this._settingsData = { ...this._settingsData,
-          temp_min: tempMin, temp_max: tempMax, away_temp: awayTemp,
-          manual_override_minutes: overrideMins };
-        this._showToast("Temperature settings saved.");
-      } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
+    root.querySelectorAll("[data-cfg]").forEach(el => {
+      el.addEventListener(el.dataset.kind === "bool" ? "change" : "input", () => this._onCfgInput(el));
+      if (el.tagName === "SELECT") el.addEventListener("change", () => this._onCfgInput(el));
     });
+    root.querySelectorAll("[data-cfg-person]").forEach(el => el.addEventListener("change", () => this._onPersonToggle()));
 
-    // Learning section
-    const learningRange = root.getElementById("cfg-learning-range");
-    const learningLabel = root.getElementById("cfg-learning-label");
-    if (learningRange && learningLabel) {
-      learningRange.addEventListener("input", () => {
-        const v = parseInt(learningRange.value);
-        learningLabel.textContent = String(v);
-        // update the suffix text — easier to just update the label
-      });
-    }
-    const learningChk = root.getElementById("cfg-learning-enabled");
-    if (learningChk) {
-      learningChk.addEventListener("change", () => {
-        const field = root.getElementById("cfg-learning-range")?.closest(".settings-field");
-        if (field) field.classList.toggle("settings-field-disabled", !learningChk.checked);
-        if (learningRange) learningRange.disabled = !learningChk.checked;
-      });
-    }
-    this._addClick("saveLearningBtn", async () => {
-      const enabled = root.getElementById("cfg-learning-enabled")?.checked ?? true;
-      const threshold = parseInt(root.getElementById("cfg-learning-range")?.value);
-      if (isNaN(threshold)) return;
-      try {
-        await this._hass.callWS({ type: "gttc/set_config",
-          learning_enabled: enabled, learning_threshold: threshold });
-        this._settingsData = { ...this._settingsData,
-          learning_enabled: enabled, learning_threshold: threshold };
-        this._showToast("Learning settings saved.");
-      } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
-    });
+    this._addClick("saveAllBtn", () => this._saveSettings());
+    this._addClick("discardAllBtn", () => { this._draft = {}; this._render(); });
 
-    // Occupancy section
-    const occChk = root.getElementById("cfg-occupancy-enabled");
-    const presenceSelect = root.getElementById("cfg-presence-detection");
-    const personField = root.getElementById("person-entities-field");
-    const _updatePersonFieldVisibility = () => {
-      const mode = presenceSelect?.value || "both";
-      const showPersons = mode !== "occupancy_sensors";
-      personField?.classList.toggle("settings-field-disabled", !showPersons);
-      root.querySelectorAll(".person-chk").forEach(c => { c.disabled = !showPersons; });
-    };
-    if (occChk) {
-      occChk.addEventListener("change", () => {
-        if (presenceSelect) {
-          presenceSelect.disabled = !occChk.checked;
-          presenceSelect.closest(".settings-field")?.classList.toggle("settings-field-disabled", !occChk.checked);
-        }
-      });
-    }
-    if (presenceSelect) {
-      presenceSelect.addEventListener("change", _updatePersonFieldVisibility);
-    }
-    this._addClick("saveOccupancyBtn", async () => {
-      const enabled = root.getElementById("cfg-occupancy-enabled")?.checked ?? false;
-      const mode = root.getElementById("cfg-presence-detection")?.value || "both";
-      const trackedPersons = [...root.querySelectorAll(".person-chk:checked")].map(c => c.dataset.entity);
-      try {
-        await this._hass.callWS({ type: "gttc/set_config",
-          occupancy_enabled: enabled, presence_detection: mode, tracked_persons: trackedPersons });
-        this._settingsData = { ...this._settingsData,
-          occupancy_enabled: enabled, presence_detection: mode, tracked_persons: trackedPersons };
-        this._showToast("Occupancy settings saved.");
-      } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
-    });
-
-    // Energy section
-    const touChk = root.getElementById("cfg-tou-enabled");
-    if (touChk) {
-      touChk.addEventListener("change", () => {
-        const providerField = root.getElementById("cfg-tou-provider");
-        if (providerField) {
-          providerField.disabled = !touChk.checked;
-          providerField.closest(".settings-field")?.classList.toggle("settings-field-disabled", !touChk.checked);
-        }
-      });
-    }
-    this._addClick("saveEnergyBtn", async () => {
-      const precondition = root.getElementById("cfg-precondition-enabled")?.checked ?? true;
-      const touEnabled = root.getElementById("cfg-tou-enabled")?.checked ?? false;
-      const touProvider = root.getElementById("cfg-tou-provider")?.value || "none";
-      const outdoorSensor = root.getElementById("cfg-outdoor-sensor")?.value.trim() || "";
-      try {
-        await this._hass.callWS({ type: "gttc/set_config",
-          precondition_enabled: precondition, tou_enabled: touEnabled,
-          tou_provider: touProvider, outdoor_temp_sensor: outdoorSensor });
-        this._settingsData = { ...this._settingsData,
-          precondition_enabled: precondition, tou_enabled: touEnabled,
-          tou_provider: touProvider, outdoor_temp_sensor: outdoorSensor };
-        this._showToast("Energy settings saved.");
-      } catch (err) { this._showToast(err.message || "Failed to save.", "error"); }
-    });
-
-    // Windows section
+    // ── Windows (immediate) ────────────────────────────────────────────────
     this._addClick("winAddBtn", async () => {
       const input = root.getElementById("winSensorInput");
       const entityId = input ? input.value.trim() : "";
       if (!entityId) return;
+      if (!this._hass.states[entityId]) { this._showToast(`${entityId} does not exist in Home Assistant.`, "error"); return; }
       try {
         await this._hass.callWS({ type: "gttc/add_window_sensor", entity_id: entityId });
         await this._loadSettingsData();
@@ -3390,7 +2636,6 @@ class GttcPanel extends HTMLElement {
     root.querySelectorAll("[data-window-sensor]").forEach(btn => {
       btn.addEventListener("click", async () => {
         const entityId = btn.dataset.windowSensor;
-        if (!entityId) return;
         try {
           await this._hass.callWS({ type: "gttc/remove_window_sensor", entity_id: entityId });
           await this._loadSettingsData();
@@ -3405,13 +2650,667 @@ class GttcPanel extends HTMLElement {
           await this._hass.callService("switch", winChk.checked ? "turn_on" : "turn_off", {
             entity_id: "switch.gttc_windows_open",
           });
-          if (this._settingsData) {
-            this._settingsData = { ...this._settingsData, windows_open_override: winChk.checked };
-          }
-          this._showToast(winChk.checked ? "Thermostat suspended." : "Suspension lifted.");
+          this._settingsData = { ...this._settingsData, windows_open_override: winChk.checked };
+          this._showToast(winChk.checked ? "HVAC paused." : "HVAC resumed.");
         } catch (err) { this._showToast(err.message || "Failed.", "error"); }
       });
     }
+
+    this._attachZoneListeners();
+  }
+
+  _syncZoneFormFromDOM() {
+    const root = this.shadowRoot;
+    const zones = this._settingsData?.zones || [];
+    const existing = this._editingZoneId === "new" ? null : zones.find(z => z.id === this._editingZoneId);
+    if (!this._zoneFormData) {
+      this._zoneFormData = {
+        sensor_entities: [...(existing?.sensor_entities || [])],
+        occupancy_sensor_entities: [...(existing?.occupancy_sensor_entities || [])],
+      };
+    }
+    const nameEl = root.getElementById("zone-form-name");
+    if (nameEl) this._zoneFormData.name = nameEl.value;
+    const awayEl = root.getElementById("zone-form-away-temp");
+    if (awayEl) this._zoneFormData.away_temp = awayEl.value;
+  }
+
+  _fmt12(timeStr) {
+    const [h, m] = timeStr.split(":").map(Number);
+    const ampm = h >= 12 ? "PM" : "AM";
+    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
+    return `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
+  }
+
+  // ── Styles ────────────────────────────────────────────────────────────────
+
+  _renderNowTab() {
+    const d = this._diagData;
+    if (!d) {
+      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading…</div>`;
+    }
+    return `
+      <div class="now-grid">
+        ${this._renderNowHero(d)}
+        ${this._renderNowActions(d)}
+        ${this._renderTodayStrip()}
+      </div>
+    `;
+  }
+
+  _goalWhy(d) {
+    const e = d.current_entry;
+    switch (d.hvac_action_reason) {
+      case "schedule":
+        return e ? `Schedule · ${this._fmt12(e.time_start)}–${this._fmt12(e.time_end)} block` : "Schedule";
+      case "precondition": return "Pre-conditioning for the next block";
+      case "occupancy_away": return "Nobody home — away setback";
+      case "tou_adjustment": return "Peak-rate adjustment";
+      case "heat_pump_step": return "Heat pump stepping up";
+      case "fan_precool": return "Fan pre-cooling before the AC";
+      case "fallback": return "No schedule block — fallback";
+      default: return d.schedule_enabled ? "Schedule" : "Schedule off";
+    }
+  }
+
+  _renderNowBanners(d) {
+    const banners = [];
+    if (d.override_active) {
+      const physical = d.override_source === "physical";
+      const resume = d.schedule_enabled && d.current_entry ? this._seasonTemp(d.current_entry) : null;
+      banners.push(`
+        <div class="now-banner banner-hold">
+          <ha-icon icon="${physical ? "mdi:hand-back-right" : "mdi:clock-edit"}"></ha-icon>
+          <span><b>${physical ? "Held at the thermostat" : `Override ${d.override_target_temp}°`}</b>
+            · ${d.override_remaining_minutes} min left${resume != null ? `, then back to ${resume}°` : ""}</span>
+          <button class="btn btn-sm js-cancel-override">Resume schedule</button>
+        </div>`);
+    }
+    if (d.vacation_mode) {
+      const vm = d.vacation_mode;
+      const until = new Date(vm.end_dt).toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+      banners.push(`
+        <div class="now-banner banner-vacation">
+          <ha-icon icon="mdi:airplane"></ha-icon>
+          <span><b>${vm.label || "Vacation"}</b> · holding ${vm.setback_temp}° until ${until}</span>
+          <button class="btn btn-sm" id="clearVacationBtn">End vacation</button>
+        </div>`);
+    }
+    const w = d.windows || {};
+    if (w.open || w.manual_override) {
+      banners.push(`
+        <div class="now-banner banner-windows">
+          <ha-icon icon="mdi:window-open-variant"></ha-icon>
+          <span><b>HVAC paused</b> · ${w.manual_override && !w.open
+            ? "suspended by hand"
+            : `${w.open_sensors.length} window${w.open_sensors.length !== 1 ? "s" : ""} open`}</span>
+          <button class="btn btn-sm js-window-settings">Manage</button>
+        </div>`);
+    }
+    return banners.join("");
+  }
+
+  _renderNowHero(d) {
+    const action = d.hvac_action;
+    const actionLabel = action ? action.charAt(0).toUpperCase() + action.slice(1) : "—";
+    const banners = this._renderNowBanners(d);
+    const zones = d.zones || [];
+    const outdoor = d.features?.outdoor_temp;
+    return `
+      <section class="now-card now-hero">
+        <div class="eyebrow">${d.active_zone_name || "Active zone"} · active zone</div>
+        <div class="hero-row">
+          <div class="hero-temp">${d.current_temp != null ? d.current_temp.toFixed(1) : "—"}<small>°</small></div>
+          <div class="hero-goal">
+            <span class="hero-goal-num">→ ${d.target_temp != null ? d.target_temp.toFixed(1) + "°" : "—"}</span>
+            ${banners ? "" : `<span class="hero-why">${this._goalWhy(d)}</span>`}
+            <span class="hero-action ${action === "heating" ? "is-heat" : action === "cooling" ? "is-cool" : ""}">${actionLabel}</span>
+          </div>
+        </div>
+        ${banners}
+        <div class="rooms">
+          ${zones.map(z => `
+            <button class="room ${z.is_active ? "room-active" : ""}" data-now-zone="${z.id}" ${z.is_active ? "disabled" : ""}
+                    title="${z.is_active ? "Active zone" : "Make this the active zone"}">
+              <span class="room-name">${z.name}</span>
+              <span class="room-temp">${z.current_temp != null ? z.current_temp.toFixed(1) + "°" : "—"}</span>
+            </button>`).join("")}
+          <div class="room room-outside">
+            <span class="room-name">Outside</span>
+            <span class="room-temp">${outdoor != null ? outdoor.toFixed(1) + "°" : "—"}</span>
+          </div>
+        </div>
+      </section>
+    `;
+  }
+
+  _renderNowActions(d) {
+    const f = d.features || {};
+    const w = d.windows || {};
+    const boosts = this._isCooling()
+      ? [
+          { id: "max_cool", big: "−4°", sub: "Max cool · 90 min", cls: "tile-cool" },
+          { id: "cool_down", big: "−3°", sub: "Cool down · 60 min", cls: "tile-cool" },
+        ]
+      : [
+          { id: "boost", big: "+4°", sub: "Boost · 90 min", cls: "tile-heat" },
+          { id: "warm_up", big: "+3°", sub: "Warm up · 60 min", cls: "tile-heat" },
+        ];
+    const chips = [
+      { id: "schedule", label: "Schedule", on: !!d.schedule_enabled },
+      { id: "learning", label: d.learning?.patterns_learned ? `Learning · ${d.learning.patterns_learned} patterns` : "Learning", on: !!d.learning?.enabled },
+      { id: "occupancy", label: "Presence", on: !!f.occupancy_enabled },
+      { id: "tou", label: "Peak rates", on: !!f.tou_enabled },
+      { id: "precondition", label: f.precondition_active ? "Pre-condition · running" : "Pre-condition", on: !!f.precondition_enabled },
+      { id: "windows", label: "Pause HVAC", on: !!w.manual_override },
+    ];
+    return `
+      <section class="now-card now-actions">
+        <div class="eyebrow">Quick actions</div>
+        <div class="action-tiles">
+          ${boosts.map(b => `
+            <button class="action-tile ${b.cls} boost-btn" data-boost-type="${b.id}">
+              <b>${b.big}</b><span>${b.sub}</span>
+            </button>`).join("")}
+          ${d.vacation_mode ? "" : `
+            <button class="action-tile" id="setVacationBtn">
+              <b><ha-icon icon="mdi:airplane"></ha-icon></b><span>Vacation…</span>
+            </button>`}
+        </div>
+        <div class="eyebrow">Automations · tap to switch</div>
+        <div class="auto-chips">
+          ${chips.map(c => `
+            <button class="auto-chip ${c.on ? "chip-on" : "chip-off"}" data-auto-toggle="${c.id}" data-on="${c.on ? 1 : 0}"
+                    aria-pressed="${c.on}">${c.label}</button>`).join("")}
+        </div>
+      </section>
+    `;
+  }
+
+  _renderTodayStrip() {
+    const today = DAYS_ORDERED[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
+    const entries = this._getEntriesForDay(today);
+    const s = this._schedule;
+    const label = s.active_preset ? (s.preset_labels?.[s.active_preset] || s.active_preset) : "Base fallback";
+    return `
+      <section class="now-card now-today">
+        <div class="today-head">
+          <div class="eyebrow">Today · ${DAY_LABELS_FULL[today]} · ${label} · ${this._isCooling() ? "cooling" : "heating"} targets</div>
+          <button class="btn btn-outline btn-sm" id="goScheduleBtn">Edit schedule</button>
+        </div>
+        <div class="week-row-timeline today-timeline">
+          ${this._renderOnPeakOverlay(today)}
+          ${this._renderTimelineBlocks(entries, today, true)}
+          <div class="now-line" style="left:${this._nowPercent()}%"></div>
+        </div>
+        <div class="today-axis">
+          <span style="left:0">12a</span><span style="left:25%">6a</span><span style="left:50%">12p</span>
+          <span style="left:75%">6p</span><span style="left:100%">12a</span>
+        </div>
+      </section>
+    `;
+  }
+
+  _renderScheduleTab() {
+    const s = this._schedule;
+    const label = s.active_preset ? (s.preset_labels?.[s.active_preset] || s.active_preset) : "Base fallback";
+    return `
+      <div class="schedule-section">
+        <div class="schedule-section-header">
+          <div class="section-label"><ha-icon icon="mdi:calendar-clock"></ha-icon> ${label} schedule</div>
+          <div class="schedule-controls-row">
+            ${this._renderUndoRedo()}
+            ${this._renderScheduleMode()}
+            ${this._renderPresetSelector()}
+            ${this._renderToolbar()}
+          </div>
+        </div>
+        <div class="schedule-section-body">
+          <div class="day-tabs">
+            ${DAYS_ORDERED.map(day => `
+              <button class="day-tab ${day === this._selectedDay ? "active" : ""}" data-day="${day}">
+                <span class="day-short">${DAY_LABELS[day]}</span>
+              </button>
+            `).join("")}
+          </div>
+          <div class="schedule-view">
+            ${this._renderWeekOverview()}
+            ${this._renderDayDetail()}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderHistoryTab() {
+    const d = this._diagData;
+    return `
+      <div class="history-tab">
+        ${this._renderTempChart()}
+        ${this._renderRuntimeChart()}
+        <div class="history-row">
+          ${this._renderActionLog()}
+          ${d ? this._renderLearningCard(d) : ""}
+        </div>
+        ${d ? this._renderDebugCard(d) : ""}
+      </div>
+    `;
+  }
+
+  async _loadActionLog() {
+    try {
+      this._actionLog = await this._hass.callWS({ type: "gttc/get_action_log", limit: 200 });
+    } catch (err) {
+      this._actionLog = { error: err.message || String(err) };
+    }
+    if (this._activeMainTab === "history") this._repaint();
+  }
+
+  _reasonLabel(reason) {
+    return ({
+      schedule: "Schedule", manual_override: "Override", physical_override: "Thermostat hold",
+      vacation: "Vacation", occupancy_away: "Nobody home", precondition: "Pre-conditioning",
+      tou_adjustment: "Peak-rate adjustment", heat_pump_step: "Heat pump step",
+      fan_precool: "Fan pre-cool", window_open: "Windows open", fallback: "Fallback",
+    })[reason] || reason;
+  }
+
+  _renderActionLog() {
+    const al = this._actionLog;
+    let body;
+    if (!al) {
+      body = `<div class="chart-empty">Loading…</div>`;
+    } else if (al.error) {
+      body = `<div class="chart-empty">Could not load the log: ${al.error}</div>`;
+    } else if (!al.log || al.log.length === 0) {
+      body = `<div class="chart-empty">No decisions recorded since Home Assistant started.</div>`;
+    } else {
+      // Collapse consecutive identical decisions into runs, newest first.
+      const runs = [];
+      for (const e of al.log) {
+        if (!e || isNaN(new Date(e.ts).getTime())) continue;
+        const last = runs[runs.length - 1];
+        if (last && last.reason === e.reason && last.target_temp === e.target_temp) continue;
+        runs.push({ ts: e.ts, reason: e.reason, target_temp: e.target_temp });
+      }
+      const now = Date.now();
+      const today = new Date().toDateString();
+      body = `<ol class="log-list">${runs.map((r, i) => {
+        const t = new Date(r.ts);
+        const end = i < runs.length - 1 ? new Date(runs[i + 1].ts).getTime() : now;
+        const mins = Math.max(0, Math.round((end - t.getTime()) / 60000));
+        const dur = mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`;
+        const when = t.toDateString() === today
+          ? t.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+          : t.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+        return `<li class="log-row ${i === runs.length - 1 ? "log-current" : ""}">
+          <span class="log-when">${when}</span>
+          <span class="log-reason">${this._reasonLabel(r.reason)}</span>
+          <span class="log-temp">${r.target_temp}°</span>
+          <span class="log-dur">${i === runs.length - 1 ? `${dur} so far` : dur}</span>
+        </li>`;
+      }).reverse().slice(0, 40).join("")}</ol>`;
+    }
+    return `
+      <div class="chart-card log-card">
+        <div class="chart-title">Why the goal changed</div>
+        ${body}
+      </div>
+    `;
+  }
+
+  _renderLearningCard(d) {
+    const rd = this._runtimeData;
+    const rows = [
+      ["Learning", d.learning?.enabled ? "On" : "Off"],
+      ["Patterns learned", d.learning?.patterns_learned ?? "—"],
+      ["Changes recorded", d.learning?.events_recorded ?? "—"],
+      ["Adaptive lead time", rd?.learned_ramp_minutes ? `${rd.learned_ramp_minutes.toFixed(0)} min` : "—"],
+      ["Heat pump", d.features?.heat_pump_detected ? "Detected" : "Not detected"],
+    ];
+    return `
+      <div class="chart-card learn-card">
+        <div class="chart-title">What GTTC has learned</div>
+        <table class="sys-table">
+          ${rows.map(([k, v]) => `<tr><td class="sys-label">${k}</td><td class="sys-val">${v}</td></tr>`).join("")}
+        </table>
+      </div>
+    `;
+  }
+
+  _settingsSections() {
+    return [
+      { id: "season", label: "Season rules", icon: "mdi:weather-partly-cloudy",
+        keys: ["auto_season_switch", "seasonal_recommend_hours", "cooling_comfort", "cooling_away_temp"] },
+      { id: "temps", label: "Temperatures", icon: "mdi:thermometer-lines",
+        keys: ["temp_min", "temp_max", "away_temp", "manual_override_minutes"] },
+      { id: "presence", label: "Presence", icon: "mdi:account-check",
+        keys: ["occupancy_enabled", "presence_detection", "tracked_persons"] },
+      { id: "energy", label: "Energy", icon: "mdi:lightning-bolt-circle",
+        keys: ["precondition_enabled", "tou_enabled", "tou_provider", "outdoor_temp_sensor"] },
+      { id: "learning", label: "Learning", icon: "mdi:brain",
+        keys: ["learning_enabled", "learning_threshold"] },
+      { id: "windows", label: "Windows", icon: "mdi:window-open-variant", keys: [] },
+      { id: "zones", label: "Zones", icon: "mdi:map-marker-radius", keys: [] },
+    ];
+  }
+
+  _cfg(key) {
+    return Object.prototype.hasOwnProperty.call(this._draft, key) ? this._draft[key] : this._settingsData?.[key];
+  }
+
+  _isDirty(key) {
+    return Object.prototype.hasOwnProperty.call(this._draft, key);
+  }
+
+  _row(key, label, hint, control, opts = {}) {
+    const off = opts.depends && !this._cfg(opts.depends);
+    return `
+      <div class="set-row ${this._isDirty(key) ? "set-row-dirty" : ""} ${off ? "set-row-off" : ""}"
+           data-row="${key}" ${opts.depends ? `data-depends="${opts.depends}"` : ""}>
+        <div class="set-text">
+          <label for="cfg-${key}">${label}</label>
+          ${hint ? `<div class="settings-hint">${hint}</div>` : ""}
+        </div>
+        <div class="set-control">${control}</div>
+      </div>`;
+  }
+
+  _numField(key, label, hint, { min, max, step = 0.5, unit = "°F", depends } = {}) {
+    const v = this._cfg(key);
+    const off = depends && !this._cfg(depends);
+    return this._row(key, label, hint, `
+      <input type="number" class="set-num" id="cfg-${key}" data-cfg="${key}" data-kind="num"
+             value="${v ?? ""}" min="${min}" max="${max}" step="${step}" ${off ? "disabled" : ""}>
+      <span class="set-unit">${unit}</span>`, { depends });
+  }
+
+  _rangeField(key, label, hint, { min, max, step = 1, suffix = "", depends } = {}) {
+    const v = this._cfg(key);
+    const off = depends && !this._cfg(depends);
+    return this._row(key, label, hint, `
+      <input type="range" class="set-range" id="cfg-${key}" data-cfg="${key}" data-kind="num" data-suffix="${suffix}"
+             value="${v}" min="${min}" max="${max}" step="${step}" ${off ? "disabled" : ""}>
+      <output class="set-out" id="cfg-${key}-out">${v}${suffix}</output>`, { depends });
+  }
+
+  _boolField(key, label, hint) {
+    return this._row(key, label, hint, `
+      <label class="toggle-switch">
+        <input type="checkbox" id="cfg-${key}" data-cfg="${key}" data-kind="bool" ${this._cfg(key) ? "checked" : ""}>
+        <span class="toggle-slider"></span>
+      </label>`);
+  }
+
+  _selectField(key, label, hint, options, { depends } = {}) {
+    const v = this._cfg(key);
+    const off = depends && !this._cfg(depends);
+    return this._row(key, label, hint, `
+      <select class="set-select" id="cfg-${key}" data-cfg="${key}" data-kind="str" ${off ? "disabled" : ""}>
+        ${options.map(([val, text]) => `<option value="${val}" ${v === val ? "selected" : ""}>${text}</option>`).join("")}
+      </select>`, { depends });
+  }
+
+  _entityReading(entityId) {
+    if (!entityId) return "";
+    const st = this._hass?.states?.[entityId];
+    if (!st) return `<span class="ent-missing">not found</span>`;
+    const unit = st.attributes?.unit_of_measurement || "";
+    return `${st.attributes?.friendly_name || entityId} · ${st.state}${unit}`;
+  }
+
+  _entityOptions(domain, deviceClasses) {
+    const states = this._hass?.states || {};
+    return Object.keys(states)
+      .filter(id => id.startsWith(domain + ".") && (!deviceClasses || deviceClasses.includes(states[id].attributes?.device_class)))
+      .sort()
+      .map(id => `<option value="${id}">${states[id].attributes?.friendly_name || ""}</option>`)
+      .join("");
+  }
+
+  _renderEntityDatalists() {
+    return `
+      <datalist id="dl-temp-sensors">${this._entityOptions("sensor", ["temperature"])}</datalist>
+      <datalist id="dl-window-sensors">${this._entityOptions("binary_sensor", ["window", "door", "opening", "garage_door"])}</datalist>
+      <datalist id="dl-occ-sensors">${this._entityOptions("binary_sensor", ["occupancy", "motion", "presence"])}</datalist>
+    `;
+  }
+
+  _saveBarText() {
+    const keys = Object.keys(this._draft);
+    const where = this._settingsSections().filter(x => x.keys.some(k => keys.includes(k))).map(x => x.label);
+    return `${keys.length} unsaved change${keys.length !== 1 ? "s" : ""}${where.length ? ` · ${where.join(", ")}` : ""}`;
+  }
+
+  _settingsClampWarning(key, label) {
+    const off = this._diagData?.zone_offset;
+    const v = this._cfg(key);
+    const max = this._cfg("temp_max");
+    const min = this._cfg("temp_min");
+    if (off == null || v == null || isNaN(v)) return "";
+    const wall = v + off;
+    const cap = wall > max ? max : wall < min ? min : null;
+    if (cap == null || Math.abs(wall - cap) < 0.25) return "";
+    const settles = Math.round((cap - off) * 10) / 10;
+    return `<div class="set-warn">⚠ ${label} ${v}° needs ${wall.toFixed(1)}° at the wall (offset ${off > 0 ? "+" : ""}${off}°),
+      but the wall is capped at ${cap}°. ${this._diagData.active_zone_name || "The active zone"} will settle near ${settles}°.</div>`;
+  }
+
+  _renderSettings_season() {
+    const d = this._settingsData;
+    return `
+      <p class="set-lede">Currently <b>${d.season === "cooling" ? "cooling" : "heating"}</b>. Switch season with the Heat / Cool control above — it applies immediately. These are the rules for when GTTC recommends or makes the switch itself.</p>
+      ${this._boolField("auto_season_switch", "Switch automatically",
+        "Switch to the other season once the threshold below is reached. Off: GTTC only recommends.")}
+      ${this._rangeField("seasonal_recommend_hours", "Hours before recommending a switch",
+        "Outdoor must stay past indoor (by the switch margin) this long. A reversal resets the count.",
+        { min: 1, max: 48, step: 1, suffix: "h" })}
+      ${this._numField("cooling_comfort", "Cooling comfort", "Used by schedule blocks that have no cooling target of their own.", { min: 60, max: 85 })}
+      ${this._settingsClampWarning("cooling_comfort", "Cooling comfort")}
+      ${this._numField("cooling_away_temp", "Cooling away", "Used when nobody is home in cooling season.", { min: 60, max: 90 })}
+      ${this._settingsClampWarning("cooling_away_temp", "Cooling away")}
+    `;
+  }
+
+  _renderSettings_temps() {
+    return `
+      ${this._numField("temp_min", "Minimum", "GTTC never sends the wall unit a setpoint below this.", { min: 32, max: 99 })}
+      ${this._numField("temp_max", "Maximum", "…or above this. The cap applies after the zone offset is added.", { min: 33, max: 100 })}
+      ${this._numField("away_temp", "Heating away", "Used when nobody is home in heating season. Must sit between min and max.", { min: 32, max: 100 })}
+      ${this._rangeField("manual_override_minutes", "Hold length",
+        "How long a change at the wall or a panel override holds before the schedule takes back over.",
+        { min: 15, max: 480, step: 15, suffix: " min" })}
+    `;
+  }
+
+  _renderSettings_presence() {
+    const d = this._settingsData;
+    const persons = d.all_persons || [];
+    const tracked = new Set(this._cfg("tracked_persons") || []);
+    const personsOff = !this._cfg("occupancy_enabled") || this._cfg("presence_detection") === "occupancy_sensors";
+    return `
+      ${this._boolField("occupancy_enabled", "Use presence", "Drop to the away temperature when nobody is home.")}
+      ${this._selectField("presence_detection", "Detect presence with", "", [
+        ["both", "People and occupancy sensors"],
+        ["person_entities", "People only"],
+        ["occupancy_sensors", "Occupancy sensors only"],
+      ], { depends: "occupancy_enabled" })}
+      <div class="set-row ${this._isDirty("tracked_persons") ? "set-row-dirty" : ""} ${personsOff ? "set-row-off" : ""}" data-row="tracked_persons" data-persons>
+        <div class="set-text">
+          <label>People to track</label>
+          <div class="settings-hint">None ticked tracks everyone.</div>
+        </div>
+        <div class="set-control set-control-list">
+          ${persons.length === 0 ? `<span class="settings-hint">No person entities in Home Assistant.</span>` : persons.map(p => `
+            <label class="person-row">
+              <input type="checkbox" data-cfg-person="${p.entity_id}" ${tracked.has(p.entity_id) ? "checked" : ""} ${personsOff ? "disabled" : ""}>
+              <span class="person-name">${p.name}</span>
+              <span class="person-badge ${p.is_home ? "person-badge-home" : "person-badge-away"}">${p.is_home ? "home" : p.state}</span>
+            </label>`).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSettings_energy() {
+    const sensor = this._cfg("outdoor_temp_sensor") || "";
+    return `
+      ${this._boolField("precondition_enabled", "Pre-condition", "Start moving toward the next block early, using the learned lead time.")}
+      ${this._boolField("tou_enabled", "Peak-rate optimisation", "Shift the setpoint during on-peak electricity hours.")}
+      ${this._selectField("tou_provider", "Rate plan", "", [
+        ["none", "None"],
+        ["dominion_virginia", "Dominion Energy Virginia"],
+      ], { depends: "tou_enabled" })}
+      ${this._row("outdoor_temp_sensor", "Outdoor temperature sensor",
+        "Drives the season recommendation, fan pre-cool and heat-pump setback. Blank disables them.", `
+        <input type="text" class="set-entity" id="cfg-outdoor_temp_sensor" data-cfg="outdoor_temp_sensor" data-kind="entity"
+               list="dl-temp-sensors" value="${sensor}" placeholder="sensor.outside_temperature" spellcheck="false" autocomplete="off">
+        <span class="set-reading" id="cfg-outdoor_temp_sensor-state">${this._entityReading(sensor)}</span>`)}
+    `;
+  }
+
+  _renderSettings_learning() {
+    const v = this._cfg("learning_threshold");
+    return `
+      ${this._boolField("learning_enabled", "Learn from changes", "Rewrite a schedule block after the same change is made to it repeatedly.")}
+      ${this._rangeField("learning_threshold", "Changes before a block adapts", `Currently ${v} repeats.`,
+        { min: 2, max: 10, step: 1, suffix: "×", depends: "learning_enabled" })}
+    `;
+  }
+
+  _renderSettings_windows() {
+    const d = this._settingsData;
+    const sensors = d.window_sensors || [];
+    return `
+      <p class="set-lede">Changes in this section apply immediately.</p>
+      <div class="set-row">
+        <div class="set-text">
+          <label for="winManualChk">Pause HVAC by hand</label>
+          <div class="settings-hint">Parks the thermostat as if a window were open, until you switch it back.</div>
+        </div>
+        <div class="set-control">
+          <label class="toggle-switch">
+            <input type="checkbox" id="winManualChk" ${d.windows_open_override ? "checked" : ""}>
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+      <div class="set-row set-row-stack">
+        <div class="set-text">
+          <label for="winSensorInput">Window and door sensors</label>
+          <div class="settings-hint">Any one open pauses heating and cooling.</div>
+        </div>
+        <div class="win-sensor-list">
+          ${sensors.length === 0 ? `<div class="win-empty">No sensors added yet.</div>` : sensors.map(id => `
+            <div class="win-sensor-row">
+              <ha-icon icon="mdi:window-closed"></ha-icon>
+              <span class="win-sensor-id">${id}</span>
+              <span class="set-reading">${this._entityReading(id)}</span>
+              <button class="win-remove-btn" data-window-sensor="${id}" title="Remove">
+                <ha-icon icon="mdi:close"></ha-icon>
+              </button>
+            </div>`).join("")}
+        </div>
+        <div class="win-add-row">
+          <input class="win-input" id="winSensorInput" type="text" list="dl-window-sensors"
+                 placeholder="binary_sensor.bedroom_window" spellcheck="false" autocomplete="off">
+          <button class="btn btn-sm" id="winAddBtn">Add sensor</button>
+        </div>
+      </div>
+    `;
+  }
+
+  _renderSettings_zones() {
+    return `
+      <p class="set-lede">Zones save on their own — each has its own Save.</p>
+      ${this._renderSettingsZonesCard(this._settingsData)}
+    `;
+  }
+
+  _onCfgInput(el) {
+    const key = el.dataset.cfg;
+    const kind = el.dataset.kind;
+    let v;
+    if (kind === "bool") v = el.checked;
+    else if (kind === "num") v = el.value === "" ? NaN : parseFloat(el.value);
+    else v = el.value.trim();
+    const orig = this._settingsData?.[key];
+    const same = kind === "num" ? Number(orig) === v : orig === v || (orig == null && v === "");
+    if (same) delete this._draft[key];
+    else this._draft[key] = v;
+
+    const root = this.shadowRoot;
+    const out = root.getElementById(`cfg-${key}-out`);
+    if (out) out.textContent = `${el.value}${el.dataset.suffix || ""}`;
+    const row = root.querySelector(`[data-row="${key}"]`);
+    if (row) row.classList.toggle("set-row-dirty", !same);
+    if (kind === "bool") {
+      root.querySelectorAll(`[data-depends="${key}"]`).forEach(r => {
+        r.classList.toggle("set-row-off", !v);
+        r.querySelectorAll("input, select").forEach(i => { i.disabled = !v; });
+      });
+    }
+    if (key === "occupancy_enabled" || key === "presence_detection") {
+      const off = !this._cfg("occupancy_enabled") || this._cfg("presence_detection") === "occupancy_sensors";
+      const pr = root.querySelector("[data-persons]");
+      if (pr) {
+        pr.classList.toggle("set-row-off", off);
+        pr.querySelectorAll("input").forEach(i => { i.disabled = off; });
+      }
+    }
+    if (kind === "entity") {
+      const r = root.getElementById(`cfg-${key}-state`);
+      if (r) r.innerHTML = this._entityReading(v);
+    }
+    this._updateSaveBar();
+  }
+
+  _onPersonToggle() {
+    const picked = [...this.shadowRoot.querySelectorAll("[data-cfg-person]:checked")].map(c => c.dataset.cfgPerson).sort();
+    const orig = [...(this._settingsData?.tracked_persons || [])].sort();
+    const same = JSON.stringify(picked) === JSON.stringify(orig);
+    if (same) delete this._draft.tracked_persons;
+    else this._draft.tracked_persons = picked;
+    const row = this.shadowRoot.querySelector('[data-row="tracked_persons"]');
+    if (row) row.classList.toggle("set-row-dirty", !same);
+    this._updateSaveBar();
+  }
+
+  _updateSaveBar() {
+    const root = this.shadowRoot;
+    const n = Object.keys(this._draft).length;
+    const bar = root.getElementById("saveBar");
+    if (bar) bar.hidden = n === 0;
+    const text = root.getElementById("saveBarText");
+    if (text) text.textContent = this._saveBarText();
+    for (const x of this._settingsSections()) {
+      const dot = root.querySelector(`[data-dirty-for="${x.id}"]`);
+      if (dot) dot.hidden = !x.keys.some(k => this._isDirty(k));
+    }
+    const tab = root.querySelector('[data-main-tab="settings"]');
+    if (tab) tab.lastChild.textContent = n ? " Settings •" : " Settings";
+  }
+
+  async _saveSettings() {
+    const draft = { ...this._draft };
+    const bad = Object.entries(draft).filter(([, v]) => typeof v === "number" && isNaN(v)).map(([k]) => k);
+    if (bad.length) { this._showToast(`Fill in: ${bad.join(", ").replace(/_/g, " ")}`, "error"); return; }
+    const min = this._cfg("temp_min"), max = this._cfg("temp_max"), away = this._cfg("away_temp");
+    if (min >= max) { this._showToast("Minimum must be below maximum.", "error"); return; }
+    if (away < min || away > max) { this._showToast(`Heating away (${away}°) must sit between ${min}° and ${max}°.`, "error"); return; }
+    try {
+      await this._hass.callWS({ type: "gttc/set_config", ...draft });
+      this._settingsData = { ...this._settingsData, ...draft };
+      this._draft = {};
+      await this._loadData();
+      this._showToast(`Saved ${Object.keys(draft).length} setting${Object.keys(draft).length !== 1 ? "s" : ""}.`);
+    } catch (err) {
+      this._showToast(`Not saved: ${err.message || err}`, "error");
+    }
+  }
+
+  _attachZoneListeners() {
+    const root = this.shadowRoot;
 
     // ── Zones section ──────────────────────────────────────────────────────
     this._addClick("addZoneBtn", () => {
@@ -3563,110 +3462,6 @@ class GttcPanel extends HTMLElement {
       } catch (err) { this._showToast(err.message || "Failed to save zone.", "error"); }
     });
   }
-
-  _syncZoneFormFromDOM() {
-    const root = this.shadowRoot;
-    const zones = this._settingsData?.zones || [];
-    const existing = this._editingZoneId === "new" ? null : zones.find(z => z.id === this._editingZoneId);
-    if (!this._zoneFormData) {
-      this._zoneFormData = {
-        sensor_entities: [...(existing?.sensor_entities || [])],
-        occupancy_sensor_entities: [...(existing?.occupancy_sensor_entities || [])],
-      };
-    }
-    const nameEl = root.getElementById("zone-form-name");
-    if (nameEl) this._zoneFormData.name = nameEl.value;
-    const awayEl = root.getElementById("zone-form-away-temp");
-    if (awayEl) this._zoneFormData.away_temp = awayEl.value;
-  }
-
-  _renderWindowCard(d) {
-    const win = (d && d.windows) || { open: false, sensors: [], open_sensors: [], manual_override: false };
-    const isOpen = win.open;
-    const statusLabel = win.manual_override
-      ? "Paused (manual)"
-      : isOpen
-        ? `Paused — ${win.open_sensors.length} window${win.open_sensors.length !== 1 ? "s" : ""} open`
-        : win.sensors.length > 0
-          ? `All closed (${win.sensors.length} sensor${win.sensors.length !== 1 ? "s" : ""})`
-          : "No sensors configured";
-    const statusClass = isOpen ? "win-open" : "win-closed";
-    const statusIcon = isOpen ? "mdi:window-open-variant" : "mdi:window-closed-variant";
-
-    return `
-      <div class="status-card win-card">
-        <div class="status-card-title"><ha-icon icon="mdi:window-open-variant"></ha-icon> Windows</div>
-        <div class="win-status ${statusClass}">
-          <ha-icon icon="${statusIcon}"></ha-icon>
-          <span>${statusLabel}</span>
-          ${isOpen ? '<span class="win-badge">HVAC suspended</span>' : ""}
-        </div>
-        ${win.sensors.length > 0 ? `
-          <div class="win-sensor-list" style="margin-top:8px">
-            ${win.sensors.map(entityId => {
-              const isThisOpen = win.open_sensors.includes(entityId);
-              return `
-                <div class="win-sensor-row ${isThisOpen ? "win-sensor-open" : ""}">
-                  <ha-icon icon="${isThisOpen ? "mdi:window-open" : "mdi:window-closed"}"></ha-icon>
-                  <span class="win-sensor-id">${entityId}</span>
-                  <span class="win-sensor-state">${isThisOpen ? "open" : "closed"}</span>
-                </div>
-              `;
-            }).join("")}
-          </div>
-        ` : ""}
-        <div style="margin-top:10px">
-          <button class="btn btn-outline btn-sm js-window-settings">
-            <ha-icon icon="mdi:cog"></ha-icon> Manage in Settings
-          </button>
-        </div>
-      </div>
-    `;
-  }
-
-  _fmt12(timeStr) {
-    const [h, m] = timeStr.split(":").map(Number);
-    const ampm = h >= 12 ? "PM" : "AM";
-    const h12 = h === 0 ? 12 : h > 12 ? h - 12 : h;
-    return `${h12}:${String(m).padStart(2, "0")} ${ampm}`;
-  }
-
-  async _loadStatusData() {
-    if (this._statusLoading) return;
-    this._statusLoading = true;
-    this._render();
-    try {
-      this._statusError = null;
-      this._diagData = await this._hass.callWS({ type: "gttc/get_diagnostics" });
-      // Fetch temperature history if we have the entity ID
-      const entityId = this._diagData.entity_ids && this._diagData.entity_ids.active_zone_temp;
-      if (entityId) {
-        try {
-          const start = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-          const histResult = await this._hass.callApi(
-            "GET",
-            `history/period/${start}?filter_entity_id=${entityId}&minimal_response=true&no_attributes=true`
-          );
-          this._historyData = (histResult && histResult[0]) ? histResult[0] : [];
-        } catch (histErr) {
-          console.warn("GTTC: Could not fetch history", histErr);
-          this._historyData = [];
-        }
-      } else {
-        this._historyData = [];
-      }
-    } catch (err) {
-      console.error("GTTC: Failed to load diagnostics", err);
-      this._diagData = null;
-      this._historyData = [];
-      this._statusError = err.message || err.code || String(err);
-    } finally {
-      this._statusLoading = false;
-      this._render();
-    }
-  }
-
-  // ── Styles ────────────────────────────────────────────────────────────────
 
   _styles() {
     return `
@@ -4021,7 +3816,7 @@ class GttcPanel extends HTMLElement {
         overflow: hidden;
       }
       .debug-toggle {
-        width: 100%; padding: 12px 16px; background: none; border: none; cursor: pointer;
+        box-sizing: border-box; width: 100%; padding: 12px 16px; background: none; border: none; cursor: pointer;
         color: var(--secondary-text); font-size: 13px; font-weight: 500; text-align: left;
         display: flex; align-items: center; gap: 8px;
       }
@@ -4454,6 +4249,155 @@ class GttcPanel extends HTMLElement {
       .entry-other { font-size: 12px; color: var(--secondary-text); }
       .entry-clamp { font-size: 12px; color: #b26a00; }
       .form-label-now { font-size: 11px; font-weight: 600; color: var(--primary); margin-left: 4px; }
+
+      /* ── v2.3 shell ──────────────────────────────────────────────────────── */
+      .main-tab { white-space: nowrap; }
+      @media (max-width: 560px) {
+        .main-tab-bar { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        .main-tab { padding-left: 4px; padding-right: 4px; justify-content: center; font-size: 13px; }
+        .main-tab ha-icon { display: none; }
+        .strip-preset { margin-left: 0; width: 100%; }
+        .strip-preset select { flex: 1; min-width: 0; }
+        .hero-temp { font-size: 48px; }
+        .today-timeline .block-badge { display: none; }
+        .today-timeline .timeline-block { padding: 0 1px; }
+        .today-timeline .timeline-block .block-temp { font-size: 12px; }
+      }
+      .status-live { cursor: pointer; font: inherit; font-size: 12px; color: var(--secondary-text); }
+      .live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); display: inline-block; }
+      .strip-preset { display: flex; align-items: center; gap: 8px; margin-left: auto; font-size: 13px; color: var(--secondary-text); }
+      .season-cta + .strip-preset { margin-left: 0; }
+      .strip-preset select { font: inherit; font-size: 14px; font-weight: 600; padding: 6px 10px; border-radius: 8px;
+        border: 1px solid var(--divider); background: var(--card-bg); color: var(--primary-text); }
+      .eyebrow { font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; color: var(--secondary-text); }
+
+      /* ── Now ─────────────────────────────────────────────────────────────── */
+      .now-grid { display: grid; grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 16px; }
+      .now-today { grid-column: 1 / -1; }
+      @media (max-width: 820px) { .now-grid { grid-template-columns: minmax(0, 1fr); } }
+      .now-card { background: var(--card-bg); border: 1px solid var(--divider); border-radius: 12px; padding: 16px;
+        display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+      .hero-row { display: flex; align-items: flex-end; gap: 20px; flex-wrap: wrap; }
+      .hero-temp { font-size: 56px; font-weight: 600; line-height: 1; letter-spacing: -.03em; font-variant-numeric: tabular-nums; }
+      .hero-temp small { font-size: 24px; color: var(--secondary-text); }
+      .hero-goal { display: flex; flex-direction: column; gap: 3px; padding-bottom: 4px; }
+      .hero-goal-num { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+      .hero-why { font-size: 13px; color: var(--secondary-text); }
+      .hero-action { font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--secondary-text); }
+      .hero-action.is-heat { color: #e65100; }
+      .hero-action.is-cool { color: #0277bd; }
+      .now-banner { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 12px; border-radius: 10px; font-size: 13px; }
+      .now-banner ha-icon { --mdc-icon-size: 18px; flex-shrink: 0; }
+      .now-banner span { flex: 1; min-width: 160px; }
+      .now-banner .btn { margin-left: auto; }
+      .banner-hold { background: color-mix(in srgb, #ff9800 14%, var(--card-bg)); }
+      .banner-vacation { background: color-mix(in srgb, #1976d2 12%, var(--card-bg)); }
+      .banner-windows { background: color-mix(in srgb, #fbc02d 16%, var(--card-bg)); }
+      .rooms { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 8px; }
+      .room { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 8px 10px; border-radius: 10px;
+        border: 1px solid var(--divider); background: transparent; color: var(--primary-text); font: inherit; text-align: left; cursor: pointer; }
+      .room:disabled { cursor: default; }
+      .room-active { border-color: var(--primary); box-shadow: inset 0 0 0 1px var(--primary); }
+      .room-outside { cursor: default; }
+      .room-name { font-size: 12px; color: var(--secondary-text); }
+      .room-temp { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+      .action-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+      .action-tile { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 10px 12px; border-radius: 10px;
+        border: 1px solid var(--divider); background: transparent; color: var(--primary-text); font: inherit; cursor: pointer; text-align: left; }
+      .action-tile:hover { border-color: var(--primary); }
+      .action-tile b { font-size: 18px; font-variant-numeric: tabular-nums; }
+      .action-tile span { font-size: 12px; color: var(--secondary-text); }
+      .tile-heat b { color: #e65100; }
+      .tile-cool b { color: #0277bd; }
+      .auto-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+      .auto-chip { font: inherit; font-size: 12px; font-weight: 500; padding: 5px 11px; border-radius: 999px; cursor: pointer;
+        border: 1px solid var(--divider); background: transparent; color: var(--secondary-text); }
+      .auto-chip::before { content: "○ "; }
+      .auto-chip.chip-on { color: var(--primary-text); border-color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); }
+      .auto-chip.chip-on::before { content: "● "; color: var(--success); }
+      .auto-chip:disabled { opacity: .5; }
+      .today-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+      .today-timeline { height: 48px; flex: none; }
+      .today-timeline .timeline-block .block-temp { font-size: 13px; }
+      .today-axis { position: relative; height: 14px; font-size: 11px; color: var(--secondary-text); }
+      .today-axis span { position: absolute; transform: translateX(-50%); }
+      .today-axis span:first-child { transform: none; }
+      .today-axis span:last-child { transform: translateX(-100%); }
+
+      /* ── History ─────────────────────────────────────────────────────────── */
+      .history-tab { display: flex; flex-direction: column; gap: 16px; }
+      .history-row { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+      @media (max-width: 820px) { .history-row { grid-template-columns: minmax(0, 1fr); } }
+      .log-list { list-style: none; margin: 0; padding: 0 8px 8px; max-height: 420px; overflow-y: auto; }
+      .log-row { display: grid; grid-template-columns: 110px 1fr auto 80px; gap: 10px; padding: 7px 4px; font-size: 13px;
+        border-top: 1px solid var(--divider); font-variant-numeric: tabular-nums; }
+      .log-row:first-child { border-top: 0; }
+      .log-current { font-weight: 600; }
+      .log-when, .log-dur { color: var(--secondary-text); }
+      .log-dur { text-align: right; }
+      .log-temp { font-weight: 600; }
+      .rt-bars { display: flex; align-items: stretch; gap: 4px; height: 210px; padding: 8px 8px 0; }
+      .rt-col { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+      .rt-stack { flex: 1; display: flex; flex-direction: column-reverse; }
+      .rt-bar { width: 100%; min-height: 2px; }
+      .rt-stack .rt-bar:last-child { border-radius: 3px 3px 0 0; }
+      .rt-label, .rt-out { font-size: 10px; text-align: center; color: var(--secondary-text); white-space: nowrap; overflow: hidden; }
+      .rt-out { color: var(--secondary-text); opacity: .8; }
+      details.debug-card > summary { cursor: pointer; list-style: revert; }
+
+      /* ── Settings ────────────────────────────────────────────────────────── */
+      .settings-layout { display: grid; grid-template-columns: 200px minmax(0, 1fr); background: var(--card-bg);
+        border: 1px solid var(--divider); border-radius: 12px; overflow: hidden; }
+      .set-nav { display: flex; flex-direction: column; gap: 2px; padding: 10px; border-right: 1px solid var(--divider); }
+      .set-nav-item { display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 8px; border: 0;
+        background: transparent; color: var(--secondary-text); font: inherit; font-size: 14px; text-align: left; cursor: pointer; }
+      .set-nav-item ha-icon { --mdc-icon-size: 18px; }
+      .set-nav-item.active { background: var(--bg); color: var(--primary-text); font-weight: 600; }
+      .set-nav-dot { width: 7px; height: 7px; border-radius: 50%; background: #f9a825; margin-left: auto; }
+      @media (max-width: 720px) {
+        .settings-layout { grid-template-columns: minmax(0, 1fr); }
+        .set-nav { flex-direction: row; flex-wrap: wrap; border-right: 0; border-bottom: 1px solid var(--divider); }
+      }
+      .set-pane { padding: 18px 20px 24px; display: flex; flex-direction: column; gap: 0; min-width: 0; }
+      .set-title { margin: 0 0 10px; font-size: 18px; font-weight: 600; }
+      .set-lede { margin: 0 0 12px; font-size: 13px; color: var(--secondary-text); max-width: 64ch; }
+      .set-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 20px; align-items: center;
+        padding: 14px 0; border-top: 1px solid var(--divider); }
+      .set-row-stack { grid-template-columns: minmax(0, 1fr); }
+      .set-row label { font-size: 14px; font-weight: 600; }
+      .set-row-off { opacity: .45; }
+      .set-row-dirty .set-num, .set-row-dirty .set-select, .set-row-dirty .set-entity { border-color: #f9a825; background: color-mix(in srgb, #f9a825 10%, var(--card-bg)); }
+      .set-row-dirty label::after { content: " •"; color: #f9a825; }
+      .set-control { display: flex; align-items: center; gap: 8px; justify-self: end; flex-wrap: wrap; justify-content: flex-end; }
+      .set-control-list { flex-direction: column; align-items: stretch; }
+      .set-num { width: 84px; text-align: right; font: inherit; font-size: 16px; font-variant-numeric: tabular-nums; padding: 6px 8px;
+        border: 1px solid var(--divider); border-radius: 8px; background: var(--card-bg); color: var(--primary-text); }
+      .set-select, .set-entity { font: inherit; font-size: 16px; padding: 6px 8px; border: 1px solid var(--divider); border-radius: 8px;
+        background: var(--card-bg); color: var(--primary-text); max-width: 100%; }
+      .set-entity { width: 300px; font-family: var(--code-font-family, monospace); font-size: 14px; }
+      .set-unit { font-size: 13px; color: var(--secondary-text); }
+      .set-range { width: 200px; }
+      .set-out { min-width: 64px; text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+      .set-reading { font-size: 12px; color: var(--secondary-text); flex-basis: 100%; text-align: right; }
+      .win-sensor-row .set-reading { flex-basis: auto; margin-left: auto; }
+      .ent-missing { color: var(--error); font-weight: 600; }
+      .set-warn { margin: -4px 0 10px; padding: 10px 12px; border-radius: 9px; font-size: 13px;
+        background: color-mix(in srgb, #f9a825 14%, var(--card-bg)); }
+      .save-bar { position: sticky; bottom: 12px; z-index: 5; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+        margin-top: 14px; padding: 10px 14px; border-radius: 12px; background: var(--primary-text); color: var(--card-bg);
+        box-shadow: 0 8px 24px rgba(0,0,0,.25); font-size: 14px; }
+      .save-bar[hidden] { display: none; }
+      .save-bar-sp { flex: 1; }
+      .save-bar .btn-outline { color: var(--card-bg); border-color: color-mix(in srgb, var(--card-bg) 45%, transparent); }
+      @media (max-width: 560px) {
+        .set-row { grid-template-columns: minmax(0, 1fr); }
+        .set-control { justify-self: start; justify-content: flex-start; }
+        .set-reading { text-align: left; }
+        .set-entity { width: 100%; }
+        .action-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .log-row { grid-template-columns: 80px 1fr auto; }
+        .log-dur { display: none; }
+      }
     `;
   }
 }

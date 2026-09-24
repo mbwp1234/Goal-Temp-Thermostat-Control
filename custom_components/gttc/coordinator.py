@@ -1891,6 +1891,11 @@ class GTTCCoordinator(DataUpdateCoordinator):
     def _log_action(self, reason: str, target_temp: float) -> None:
         """Append a setpoint decision to the ring buffer."""
         self._last_action_reason = reason
+        # Record decisions, not cycles: a 30s loop repeating the same reason and
+        # temperature filled the 200-entry buffer in 100 minutes.
+        rounded = round(target_temp, 1)
+        if self.action_log and self.action_log[-1]["reason"] == reason and self.action_log[-1]["target_temp"] == rounded:
+            return
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "reason": reason,
