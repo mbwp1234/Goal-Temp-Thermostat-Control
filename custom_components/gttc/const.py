@@ -176,6 +176,9 @@ BOOST_TYPES = {
     "boost": {"label": "Boost +4°", "delta": 4.0, "minutes": 90, "icon": "🔥"},
     "warm_up": {"label": "Warm Up +3°", "delta": 3.0, "minutes": 60, "icon": "🌡"},
     "cool_down": {"label": "Cool Down -3°", "delta": -3.0, "minutes": 60, "icon": "❄️"},
+    # Cooling-season counterpart of "boost"; the panel offers boost/warm_up in
+    # heating season and max_cool/cool_down in cooling season.
+    "max_cool": {"label": "Max Cool -4°", "delta": -4.0, "minutes": 90, "icon": "❄️"},
 }
 
 # Daily runtime history

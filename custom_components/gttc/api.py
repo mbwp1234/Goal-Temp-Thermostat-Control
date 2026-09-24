@@ -11,6 +11,7 @@ from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 
 from .const import DOMAIN, PRESETS
+from .coordinator import MAX_TEMP_OFFSET
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -807,6 +808,19 @@ async def ws_get_diagnostics(
     override_active = override is not None and not override.is_expired
     current_entry = coordinator.scheduler.get_current_entry()
 
+    # Wall-unit reading minus active-zone reading: what _calculate_thermostat_target
+    # adds to a goal before clamping to temp_min/temp_max. The panel uses it to
+    # warn where a schedule block can never be reached.
+    active_zone = coordinator.zone_manager.active_zone
+    zone_offset = None
+    if thermostat_temp is not None and active_zone and active_zone.current_temp is not None:
+        try:
+            zone_offset = round(
+                max(-MAX_TEMP_OFFSET, min(MAX_TEMP_OFFSET, float(thermostat_temp) - active_zone.current_temp)), 1
+            )
+        except (TypeError, ValueError):
+            zone_offset = None
+
     result = {
         "current_temp": coordinator.current_temp,
         "target_temp": coordinator.target_temp,
@@ -825,6 +839,15 @@ async def ws_get_diagnostics(
         "vacation_mode": (
             coordinator.vacation_mode.to_dict() if coordinator.vacation_mode else None
         ),
+        "season": coordinator.season,
+        "suggest_season_switch": coordinator.suggest_season_switch,
+        "season_conditions_hours": coordinator.season_conditions_hours,
+        "seasonal_recommend_hours": coordinator.seasonal_recommend_hours,
+        "auto_season_switch": coordinator.auto_season_switch,
+        "cooling_comfort": coordinator.cooling_comfort,
+        "cooling_away_temp": coordinator.cooling_away_temp,
+        "zone_offset": zone_offset,
+        "active_zone_id": coordinator.zone_manager.active_zone_id,
         "active_zone_name": coordinator.zone_manager.active_zone.name if coordinator.zone_manager.active_zone else None,
         "zones": zones,
         "learning": {

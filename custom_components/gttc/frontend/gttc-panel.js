@@ -284,6 +284,7 @@ class GttcPanel extends HTMLElement {
         </header>
 
         ${this._renderMainTabBar()}
+        ${this._renderSeasonStrip()}
 
         <div class="content">
           ${this._activeMainTab === "command"
@@ -526,21 +527,27 @@ class GttcPanel extends HTMLElement {
       if (endMin <= startMin) endMin = 1440;
       const leftPct = (startMin / 1440) * 100;
       const widthPct = ((endMin - startMin) / 1440) * 100;
-      const color = tempColor(entry.target_temp, s.temp_min, s.temp_max);
+      const cooling = this._isCooling();
+      const temp = this._seasonTemp(entry);
+      const other = this._otherSeasonTemp(entry);
+      const clamp = this._clampNote(entry);
+      const color = temp != null ? tempColor(temp, s.temp_min, s.temp_max) : "var(--divider)";
       const textColor = "rgba(255,255,255,0.95)";
       const zoneLabel = entry.zone_id ? ` [${this._getZoneName(entry.zone_id)}]` : "";
       const extraBadges = [
-        entry.cooling_temp != null ? `<span class="block-badge cool-badge">\u2744${entry.cooling_temp}\u00b0</span>` : "",
-        entry.away_temp != null ? `<span class="block-badge away-badge">\ud83c\udfeb${entry.away_temp}\u00b0</span>` : "",
+        clamp ? `<span class="block-badge clamp-badge" title="${clamp.text}">⚠</span>` : "",
+        other != null ? `<span class="block-badge ${cooling ? "heat-badge" : "cool-badge"}">${cooling ? "▲" : "▼"}${other}°</span>` : "",
+        entry.away_temp != null && !cooling ? `<span class="block-badge away-badge">away ${entry.away_temp}°</span>` : "",
       ].filter(Boolean).join("");
+      const tempText = `${this._fmtTemp(temp)}${this._seasonTempIsFallback(entry) ? "*" : ""}`;
       return `
         <div class="timeline-block ${compact ? "compact" : ""}"
              style="left:${leftPct}%;width:${widthPct}%;background:${color};color:${textColor}"
              data-day="${day}" data-index="${i}"
-             title="${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}: ${entry.target_temp}\u00b0F${entry.cooling_temp != null ? ` / \u2744${entry.cooling_temp}\u00b0F` : ""}${entry.away_temp != null ? ` / away ${entry.away_temp}\u00b0F` : ""}${zoneLabel}">
+             title="${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}: heat ${entry.target_temp}°F / cool ${entry.cooling_temp != null ? entry.cooling_temp + "°F" : "default"}${entry.away_temp != null ? ` / away ${entry.away_temp}°F` : ""}${zoneLabel}${clamp ? ` — ${clamp.text}` : ""}">
           ${compact
-            ? `<span class="block-temp">${entry.target_temp}\u00b0${extraBadges}</span>`
-            : `<span class="block-temp">${entry.target_temp}\u00b0F${extraBadges}</span>
+            ? `<span class="block-temp">${tempText}${extraBadges}</span>`
+            : `<span class="block-temp">${tempText}${extraBadges}</span>
                <span class="block-time">${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}</span>`
           }
           ${!compact ? `
@@ -556,15 +563,21 @@ class GttcPanel extends HTMLElement {
 
   _renderEntryCard(entry, index, day) {
     const s = this._schedule;
-    const color = tempColor(entry.target_temp, s.temp_min, s.temp_max);
+    const cooling = this._isCooling();
+    const temp = this._seasonTemp(entry);
+    const other = this._otherSeasonTemp(entry);
+    const clamp = this._clampNote(entry);
+    const color = temp != null ? tempColor(temp, s.temp_min, s.temp_max) : "var(--divider)";
     const zoneLabel = entry.zone_id ? this._getZoneName(entry.zone_id) : "";
     return `
       <div class="entry-card" data-day="${day}" data-index="${index}">
         <div class="entry-color" style="background:${color}"></div>
         <div class="entry-info">
-          <span class="entry-time">${formatTime12(entry.time_start)} \u2014 ${formatTime12(entry.time_end)}</span>
-          <span class="entry-temp">${entry.target_temp}\u00b0F${entry.cooling_temp != null ? ` / \u2744\uFE0F${entry.cooling_temp}\u00b0F` : ""}${entry.away_temp != null ? ` / \ud83c\udfeb${entry.away_temp}\u00b0F` : ""}</span>
+          <span class="entry-time">${formatTime12(entry.time_start)} — ${formatTime12(entry.time_end)}</span>
+          <span class="entry-temp">${this._fmtTemp(temp)}<span class="entry-temp-kind">${cooling ? "cool" : "heat"}${this._seasonTempIsFallback(entry) ? " · default" : ""}</span></span>
+          <span class="entry-other">${cooling ? "heat" : "cool"} ${other != null ? other + "°" : "default"}${entry.away_temp != null ? ` · away ${entry.away_temp}°` : ""}</span>
           ${zoneLabel ? `<span class="entry-zone">${zoneLabel}</span>` : ""}
+          ${clamp ? `<span class="entry-clamp">⚠ ${clamp.text}</span>` : ""}
         </div>
         <div class="entry-actions">
           <button class="btn btn-sm btn-copy" data-action="copy" data-day="${day}" data-index="${index}" title="Copy to other days">Copy</button>
@@ -573,6 +586,117 @@ class GttcPanel extends HTMLElement {
         </div>
       </div>
     `;
+  }
+
+  // ── Season ────────────────────────────────────────────────────────────────
+  // Every schedule entry carries two numbers: target_temp (heating) and
+  // cooling_temp. Which one is in force depends on the season, so everything
+  // that shows "the" temperature of a block must go through _seasonTemp.
+
+  _season() {
+    return this._diagData?.season || this._settingsData?.season || "heating";
+  }
+
+  _isCooling() {
+    return this._season() === "cooling";
+  }
+
+  // Mirrors _calculate_desired_temp: cooling uses the entry's cooling_temp,
+  // falling back to the global cooling comfort when the entry has none.
+  _seasonTemp(entry) {
+    if (!entry) return null;
+    if (this._isCooling()) {
+      if (entry.cooling_temp != null) return entry.cooling_temp;
+      return this._diagData?.cooling_comfort ?? this._settingsData?.cooling_comfort ?? null;
+    }
+    return entry.target_temp;
+  }
+
+  // True when a cooling-season number is the global fallback, not the entry's own.
+  _seasonTempIsFallback(entry) {
+    return this._isCooling() && entry && entry.cooling_temp == null;
+  }
+
+  _otherSeasonTemp(entry) {
+    if (!entry) return null;
+    return this._isCooling() ? entry.target_temp : entry.cooling_temp;
+  }
+
+  _fmtTemp(v) {
+    return v == null ? "—" : `${v}°`;
+  }
+
+  // A block whose goal plus the wall/zone offset lands past temp_min/temp_max
+  // is clamped at the wall, so the zone settles short of the goal. Only the
+  // active zone's offset is known, so only its blocks (or zoneless ones) warn.
+  _clampNote(entry) {
+    const d = this._diagData;
+    const s = this._schedule;
+    if (!d || !s || d.zone_offset == null) return null;
+    if (entry.zone_id && d.active_zone_id && entry.zone_id !== d.active_zone_id) return null;
+    const goal = this._seasonTemp(entry);
+    if (goal == null) return null;
+    const wall = goal + d.zone_offset;
+    const cap = wall > s.temp_max ? s.temp_max : wall < s.temp_min ? s.temp_min : null;
+    if (cap == null || Math.abs(wall - cap) < 0.25) return null;
+    const settles = Math.round((cap - d.zone_offset) * 10) / 10;
+    return {
+      goal, cap, settles,
+      text: `Wall capped at ${cap}° (${cap === s.temp_max ? "max" : "min"}); with the ${d.zone_offset > 0 ? "+" : ""}${d.zone_offset}° offset this zone settles near ${settles}°, not ${goal}°.`,
+    };
+  }
+
+  _renderSeasonStrip() {
+    const d = this._diagData;
+    if (!d) return "";
+    const cooling = this._isCooling();
+    const other = cooling ? "heating" : "cooling";
+    const otherLabel = cooling ? "Heating" : "Cooling";
+    const hours = d.season_conditions_hours || 0;
+    const need = d.seasonal_recommend_hours || 0;
+    const pct = need > 0 ? Math.min(100, (hours / need) * 100) : 0;
+    const outdoor = d.features?.outdoor_temp;
+    let meta;
+    if (d.suggest_season_switch) {
+      meta = `<b>${otherLabel} conditions for ${hours.toFixed(1)}h</b> — switch recommended`;
+    } else if (hours > 0) {
+      meta = `<b>${otherLabel} conditions ${hours.toFixed(1)}h of ${need}h</b>`;
+    } else {
+      meta = `<b>No switch recommended</b>${outdoor != null ? ` · outside ${outdoor.toFixed(1)}°` : ""}`;
+    }
+    return `
+      <div class="season-strip ${d.suggest_season_switch ? "season-strip-suggest" : ""}">
+        <div class="season-seg" role="group" aria-label="Season">
+          <button class="season-seg-btn seg-heat" id="seasonHeatBtn" aria-pressed="${!cooling}">
+            <ha-icon icon="mdi:fire"></ha-icon> Heat
+          </button>
+          <button class="season-seg-btn seg-cool" id="seasonCoolBtn" aria-pressed="${cooling}">
+            <ha-icon icon="mdi:snowflake"></ha-icon> Cool
+          </button>
+        </div>
+        <div class="season-meta">
+          <span>${meta} · auto-switch ${d.auto_season_switch ? "on" : "off"}</span>
+          ${need > 0 && hours > 0 ? `<span class="season-meter" aria-hidden="true"><i style="width:${pct.toFixed(0)}%"></i></span>` : ""}
+        </div>
+        ${d.suggest_season_switch ? `
+          <button class="btn btn-primary season-cta" data-season-switch="${other}">Switch to ${otherLabel}</button>
+        ` : ""}
+      </div>
+    `;
+  }
+
+  async _setSeason(season) {
+    if (season === this._season()) return;
+    try {
+      await this._hass.callWS({ type: "gttc/set_season", season });
+      if (this._settingsData) this._settingsData = { ...this._settingsData, season };
+      await this._loadData();
+      this._showToast(season === "cooling"
+        ? "Cooling season — thermostat set to Cool."
+        : "Heating season — thermostat set to Heat.");
+    } catch (err) {
+      this._showToast(`Season not changed: ${err.message || err}`, "error");
+    }
   }
 
   _getZoneName(zoneId) {
@@ -607,8 +731,9 @@ class GttcPanel extends HTMLElement {
               <label>End Time</label>
               <input type="time" id="editEnd" value="${entry.time_end || "17:00"}" required>
             </div>
+            ${this._isCooling() ? this._renderCoolingField(entry, s) : ""}
             <div class="form-row">
-              <label>Heating Target (\u00b0F)</label>
+              <label>Heating target (°F)${this._isCooling() ? "" : ` <span class="form-label-now">in use now</span>`}</label>
               <div class="temp-input-row">
                 <input type="range" id="editTempRange" min="${s.temp_min}" max="${s.temp_max}" step="1"
                        value="${entry.target_temp || 70}">
@@ -621,17 +746,7 @@ class GttcPanel extends HTMLElement {
                 ${entry.target_temp || 70}\u00b0F
               </div>
             </div>
-            <div class="form-row">
-              <label>Cooling Target (\u00b0F) <span class="form-label-hint">leave blank to use global comfort</span></label>
-              <div class="temp-input-row">
-                <input type="range" id="editCoolingTempRange" min="${s.temp_min}" max="${s.temp_max}" step="1"
-                       value="${entry.cooling_temp != null ? entry.cooling_temp : 74}">
-                <input type="number" id="editCoolingTemp" min="${s.temp_min}" max="${s.temp_max}" step="0.5"
-                       placeholder="global default"
-                       value="${entry.cooling_temp != null ? entry.cooling_temp : ""}">
-                <span class="temp-unit">\u00b0F</span>
-              </div>
-            </div>
+            ${this._isCooling() ? "" : this._renderCoolingField(entry, s)}
             <div class="form-row">
               <label>Away Temp (\u00b0F) <span class="form-label-hint">setback when nobody home — leave blank to use global away</span></label>
               <div class="temp-input-row">
@@ -663,6 +778,23 @@ class GttcPanel extends HTMLElement {
     `;
   }
 
+  _renderCoolingField(entry, s) {
+    const fallback = this._diagData?.cooling_comfort ?? this._settingsData?.cooling_comfort;
+    return `
+            <div class="form-row">
+              <label>Cooling target (°F)${this._isCooling() ? ` <span class="form-label-now">in use now</span>` : ""}
+                <span class="form-label-hint">blank = cooling comfort${fallback != null ? ` (${fallback}°)` : ""}</span></label>
+              <div class="temp-input-row">
+                <input type="range" id="editCoolingTempRange" min="${s.temp_min}" max="${s.temp_max}" step="1"
+                       value="${entry.cooling_temp != null ? entry.cooling_temp : (fallback ?? 74)}">
+                <input type="number" id="editCoolingTemp" min="${s.temp_min}" max="${s.temp_max}" step="0.5"
+                       placeholder="${fallback != null ? fallback : "default"}"
+                       value="${entry.cooling_temp != null ? entry.cooling_temp : ""}">
+                <span class="temp-unit">°F</span>
+              </div>
+            </div>`;
+  }
+
   // ── Copy entry modal ──────────────────────────────────────────────────────
 
   _renderCopyModal() {
@@ -673,7 +805,7 @@ class GttcPanel extends HTMLElement {
         <div class="modal">
           <h3>Copy Entry to Other Days</h3>
           <p class="copy-info">
-            ${formatTime12(entry.entry.time_start)} \u2014 ${formatTime12(entry.entry.time_end)} at ${entry.entry.target_temp}\u00b0F
+            ${formatTime12(entry.entry.time_start)} — ${formatTime12(entry.entry.time_end)} at ${this._fmtTemp(this._seasonTemp(entry.entry))}F
           </p>
           ${this._renderDayCheckboxes("copyDayCheckboxes", this._copyTargetDays, entry.sourceDay)}
           <div class="form-actions">
@@ -820,6 +952,13 @@ class GttcPanel extends HTMLElement {
 
   _attachListeners() {
     const root = this.shadowRoot;
+
+    // Season strip
+    this._addClick("seasonHeatBtn", () => this._setSeason("heating"));
+    this._addClick("seasonCoolBtn", () => this._setSeason("cooling"));
+    root.querySelectorAll("[data-season-switch]").forEach(btn => {
+      btn.addEventListener("click", () => this._setSeason(btn.dataset.seasonSwitch));
+    });
 
     // Main tab bar
     root.querySelectorAll(".main-tab").forEach(btn => {
@@ -1461,7 +1600,7 @@ class GttcPanel extends HTMLElement {
   // ── Delete entry ──────────────────────────────────────────────────────────
 
   async _deleteEntry(day, entry) {
-    if (!confirm(`Delete ${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)} (${entry.target_temp}\u00b0F)?`)) return;
+    if (!confirm(`Delete ${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)} (${this._fmtTemp(this._seasonTemp(entry))}F)?`)) return;
     const msg = { type: "gttc/delete_entry", day, time_start: entry.time_start, time_end: entry.time_end };
     if (this._schedule.active_preset) msg.preset = this._schedule.active_preset;
 
@@ -1974,11 +2113,17 @@ class GttcPanel extends HTMLElement {
   }
 
   _renderBoostButtons() {
-    const boosts = [
-      { id: "boost",     icon: "mdi:fire",         label: "Boost +4°",     delta: "+4", color: "#f57c00" },
-      { id: "warm_up",   icon: "mdi:thermometer-plus", label: "Warm Up +3°", delta: "+3", color: "#e64a19" },
-      { id: "cool_down", icon: "mdi:snowflake",     label: "Cool Down −3°", delta: "−3", color: "#0288d1" },
-    ];
+    // Offer only the direction the season can act on: a +4 boost in cooling
+    // season just lets the house warm up, which is not what "boost" means.
+    const boosts = this._isCooling()
+      ? [
+          { id: "max_cool",  icon: "mdi:snowflake-alert", label: "Max Cool −4° · 90m", color: "#01579b" },
+          { id: "cool_down", icon: "mdi:snowflake",       label: "Cool Down −3° · 60m", color: "#0288d1" },
+        ]
+      : [
+          { id: "boost",   icon: "mdi:fire",             label: "Boost +4° · 90m",   color: "#f57c00" },
+          { id: "warm_up", icon: "mdi:thermometer-plus", label: "Warm Up +3° · 60m", color: "#e64a19" },
+        ];
     return `
       <div class="boost-row">
         ${boosts.map(b => `
@@ -2169,7 +2314,7 @@ class GttcPanel extends HTMLElement {
 
     const schedEntry = d.current_entry;
     const entryLabel = schedEntry
-      ? `${this._fmt12(schedEntry.time_start)}–${this._fmt12(schedEntry.time_end)} @ ${schedEntry.target_temp}°`
+      ? `${this._fmt12(schedEntry.time_start)}–${this._fmt12(schedEntry.time_end)} @ ${this._fmtTemp(this._seasonTemp(schedEntry))}`
       : "No active entry";
 
     return `
@@ -2239,7 +2384,7 @@ class GttcPanel extends HTMLElement {
 
     const goalSteps = this._buildScheduleGoalSteps(tMin, tMax);
 
-    const goalTemps = goalSteps.map(s => s.temp);
+    const goalTemps = goalSteps.map(s => s.temp).filter(v => v != null);
     const temps = points.map(p => p.v).concat(goalTemps);
     const vMin = Math.floor(Math.min(...temps) - 1);
     const vMax = Math.ceil(Math.max(...temps) + 1);
@@ -2497,7 +2642,7 @@ class GttcPanel extends HTMLElement {
           steps.push({
             tStart: Math.max(eStart, tMin),
             tEnd: Math.min(eEnd, tMax),
-            temp: entry.target_temp,
+            temp: this._seasonTemp(entry),
             zone_id: entry.zone_id || null,
           });
         }
@@ -2686,15 +2831,8 @@ class GttcPanel extends HTMLElement {
         </div>
         <div class="settings-card-body">
           <div class="settings-field">
-            <label>Current season</label>
-            <div class="season-toggle-row">
-              <button class="btn season-mode-btn ${isHeating ? "season-mode-btn-active" : ""}" id="seasonHeatingBtn">
-                <ha-icon icon="mdi:fire"></ha-icon> Heating
-              </button>
-              <button class="btn season-mode-btn ${!isHeating ? "season-mode-btn-active" : ""}" id="seasonCoolingBtn">
-                <ha-icon icon="mdi:snowflake"></ha-icon> Cooling
-              </button>
-            </div>
+            <label>Current season: <strong>${isHeating ? "Heating" : "Cooling"}</strong></label>
+            <div class="settings-hint">Switch it from the Heat / Cool control at the top of the page — it applies immediately. The settings below are rules and need Save.</div>
             ${suggestHint}
           </div>
           <div class="settings-field settings-field-toggle">
@@ -3098,22 +3236,6 @@ class GttcPanel extends HTMLElement {
         seasonHoursLabel.textContent = seasonHoursRange.value;
       });
     }
-    this._addClick("seasonHeatingBtn", async () => {
-      try {
-        await this._hass.callWS({ type: "gttc/set_season", season: "heating" });
-        this._settingsData = { ...this._settingsData, season: "heating" };
-        this._showToast("Switched to heating season.");
-        this._loadSettingsData();
-      } catch (err) { this._showToast(err.message || "Failed to switch season.", "error"); }
-    });
-    this._addClick("seasonCoolingBtn", async () => {
-      try {
-        await this._hass.callWS({ type: "gttc/set_season", season: "cooling" });
-        this._settingsData = { ...this._settingsData, season: "cooling" };
-        this._showToast("Switched to cooling season.");
-        this._loadSettingsData();
-      } catch (err) { this._showToast(err.message || "Failed to switch season.", "error"); }
-    });
     this._addClick("saveSeasonBtn", async () => {
       const autoSwitch = root.getElementById("cfg-auto-season-switch")?.checked ?? false;
       const coolingComfort = parseFloat(root.getElementById("cfg-cooling-comfort")?.value);
@@ -4303,6 +4425,35 @@ class GttcPanel extends HTMLElement {
       .range-btn.active {
         background: var(--primary-color, #03a9f4); color: #fff; border-color: var(--primary-color, #03a9f4);
       }
+
+      /* ── Season strip ────────────────────────────────────────────────────── */
+      .season-strip {
+        display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px;
+        padding: 10px 14px; margin-bottom: 16px; border-radius: 12px;
+        background: var(--card-bg); border: 1px solid var(--divider);
+      }
+      .season-strip-suggest { border-color: #f9a825; background: color-mix(in srgb, #f9a825 10%, var(--card-bg)); }
+      .season-seg { display: inline-flex; gap: 2px; padding: 3px; border-radius: 999px; background: var(--bg); border: 1px solid var(--divider); }
+      .season-seg-btn {
+        display: inline-flex; align-items: center; gap: 6px; border: 0; background: transparent;
+        color: var(--secondary-text); font: inherit; font-size: 14px; font-weight: 600;
+        padding: 7px 16px; border-radius: 999px; cursor: pointer;
+      }
+      .season-seg-btn ha-icon { --mdc-icon-size: 16px; }
+      .season-seg-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+      .season-seg-btn.seg-heat[aria-pressed="true"] { background: #e65100; color: #fff; }
+      .season-seg-btn.seg-cool[aria-pressed="true"] { background: #0277bd; color: #fff; }
+      .season-meta { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--secondary-text); min-width: 0; }
+      .season-meta b { color: var(--primary-text); font-weight: 600; }
+      .season-meter { display: block; width: 140px; height: 4px; border-radius: 2px; background: var(--divider); overflow: hidden; }
+      .season-meter i { display: block; height: 100%; background: #f9a825; }
+      .season-cta { margin-left: auto; }
+      .heat-badge { background: rgba(230,81,0,0.75); }
+      .clamp-badge { background: rgba(0,0,0,0.45); }
+      .entry-temp-kind { font-size: 11px; font-weight: 600; margin-left: 6px; color: var(--secondary-text); text-transform: uppercase; letter-spacing: .04em; }
+      .entry-other { font-size: 12px; color: var(--secondary-text); }
+      .entry-clamp { font-size: 12px; color: #b26a00; }
+      .form-label-now { font-size: 11px; font-weight: 600; color: var(--primary); margin-left: 4px; }
     `;
   }
 }
