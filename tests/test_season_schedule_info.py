@@ -37,3 +37,14 @@ def test_heating_uses_target_temp():
 def test_cooling_boosts_lower_the_setpoint():
     assert BOOST_TYPES["max_cool"]["delta"] < 0
     assert BOOST_TYPES["cool_down"]["delta"] < 0
+
+
+def test_action_log_records_changes_not_cycles():
+    coord = _make_coordinator()
+    for _ in range(5):
+        coord._log_action("schedule", 71.0)
+    coord._log_action("physical_override", 72.0)
+    coord._log_action("physical_override", 72.0)
+    coord._log_action("schedule", 71.0)
+    assert [e["reason"] for e in coord.action_log] == ["schedule", "physical_override", "schedule"]
+    assert coord._last_action_reason == "schedule"
