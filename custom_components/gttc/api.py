@@ -819,6 +819,12 @@ async def ws_get_diagnostics(
         "override_source": override.source if override_active else None,
         "schedule_enabled": coordinator.schedule_enabled,
         "current_entry": current_entry.to_dict() if current_entry else None,
+        # The panel's "why" line and vacation banner read these; they were
+        # only ever on climate.gttc's attributes, so the panel never saw them.
+        "hvac_action_reason": coordinator._last_action_reason,
+        "vacation_mode": (
+            coordinator.vacation_mode.to_dict() if coordinator.vacation_mode else None
+        ),
         "active_zone_name": coordinator.zone_manager.active_zone.name if coordinator.zone_manager.active_zone else None,
         "zones": zones,
         "learning": {

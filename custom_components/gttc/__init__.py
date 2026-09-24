@@ -161,6 +161,12 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
         )
         _STATIC_PATH_REGISTERED = True
 
+    # Cache-bust the panel URL with the file's mtime: a HACS download rewrites
+    # the file, so each release gets a new URL and the browser cannot serve
+    # the previous version's panel from cache.
+    panel_js = FRONTEND_DIR / "gttc-panel.js"
+    stamp = await hass.async_add_executor_job(lambda: int(panel_js.stat().st_mtime))
+
     # Register the sidebar panel
     async_register_built_in_panel(
         hass,
@@ -168,7 +174,7 @@ async def _async_register_panel(hass: HomeAssistant) -> None:
         sidebar_title=PANEL_TITLE,
         sidebar_icon=PANEL_ICON,
         frontend_url_path="gttc-schedule",
-        config={"_panel_custom": {"name": "gttc-panel", "js_url": PANEL_URL}},
+        config={"_panel_custom": {"name": "gttc-panel", "js_url": f"{PANEL_URL}?v={stamp}"}},
         require_admin=False,
     )
 

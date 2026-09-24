@@ -116,8 +116,79 @@ class GttcPanel extends HTMLElement {
   set hass(hass) {
     this._hass = hass;
     if (!this._schedule) {
-      this._loadData();
+      if (!this._loading) this._loadData();
+      return;
     }
+    // HA hands us a new hass object on every state change in the house. Only
+    // the GTTC entities matter; when one of them moves, re-fetch and repaint.
+    const sig = this._liveSignature(hass);
+    if (sig !== this._liveSig) {
+      this._liveSig = sig;
+      this._queueLiveRefresh();
+    }
+  }
+
+  // ── Live refresh ──────────────────────────────────────────────────────────
+
+  _liveSignature(hass) {
+    const ids = [
+      this._diagData?.entity_ids?.climate || "climate.gttc",
+      "select.gttc_season_mode",
+      "switch.gttc_schedule",
+      "binary_sensor.gttc_windows_open",
+    ];
+    return ids.map(id => hass.states[id]?.last_updated || "").join("|");
+  }
+
+  _queueLiveRefresh() {
+    if (this._liveTimer) return;
+    // Debounce, and never more than one refresh every 10s — climate.gttc's
+    // attributes move every coordinator cycle.
+    const wait = Math.max(1500, 10000 - (Date.now() - (this._lastFetchAt || 0)));
+    this._liveTimer = setTimeout(() => {
+      this._liveTimer = null;
+      this._refreshLive();
+    }, wait);
+  }
+
+  async _refreshLive() {
+    if (!this._hass || this._loading) return;
+    try {
+      const [schedule, status, diagData] = await Promise.all([
+        this._hass.callWS({ type: "gttc/get_schedule" }),
+        this._hass.callWS({ type: "gttc/get_status" }),
+        this._hass.callWS({ type: "gttc/get_diagnostics" }).catch(() => this._diagData),
+      ]);
+      this._schedule = schedule;
+      this._status = status;
+      this._diagData = diagData;
+      this._activePreset = schedule.active_preset;
+      this._lastFetchAt = Date.now();
+      this._repaint();
+    } catch (err) {
+      console.warn("GTTC: live refresh failed", err);
+    }
+  }
+
+  // True while the user is in the middle of something a repaint would destroy:
+  // an open modal, a drag, or focus in a form field.
+  _isBusy() {
+    if (this._editingEntry || this._showCopyModal || this._showCopyDayModal || this._showPresetModal
+        || this._showExportModal || this._showImportModal || this._showVacationModal) return true;
+    if (this._dragActive) return true;
+    if (this._activeMainTab === "settings") return true;
+    const el = this.shadowRoot && this.shadowRoot.activeElement;
+    return !!(el && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName));
+  }
+
+  _repaint() {
+    if (this._isBusy()) { this._repaintPending = true; return; }
+    this._repaintPending = false;
+    this._render();
+  }
+
+  disconnectedCallback() {
+    if (this._liveTimer) { clearTimeout(this._liveTimer); this._liveTimer = null; }
   }
 
   set panel(panel) {
@@ -126,6 +197,7 @@ class GttcPanel extends HTMLElement {
 
   async _loadData() {
     if (!this._hass) return;
+    this._loading = true;
     try {
       const [schedule, status, diagData, configData, runtimeData] = await Promise.all([
         this._hass.callWS({ type: "gttc/get_schedule" }),
@@ -140,6 +212,8 @@ class GttcPanel extends HTMLElement {
       this._configData = configData;
       this._runtimeData = runtimeData;
       this._activePreset = schedule.active_preset;
+      this._lastFetchAt = Date.now();
+      this._liveSig = this._liveSignature(this._hass);
       if (!this._selectedDay) {
         const today = DAYS_ORDERED[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
         this._selectedDay = today;
@@ -150,12 +224,13 @@ class GttcPanel extends HTMLElement {
       const climateId = diagData?.entity_ids?.climate;
       if (entityId && !this._historyData) {
         const start = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+        const end = encodeURIComponent(new Date().toISOString());
         Promise.all([
           this._hass.callApi("GET",
-            `history/period/${start}?filter_entity_id=${entityId}&minimal_response=true&no_attributes=true`
+            `history/period/${start}?end_time=${end}&filter_entity_id=${entityId}&minimal_response=true&no_attributes=true`
           ),
           climateId
-            ? this._hass.callApi("GET", `history/period/${start}?filter_entity_id=${climateId}`)
+            ? this._hass.callApi("GET", `history/period/${start}?end_time=${end}&filter_entity_id=${climateId}`)
             : Promise.resolve(null),
         ]).then(([tempResult, hvacResult]) => {
           this._historyData = tempResult?.[0] || [];
@@ -174,6 +249,8 @@ class GttcPanel extends HTMLElement {
           <p style="color:var(--error-color,#c00)">Failed to load data. Make sure GTTC is configured.</p>
           <pre>${err.message || err}</pre>
         </div>`;
+    } finally {
+      this._loading = false;
     }
   }
 
@@ -238,8 +315,9 @@ class GttcPanel extends HTMLElement {
     if (st.target_temp != null) parts.push(`<span class="status-item">Goal: ${st.target_temp.toFixed(1)}\u00b0</span>`);
     if (st.active_zone) parts.push(`<span class="status-item">${st.active_zone}</span>`);
     if (st.override_active) {
-      parts.push(`<span class="status-item override">Override: ${st.override_remaining}m
-        <button class="btn-cancel-override" id="cancelOverrideBtn" title="Cancel Override">\u2715</button>
+      const label = st.override_source === "physical" ? "Thermostat hold" : "Override";
+      parts.push(`<span class="status-item override">${label}: ${st.override_remaining}m
+        <button class="btn-cancel-override js-cancel-override" title="Resume schedule">\u2715</button>
       </span>`);
     }
     if (st.windows_open) {
@@ -286,7 +364,7 @@ class GttcPanel extends HTMLElement {
     return `
       <div class="preset-group">
         <select class="preset-select" id="presetSelect">
-          <option value="" ${!s.active_preset ? "selected" : ""}>Custom Schedule</option>
+          <option value="" ${!s.active_preset ? "selected" : ""}>No preset (base fallback)</option>
           ${Object.entries(presets).map(([key, label]) =>
             `<option value="${key}" ${s.active_preset === key ? "selected" : ""}>${label}</option>`
           ).join("")}
@@ -787,10 +865,10 @@ class GttcPanel extends HTMLElement {
     }
 
     // "Manage in Settings" link
-    this._addClick("goToWindowSettings", () => {
+    root.querySelectorAll(".js-window-settings").forEach(btn => btn.addEventListener("click", () => {
       this._activeMainTab = "settings";
       this._loadSettingsData();
-    });
+    }));
 
     // Boost buttons
     root.querySelectorAll(".boost-btn").forEach(btn => {
@@ -924,7 +1002,17 @@ class GttcPanel extends HTMLElement {
     // Preset selector
     const presetSelect = root.getElementById("presetSelect");
     if (presetSelect) {
-      presetSelect.addEventListener("change", () => this._setPreset(presetSelect.value));
+      presetSelect.addEventListener("change", () => {
+        const value = presetSelect.value;
+        if (!value && this._schedule.active_preset) {
+          const summary = this._baseScheduleSummary();
+          if (!confirm(`Turn off the "${this._schedule.preset_labels?.[this._schedule.active_preset] || this._schedule.active_preset}" preset?\n\nThe house will fall back to the base schedule${summary ? ` (${summary})` : ""}.`)) {
+            presetSelect.value = this._schedule.active_preset;
+            return;
+          }
+        }
+        this._setPreset(value);
+      });
     }
 
     // Schedule mode selector
@@ -933,8 +1021,10 @@ class GttcPanel extends HTMLElement {
       modeSelect.addEventListener("change", () => this._setScheduleMode(modeSelect.value));
     }
 
-    // Cancel override
-    this._addClick("cancelOverrideBtn", () => this._cancelOverride(), true);
+    // Cancel override — the header and the banner both carry one, so bind by class
+    root.querySelectorAll(".js-cancel-override").forEach(btn => {
+      btn.addEventListener("click", (e) => { e.stopPropagation(); this._cancelOverride(); });
+    });
 
     // Undo / Redo
     this._addClick("undoBtn", () => this._undo());
@@ -1071,6 +1161,7 @@ class GttcPanel extends HTMLElement {
   }
 
   _closeAllModals() {
+    this._repaintPending = false;
     this._editingEntry = null;
     this._showCopyModal = false;
     this._copyingEntry = null;
@@ -1102,6 +1193,7 @@ class GttcPanel extends HTMLElement {
     const origEnd = entry.time_end;
     this._wasDragging = false;
 
+    this._dragActive = true;
     const onMove = (me) => {
       this._wasDragging = true;
       const x = me.clientX - timelineRect.left;
@@ -1131,6 +1223,7 @@ class GttcPanel extends HTMLElement {
     const onUp = () => {
       document.removeEventListener("mousemove", onMove);
       document.removeEventListener("mouseup", onUp);
+      this._dragActive = false;
 
       if (!this._wasDragging) return;
 
@@ -1139,7 +1232,7 @@ class GttcPanel extends HTMLElement {
       const newEnd = block ? block.dataset.dragEnd || origEnd : origEnd;
 
       if (newStart !== origStart || newEnd !== origEnd) {
-        this._resizeEntry(day, origStart, origEnd, newStart, newEnd, entry.target_temp, entry.zone_id);
+        this._resizeEntry(day, entry, newStart, newEnd);
       }
     };
 
@@ -1147,13 +1240,17 @@ class GttcPanel extends HTMLElement {
     document.addEventListener("mouseup", onUp);
   }
 
-  async _resizeEntry(day, oldStart, oldEnd, newStart, newEnd, temp, zoneId) {
+  // update_entry REPLACES the entry, so every field must be sent back —
+  // omitting cooling_temp / away_temp here used to wipe them on every drag.
+  async _resizeEntry(day, entry, newStart, newEnd) {
     const msg = {
       type: "gttc/update_entry",
-      day, time_start: newStart, time_end: newEnd, target_temp: temp,
-      old_time_start: oldStart, old_time_end: oldEnd,
+      day, time_start: newStart, time_end: newEnd, target_temp: entry.target_temp,
+      old_time_start: entry.time_start, old_time_end: entry.time_end,
     };
-    if (zoneId) msg.zone_id = zoneId;
+    if (entry.cooling_temp != null) msg.cooling_temp = entry.cooling_temp;
+    if (entry.away_temp != null) msg.away_temp = entry.away_temp;
+    if (entry.zone_id) msg.zone_id = entry.zone_id;
     const s = this._schedule;
     if (s.active_preset) msg.preset = s.active_preset;
 
@@ -1162,6 +1259,8 @@ class GttcPanel extends HTMLElement {
       await this._loadData();
     } catch (err) {
       console.error("GTTC: Failed to resize entry", err);
+      this._showToast(`Resize failed: ${err.message || err}`, "error");
+      await this._loadData();
     }
   }
 
@@ -1292,8 +1391,11 @@ class GttcPanel extends HTMLElement {
     }
     if (days.length === 0) { alert("Please select at least one day."); return; }
 
+    const awayTempVal = root.getElementById("editAwayTemp")?.value.trim();
+    const awayTemp = awayTempVal ? parseFloat(awayTempVal) : undefined;
     const msg = { type: "gttc/bulk_add_entry", days, time_start: start, time_end: end, target_temp: temp };
     if (coolingTemp !== undefined && !isNaN(coolingTemp)) msg.cooling_temp = coolingTemp;
+    if (awayTemp !== undefined && !isNaN(awayTemp)) msg.away_temp = awayTemp;
     if (zoneId) msg.zone_id = zoneId;
     if (this._schedule.active_preset) msg.preset = this._schedule.active_preset;
 
@@ -1374,6 +1476,20 @@ class GttcPanel extends HTMLElement {
 
   // ── Preset / mode / override actions ──────────────────────────────────────
 
+  // One-line description of the dormant base lists, for the "no preset" warning.
+  _baseScheduleSummary() {
+    const s = this._schedule;
+    if (!s) return "";
+    const list = s.mode === "per_day" ? (s.per_day?.monday || []) : (s.weekday || []);
+    if (list.length === 0) return "empty";
+    if (list.length === 1) {
+      const e = list[0];
+      const allDay = e.time_start === "00:00" && e.time_end >= "23:59";
+      return allDay ? `${e.target_temp}\u00b0 all day` : `${e.target_temp}\u00b0 ${formatTime12(e.time_start)}\u2013${formatTime12(e.time_end)}`;
+    }
+    return `${list.length} blocks`;
+  }
+
   async _setPreset(presetName) {
     try {
       if (presetName) {
@@ -1383,7 +1499,13 @@ class GttcPanel extends HTMLElement {
       }
       await new Promise(r => setTimeout(r, 500));
       await this._loadData();
-    } catch (err) { console.error("GTTC: Failed to set preset", err); }
+      const label = presetName ? (this._schedule?.preset_labels?.[presetName] || presetName) : "Base fallback";
+      this._showToast(`Schedule: ${label}`);
+    } catch (err) {
+      console.error("GTTC: Failed to set preset", err);
+      this._showToast(`Preset not changed: ${err.message || err}`, "error");
+      await this._loadData();
+    }
   }
 
   async _setScheduleMode(mode) {
@@ -1391,7 +1513,11 @@ class GttcPanel extends HTMLElement {
       await this._hass.callWS({ type: "gttc/set_schedule_mode", mode });
       await new Promise(r => setTimeout(r, 300));
       await this._loadData();
-    } catch (err) { console.error("GTTC: Failed to set schedule mode", err); }
+    } catch (err) {
+      console.error("GTTC: Failed to set schedule mode", err);
+      this._showToast(`Mode not changed: ${err.message || err}`, "error");
+      await this._loadData();
+    }
   }
 
   async _cancelOverride() {
@@ -1640,7 +1766,7 @@ class GttcPanel extends HTMLElement {
           <button class="btn btn-outline" id="statusRefreshBtn">
             <ha-icon icon="mdi:refresh"></ha-icon> Refresh
           </button>
-          ${d ? `<span class="status-updated">Updated ${new Date().toLocaleTimeString()}</span>` : ""}
+          ${d && this._lastFetchAt ? `<span class="status-updated">Live · last fetched ${new Date(this._lastFetchAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}</span>` : ""}
         </div>
       </div>
     `;
@@ -1758,10 +1884,10 @@ class GttcPanel extends HTMLElement {
           <div class="override-banner">
             <ha-icon icon="mdi:clock-edit"></ha-icon>
             <div class="override-info">
-              <span class="override-label">Override Active</span>
+              <span class="override-label">${d.override_source === "physical" ? "Held at the thermostat" : "Override active"}</span>
               <span class="override-sub">${d.override_target_temp}° &middot; ${d.override_remaining_minutes}m left</span>
             </div>
-            <button class="btn-cancel-override" id="cancelOverrideBtn" title="Cancel">&#x2715;</button>
+            <button class="btn-cancel-override js-cancel-override" title="Resume schedule">&#x2715;</button>
           </div>
         ` : ""}
         ${this._diagData?.vacation_mode ? (() => {
@@ -1825,7 +1951,7 @@ class GttcPanel extends HTMLElement {
               ${d.windows.open ? `<span class="win-badge">HVAC paused</span>` : ""}
             </div>
             <div style="margin-top:8px">
-              <button class="btn btn-outline btn-sm" id="goToWindowSettings">
+              <button class="btn btn-outline btn-sm js-window-settings">
                 <ha-icon icon="mdi:cog"></ha-icon> Manage
               </button>
             </div>
@@ -2806,7 +2932,7 @@ class GttcPanel extends HTMLElement {
                     <div class="win-sensor-row">
                       <ha-icon icon="mdi:window-closed"></ha-icon>
                       <span class="win-sensor-id">${entityId}</span>
-                      <button class="win-remove-btn" data-sensor="${entityId}" title="Remove">
+                      <button class="win-remove-btn" data-window-sensor="${entityId}" title="Remove">
                         <ha-icon icon="mdi:close"></ha-icon>
                       </button>
                     </div>
@@ -3139,9 +3265,9 @@ class GttcPanel extends HTMLElement {
         this._showToast("Sensor added.");
       } catch (err) { this._showToast(err.message || "Failed to add sensor.", "error"); }
     });
-    root.querySelectorAll(".win-remove-btn").forEach(btn => {
+    root.querySelectorAll("[data-window-sensor]").forEach(btn => {
       btn.addEventListener("click", async () => {
-        const entityId = btn.dataset.sensor;
+        const entityId = btn.dataset.windowSensor;
         if (!entityId) return;
         try {
           await this._hass.callWS({ type: "gttc/remove_window_sensor", entity_id: entityId });
@@ -3368,7 +3494,7 @@ class GttcPanel extends HTMLElement {
           </div>
         ` : ""}
         <div style="margin-top:10px">
-          <button class="btn btn-outline btn-sm" id="goToWindowSettings">
+          <button class="btn btn-outline btn-sm js-window-settings">
             <ha-icon icon="mdi:cog"></ha-icon> Manage in Settings
           </button>
         </div>
