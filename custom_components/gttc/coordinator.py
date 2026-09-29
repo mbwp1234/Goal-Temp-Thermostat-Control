@@ -77,6 +77,7 @@ from .const import (
     RAMP_HISTORY_MAX,
     RUNTIME_HISTORY_MAX_DAYS,
     SEASON_COOLING,
+    SEASON_DEMAND_MARGIN,
     SEASON_HEATING,
     SEASONAL_RECOMMEND_HOURS,
     SEASONAL_SWITCH_MARGIN,
@@ -114,6 +115,11 @@ PHYSICAL_ECHO_TOLERANCE = 1.0  # Rounding slack when matching our echoed write
 # NEW mode (e.g. last winter's 75° heat setpoint). That is not a person at the
 # wall, so setpoint changes this soon after a mode change only reseed.
 PHYSICAL_MODE_SETTLE = timedelta(seconds=30)
+# The T6 sometimes re-reports a setpoint GTTC wrote minutes earlier (seen
+# 8.5 min later, after a fan-mode call). An exact match to one of our own
+# recent writes is an echo; a person nudging the dial lands more than 0.3 away.
+PHYSICAL_STALE_WINDOW = timedelta(minutes=15)
+PHYSICAL_STALE_TOLERANCE = 0.3
 
 
 class GTTCCoordinator(DataUpdateCoordinator):
@@ -257,6 +263,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self._pending_write_temp: float | None = None
         self._pending_write_until: datetime | None = None
         self._mode_changed_at: datetime | None = None
+        self._own_mode_write_at: datetime | None = None
+        self._recent_writes: list[tuple[float, datetime]] = []
         self._unsub_thermostat_listener = None
 
         # Fan pre-cool effectiveness tracking
@@ -333,12 +341,19 @@ class GTTCCoordinator(DataUpdateCoordinator):
 
     def _note_own_write(self, temperature: float) -> None:
         """Record a setpoint GTTC is about to write so its echo is ignored."""
+        now = datetime.now(timezone.utc)
         self._pending_write_temp = temperature
-        self._pending_write_until = datetime.now(timezone.utc) + PHYSICAL_ECHO_WINDOW
+        self._pending_write_until = now + PHYSICAL_ECHO_WINDOW
         self._known_thermostat_setpoint = temperature
+        self._recent_writes = [
+            (t, at) for t, at in self._recent_writes if now - at <= PHYSICAL_STALE_WINDOW
+        ]
+        self._recent_writes.append((temperature, now))
 
     def _is_own_write_echo(self, setpoint: float) -> bool:
         """Whether an observed setpoint is the thermostat echoing our own write."""
+        if self._is_stale_own_write(setpoint):
+            return True
         if self._pending_write_temp is None or self._pending_write_until is None:
             return False
         if datetime.now(timezone.utc) > self._pending_write_until:
@@ -347,6 +362,15 @@ class GTTCCoordinator(DataUpdateCoordinator):
             self._pending_write_until = None
             return False
         return abs(setpoint - self._pending_write_temp) <= PHYSICAL_ECHO_TOLERANCE
+
+    def _is_stale_own_write(self, setpoint: float) -> bool:
+        """Whether the thermostat is re-reporting a value GTTC wrote recently."""
+        now = datetime.now(timezone.utc)
+        return any(
+            now - at <= PHYSICAL_STALE_WINDOW
+            and abs(setpoint - temp) <= PHYSICAL_STALE_TOLERANCE
+            for temp, at in self._recent_writes
+        )
 
     def _within_mode_settle(self) -> bool:
         """Whether the thermostat's HVAC mode changed moments ago."""
@@ -364,6 +388,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
         old_state = event.data.get("old_state")
         if old_state is not None and old_state.state != new_state.state:
             self._mode_changed_at = datetime.now(timezone.utc)
+            self._maybe_adopt_wall_mode(old_state.state, new_state.state)
 
         try:
             raw = new_state.attributes.get(ATTR_TEMPERATURE)
@@ -406,6 +431,31 @@ class GTTCCoordinator(DataUpdateCoordinator):
             self.manual_override_minutes,
         )
         self.hass.async_create_task(self._async_apply_physical_override(setpoint))
+
+    def _maybe_adopt_wall_mode(self, old_mode: str, new_mode: str) -> None:
+        """Follow a heat/cool change made at the wall unit.
+
+        Otherwise GTTC keeps its season and writes heating targets into cool
+        mode (or the reverse): a heat-season 71° becomes an AC setpoint.
+        """
+        if old_mode in ("unavailable", "unknown"):
+            return  # a reconnect reporting the mode it already had
+        if (
+            self._own_mode_write_at is not None
+            and datetime.now(timezone.utc) - self._own_mode_write_at <= PHYSICAL_MODE_SETTLE
+        ):
+            return  # our own mode change, or a late report of the old one
+        wanted = {"cool": SEASON_COOLING, "heat": SEASON_HEATING}
+        season = wanted.get(new_mode)
+        if season is None or season == self.season:
+            return
+        _LOGGER.info(
+            "Thermostat switched %s → %s at the wall — following it to %s season",
+            old_mode,
+            new_mode,
+            season,
+        )
+        self.hass.async_create_task(self.async_set_season(season, apply_hvac=False))
 
     async def _async_apply_physical_override(self, setpoint: float) -> None:
         """Create a manual override from a setpoint change made at the wall unit."""
@@ -610,6 +660,12 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     await self._set_thermostat_temp(park_temp)
                     self._last_thermostat_temp = park_temp
                 self._log_action(ACTION_REASON_WINDOW, park_temp or self.target_temp or 0)
+                # Indoor readings mean nothing with a window open, and the
+                # recommendation is not re-evaluated on this path: a running
+                # countdown would keep "counting" hours nobody checked and
+                # could switch the moment the window closes.
+                self._cooling_conditions_since = None
+                self._heating_conditions_since = None
                 return self._build_state_dict()
 
             # Auto-switch active zone when the current schedule entry
@@ -1588,6 +1644,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
         # The mode's stored setpoint is about to be reported back — make sure
         # it isn't taken for someone changing the wall unit.
         self._mode_changed_at = datetime.now(timezone.utc)
+        self._own_mode_write_at = self._mode_changed_at
         try:
             await self.hass.services.async_call(
                 "climate",
@@ -1754,22 +1811,27 @@ class GTTCCoordinator(DataUpdateCoordinator):
 
         now = datetime.now(timezone.utc)
 
-        # Outdoor vs indoor alone is not a reason to switch: every warm day is
-        # followed by a night several degrees cooler than the house, while the
-        # house still wants cooling. The house must also be on the far side of
-        # the OTHER season's goal — genuinely cold before heat, warm before AC.
+        # Demand, not weather, decides. The house must be past the OTHER
+        # season's goal by SEASON_DEMAND_MARGIN, with the current season's
+        # equipment idle (if it is running, the house wants this season).
+        #  - To cooling: the house alone. A heated house sitting at 75° with
+        #    the heat idle needs cooling whatever the outdoor temperature —
+        #    on 9/24–29 every manual switch to cool had outdoor COOLER than
+        #    indoor, and fan pre-cool uses that cool air once in cool mode.
+        #  - To heating: a cold house AND a cold outside, so a warm-day AC
+        #    overshoot can never read as winter.
         if self.season == SEASON_HEATING:
             if (
-                self._outdoor_temp > self.current_temp + SEASONAL_SWITCH_MARGIN
-                and self.current_temp > self._season_goal(SEASON_COOLING)
+                self.current_temp > self._season_goal(SEASON_COOLING) + SEASON_DEMAND_MARGIN
+                and self.hvac_action != HVACAction.HEATING
             ):
                 if self._cooling_conditions_since is None:
                     self._cooling_conditions_since = now
                     _LOGGER.debug(
-                        "Cooling conditions started: outdoor %.1f° > indoor %.1f° + %.1f°",
-                        self._outdoor_temp,
+                        "Cooling conditions started: indoor %.1f° > cool goal %.1f° + %.1f°",
                         self.current_temp,
-                        SEASONAL_SWITCH_MARGIN,
+                        self._season_goal(SEASON_COOLING),
+                        SEASON_DEMAND_MARGIN,
                     )
                 self._heating_conditions_since = None
             else:
@@ -1782,7 +1844,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
         else:  # SEASON_COOLING
             if (
                 self._outdoor_temp < self.current_temp - SEASONAL_SWITCH_MARGIN
-                and self.current_temp < self._season_goal(SEASON_HEATING)
+                and self.current_temp < self._season_goal(SEASON_HEATING) - SEASON_DEMAND_MARGIN
+                and self.hvac_action != HVACAction.COOLING
             ):
                 if self._heating_conditions_since is None:
                     self._heating_conditions_since = now
@@ -1825,7 +1888,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
         finally:
             self._auto_switch_pending = False
 
-    async def async_set_season(self, season: str) -> None:
+    async def async_set_season(self, season: str, apply_hvac: bool = True) -> None:
         """Switch season and immediately update the real thermostat's HVAC mode.
 
         Called by SeasonModeSelect when the user deliberately changes the season.
@@ -1849,7 +1912,22 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 old_season,
                 season,
             )
-            await self._apply_season_hvac_mode()
+            # A hold or boost stores an absolute temperature chosen for the old
+            # season: a Max Cool 70° carried into heat season heats to 70°.
+            if self.manual_override is not None:
+                _LOGGER.info(
+                    "Cancelling %.1f° %s hold — it was set for %s season",
+                    self.manual_override.target_temp,
+                    self.manual_override.source,
+                    old_season,
+                )
+                self.manual_override = None
+            if apply_hvac:
+                await self._apply_season_hvac_mode()
+            else:
+                # The wall already changed mode; still push the new season's
+                # setpoint instead of the mode's stored one.
+                self._last_thermostat_temp = None
 
         await self.async_save()
         # Full recalculation so the target temperature also updates immediately

@@ -214,8 +214,8 @@ class SeasonRecommendationSensor(CoordinatorEntity, SensorEntity):
     """Shows whether outdoor conditions suggest switching to a different season.
 
     State is one of:
-      "Cooling Recommended"  — outdoor has been warmer than indoor for >= threshold hours
-      "Heating Recommended"  — outdoor has been cooler than indoor for >= threshold hours
+      "Cooling Recommended"  — the house has sat above the cool goal (heat idle) for >= threshold hours
+      "Heating Recommended"  — the house has sat below the heat goal on a cold day (AC idle) for >= threshold hours
       "No Change"            — conditions have not been sustained long enough
       "No Outdoor Sensor"    — no outdoor sensor configured, cannot assess
     """

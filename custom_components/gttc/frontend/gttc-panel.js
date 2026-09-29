@@ -3103,7 +3103,7 @@ class GttcPanel extends HTMLElement {
       ${this._boolField("auto_season_switch", "Switch automatically",
         "Switch to the other season once the threshold below is reached. Off: GTTC only recommends.")}
       ${this._rangeField("seasonal_recommend_hours", "Hours before recommending a switch",
-        "Outdoor must stay past indoor (by the switch margin) this long. A reversal resets the count.",
+        "The house must sit 1° past the other season's goal this long, with this season's equipment idle. Heat also needs a cold outside. Any break, or an open window, resets the count.",
         { min: 1, max: 48, step: 1, suffix: "h" })}
       ${this._numField("cooling_comfort", "Cooling comfort", "Used by schedule blocks that have no cooling target of their own.", { min: 60, max: 85 })}
       ${this._settingsClampWarning("cooling_comfort", "Cooling comfort")}
