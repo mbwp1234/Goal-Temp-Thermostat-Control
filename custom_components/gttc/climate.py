@@ -37,6 +37,8 @@ from .const import (
     DOMAIN,
     PRESET_LABEL_TO_KEY,
     PRESETS,
+    SEASON_COOLING,
+    SEASON_HEATING,
 )
 from .coordinator import GTTCCoordinator
 
@@ -164,6 +166,12 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
             await self.coordinator.async_set_temperature(float(temp))
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        # Heat and cool ARE the season: route them through it so GTTC's targets
+        # follow, instead of writing heating goals into cool mode.
+        season = {HVACMode.HEAT: SEASON_HEATING, HVACMode.COOL: SEASON_COOLING}.get(hvac_mode)
+        if season is not None and season != self.coordinator.season:
+            await self.coordinator.async_set_season(season)
+            return
         await self.coordinator.async_set_hvac_mode(hvac_mode)
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:

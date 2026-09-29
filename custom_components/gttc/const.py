@@ -99,9 +99,15 @@ DEFAULT_COOLING_AWAY = 76.0      # nobody-home setback (UP, not down, in summer)
 # surfacing it as a recommendation.
 DEFAULT_AUTO_SEASON_SWITCH = False
 
-# Outdoor temp must exceed indoor temp by this many °F before the season
-# switch recommendation countdown starts.
+# Heating season only counts toward a switch to heat when outdoor is at least
+# this many °F colder than indoor (a cold house on a cold night).
 SEASONAL_SWITCH_MARGIN = 3.0
+
+# The house must be this far past the OTHER season's goal before the switch
+# countdown runs: above cool goal + margin (heat idle) → cooling; below heat
+# goal - margin (AC idle) → heating. Heat and cool goals sit 0.7–3° apart, so
+# without it an AC overshoot or an afternoon's drift counts as a new season.
+SEASON_DEMAND_MARGIN = 1.0
 
 # How many hours of sustained opposite-season conditions before the
 # SeasonSwitchRecommended binary sensor fires.  12 hours = "it's been warm
