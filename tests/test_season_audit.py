@@ -193,9 +193,16 @@ async def test_reconnect_reporting_a_mode_is_not_a_wall_change():
 
 
 @pytest.mark.asyncio
-async def test_heat_cool_at_the_wall_leaves_the_season_alone():
+async def test_heat_cool_at_the_wall_is_adopted_since_v240():
     coord = _wall_coord(SEASON_HEATING)
     await _dispatch_event(coord, _state_event("heat_cool", 71.0, "heat"))
+    assert coord.season == "heat_cool"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_wall_mode_leaves_the_season_alone():
+    coord = _wall_coord(SEASON_HEATING)
+    await _dispatch_event(coord, _state_event("dry", 71.0, "heat"))
     assert coord.season == SEASON_HEATING
 
 

@@ -28,6 +28,7 @@ from .const import (
     ACTION_REASON_TOU,
     ACTION_REASON_VACATION,
     ACTION_REASON_WINDOW,
+    ACTION_REASON_COOL_LOCKOUT,
     BOOST_TYPES,
     BRIAN_NOTIFY_SERVICE,
     CONF_AUTO_SEASON_SWITCH,
@@ -78,7 +79,20 @@ from .const import (
     RUNTIME_HISTORY_MAX_DAYS,
     SEASON_COOLING,
     SEASON_DEMAND_MARGIN,
+    SEASON_HEAT_COOL,
     SEASON_HEATING,
+    SEASONS,
+    CONF_COOL_LOCKOUT_TEMP,
+    CONF_HEAT_COOL_LADDER,
+    CONF_HEAT_COOL_MIN_GAP,
+    CONF_HEAT_COOL_SETTLE_DAYS,
+    COOL_LOCKOUT_PARK,
+    DEFAULT_COOL_LOCKOUT_TEMP,
+    DEFAULT_HEAT_COOL_LADDER,
+    DEFAULT_HEAT_COOL_MIN_GAP,
+    DEFAULT_HEAT_COOL_SETTLE_DAYS,
+    HEAT_COOL_PARK_HIGH,
+    HEAT_COOL_PARK_LOW,
     SEASONAL_RECOMMEND_HOURS,
     SEASONAL_SWITCH_MARGIN,
     STORAGE_KEY,
@@ -120,6 +134,14 @@ PHYSICAL_MODE_SETTLE = timedelta(seconds=30)
 # recent writes is an echo; a person nudging the dial lands more than 0.3 away.
 PHYSICAL_STALE_WINDOW = timedelta(minutes=15)
 PHYSICAL_STALE_TOLERANCE = 0.3
+# A band write is two setpoints, and the thermostat may move one end while it
+# applies the other. Reports this soon after our own band write only reseed.
+RANGE_WRITE_SETTLE = timedelta(seconds=30)
+# If the thermostat still reports a different band than we wrote after this
+# long (and no one claimed it at the wall), write ours again — at most once
+# per RANGE_REWRITE_INTERVAL so a thermostat that refuses cannot loop us.
+RANGE_MISMATCH_GRACE = timedelta(seconds=60)
+RANGE_REWRITE_INTERVAL = timedelta(minutes=5)
 
 
 class GTTCCoordinator(DataUpdateCoordinator):
@@ -187,6 +209,36 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self._heating_conditions_since: datetime | None = None
         # Guards against scheduling multiple auto-switch tasks simultaneously.
         self._auto_switch_pending: bool = False
+
+        # Heat/cool — both setpoints at once, the house drifting between them.
+        self.heat_cool_ladder: bool = bool(
+            data.get(CONF_HEAT_COOL_LADDER, DEFAULT_HEAT_COOL_LADDER)
+        )
+        self.cool_lockout_temp: float = float(
+            data.get(CONF_COOL_LOCKOUT_TEMP, DEFAULT_COOL_LOCKOUT_TEMP)
+        )
+        self.heat_cool_settle_days: float = float(
+            data.get(CONF_HEAT_COOL_SETTLE_DAYS, DEFAULT_HEAT_COOL_SETTLE_DAYS)
+        )
+        self.heat_cool_min_gap: float = float(
+            data.get(CONF_HEAT_COOL_MIN_GAP, DEFAULT_HEAT_COOL_MIN_GAP)
+        )
+        # The band's goals (zone terms, before offset) and what GTTC did to them
+        self.target_low: float | None = None
+        self.target_high: float | None = None
+        self.cool_locked_out: bool = False
+        self._gap_adjusted_from: float | None = None
+        # When each side of the equipment last ran while in heat/cool — the
+        # ladder leaves for a single season once one side has been quiet for
+        # heat_cool_settle_days. Persisted, or every restart restarts the wait.
+        self._last_heat_call: datetime | None = None
+        self._last_cool_call: datetime | None = None
+        # Band write bookkeeping (thermostat terms, after offset)
+        self._last_thermostat_range: tuple[float, float] | None = None
+        self._known_thermostat_range: tuple[float, float] | None = None
+        self._range_write_at: datetime | None = None
+        self._range_mismatch_since: datetime | None = None
+        self._range_rewrite_at: datetime | None = None
 
         # Sub-managers
         self.zone_manager = ZoneManager(hass, config_entry.entry_id)
@@ -315,6 +367,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
         # Seed the known setpoint from the current state so the first event
         # after a restart doesn't look like a user change.
         self._known_thermostat_setpoint = self._read_thermostat_setpoint()
+        self._known_thermostat_range = self._read_thermostat_range()
 
         self._unsub_thermostat_listener = async_track_state_change_event(
             self.hass,
@@ -338,6 +391,30 @@ class GTTCCoordinator(DataUpdateCoordinator):
             return float(value) if value is not None else None
         except (TypeError, ValueError):
             return None
+
+    def _read_thermostat_range(self) -> tuple[float, float] | None:
+        """Read the real thermostat's heat/cool setpoints, when it has both."""
+        state = self.hass.states.get(self.thermostat_entity)
+        if state is None:
+            return None
+        return self._range_of(state)
+
+    @staticmethod
+    def _range_of(state) -> tuple[float, float] | None:
+        try:
+            low = state.attributes.get("target_temp_low")
+            high = state.attributes.get("target_temp_high")
+            if low is None or high is None:
+                return None
+            return float(low), float(high)
+        except (TypeError, ValueError, AttributeError):
+            return None
+
+    def _within_range_settle(self) -> bool:
+        """Whether GTTC wrote a band moments ago."""
+        if self._range_write_at is None:
+            return False
+        return datetime.now(timezone.utc) - self._range_write_at <= RANGE_WRITE_SETTLE
 
     def _note_own_write(self, temperature: float) -> None:
         """Record a setpoint GTTC is about to write so its echo is ignored."""
@@ -390,6 +467,12 @@ class GTTCCoordinator(DataUpdateCoordinator):
             self._mode_changed_at = datetime.now(timezone.utc)
             self._maybe_adopt_wall_mode(old_state.state, new_state.state)
 
+        # In heat/cool the thermostat reports two setpoints and no single one
+        band = self._range_of(new_state) if new_state.state == "heat_cool" else None
+        if band is not None:
+            self._handle_range_report(*band)
+            return
+
         try:
             raw = new_state.attributes.get(ATTR_TEMPERATURE)
             setpoint = float(raw) if raw is not None else None
@@ -432,6 +515,59 @@ class GTTCCoordinator(DataUpdateCoordinator):
         )
         self.hass.async_create_task(self._async_apply_physical_override(setpoint))
 
+    def _handle_range_report(self, low: float, high: float) -> None:
+        """Promote a heat/cool band changed at the wall to a band hold."""
+        previous = self._known_thermostat_range
+        self._known_thermostat_range = (low, high)
+        if previous is None:
+            return
+        changed = [
+            value
+            for value, before in ((low, previous[0]), (high, previous[1]))
+            if abs(value - before) >= PHYSICAL_CHANGE_THRESHOLD
+        ]
+        if not changed:
+            return
+        if self._within_mode_settle() or self._within_range_settle():
+            _LOGGER.debug(
+                "Thermostat band %.1f–%.1f° arrived with a mode change or our own "
+                "band write — not an override",
+                low,
+                high,
+            )
+            return
+        if all(self._is_stale_own_write(value) for value in changed):
+            _LOGGER.debug("Thermostat band %.1f–%.1f° echoes GTTC's own write", low, high)
+            return
+        _LOGGER.info(
+            "Physical heat/cool change detected: %.1f–%.1f° → %.1f–%.1f° — "
+            "holding for %d minutes",
+            previous[0],
+            previous[1],
+            low,
+            high,
+            self.manual_override_minutes,
+        )
+        self.hass.async_create_task(self._async_apply_physical_range(low, high))
+
+    async def _async_apply_physical_range(self, low: float, high: float) -> None:
+        """Hold a band set at the wall unit, exactly as the thermostat has it."""
+        self.manual_override = ManualOverride(
+            target_temp=round((low + high) / 2, 1),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            duration_minutes=self.manual_override_minutes,
+            zone_id=self.zone_manager.active_zone_id,
+            source=OVERRIDE_SOURCE_PHYSICAL,
+            target_low=low,
+            target_high=high,
+        )
+        self.target_low, self.target_high = low, high
+        # Holds skip the zone offset, so the next cycle computes this same band
+        self._last_thermostat_range = (low, high)
+        self._log_action(ACTION_REASON_PHYSICAL_OVERRIDE, low, high)
+        await self.async_save()
+        self.async_set_updated_data(self._build_state_dict())
+
     def _maybe_adopt_wall_mode(self, old_mode: str, new_mode: str) -> None:
         """Follow a heat/cool change made at the wall unit.
 
@@ -445,7 +581,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
             and datetime.now(timezone.utc) - self._own_mode_write_at <= PHYSICAL_MODE_SETTLE
         ):
             return  # our own mode change, or a late report of the old one
-        wanted = {"cool": SEASON_COOLING, "heat": SEASON_HEATING}
+        wanted = {"cool": SEASON_COOLING, "heat": SEASON_HEATING, "heat_cool": SEASON_HEAT_COOL}
         season = wanted.get(new_mode)
         if season is None or season == self.season:
             return
@@ -523,7 +659,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 self.windows_open_override = bool(data["windows_open_override"])
             if "tracked_persons" in data and isinstance(data["tracked_persons"], list):
                 self.zone_manager.tracked_persons = data["tracked_persons"]
-            if "season" in data and data["season"] in (SEASON_HEATING, SEASON_COOLING):
+            if "season" in data and data["season"] in SEASONS:
                 self.season = data["season"]
             if "cooling_comfort" in data and data["cooling_comfort"] is not None:
                 try:
@@ -542,6 +678,25 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     pass
             if "auto_season_switch" in data:
                 self.auto_season_switch = bool(data["auto_season_switch"])
+            if "heat_cool_ladder" in data:
+                self.heat_cool_ladder = bool(data["heat_cool_ladder"])
+            for key in ("cool_lockout_temp", "heat_cool_settle_days", "heat_cool_min_gap"):
+                if data.get(key) is not None:
+                    try:
+                        setattr(self, key, float(data[key]))
+                    except (ValueError, TypeError):
+                        pass
+            for key in ("_last_heat_call", "_last_cool_call"):
+                raw = data.get(key.lstrip("_"))
+                if raw:
+                    try:
+                        setattr(self, key, datetime.fromisoformat(raw))
+                    except (ValueError, TypeError):
+                        pass
+            if self.season == SEASON_HEAT_COOL:
+                now = datetime.now(timezone.utc)
+                self._last_heat_call = self._last_heat_call or now
+                self._last_cool_call = self._last_cool_call or now
             if "vacation_mode" in data and data["vacation_mode"]:
                 try:
                     vm = VacationMode.from_dict(data["vacation_mode"])
@@ -583,6 +738,16 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 "cooling_away_temp": self.cooling_away_temp,
                 "seasonal_recommend_hours": self.seasonal_recommend_hours,
                 "auto_season_switch": self.auto_season_switch,
+                "heat_cool_ladder": self.heat_cool_ladder,
+                "cool_lockout_temp": self.cool_lockout_temp,
+                "heat_cool_settle_days": self.heat_cool_settle_days,
+                "heat_cool_min_gap": self.heat_cool_min_gap,
+                "last_heat_call": (
+                    self._last_heat_call.isoformat() if self._last_heat_call else None
+                ),
+                "last_cool_call": (
+                    self._last_cool_call.isoformat() if self._last_cool_call else None
+                ),
                 "vacation_mode": (
                     self.vacation_mode.to_dict() if self.vacation_mode else None
                 ),
@@ -638,6 +803,18 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 _LOGGER.debug(
                     "Window open detected — suspending thermostat control"
                 )
+                if self.season == SEASON_HEAT_COOL and self.hvac_mode == HVACMode.HEAT_COOL:
+                    park = (
+                        max(self.get_thermostat_min_temp(), HEAT_COOL_PARK_LOW),
+                        min(self.get_thermostat_max_temp(), HEAT_COOL_PARK_HIGH),
+                    )
+                    if self._last_thermostat_range != park:
+                        await self._set_thermostat_range(*park)
+                        self._last_thermostat_range = park
+                    self._log_action(ACTION_REASON_WINDOW, park[0], park[1])
+                    self._cooling_conditions_since = None
+                    self._heating_conditions_since = None
+                    return self._build_state_dict()
                 # Actively park the thermostat so it doesn't keep running on
                 # its last setpoint. Cooling: push to max_temp so the AC
                 # won't kick on. Heating: push to min_temp so heat won't run.
@@ -706,6 +883,11 @@ class GTTCCoordinator(DataUpdateCoordinator):
 
             # Update season switch recommendation; auto-switches if enabled
             self._update_season_recommendation()
+
+            if self.season == SEASON_HEAT_COOL:
+                await self._update_heat_cool(active_zone)
+                await self.async_save()
+                return self._build_state_dict()
 
             # Determine target temperature (priority hierarchy)
             desired_temp, action_reason = self._calculate_desired_temp()
@@ -818,7 +1000,14 @@ class GTTCCoordinator(DataUpdateCoordinator):
             "season": self.season,
             "suggest_season_switch": self.suggest_season_switch,
             "season_conditions_hours": self.season_conditions_hours,
+            "season_threshold_hours": self.season_threshold_hours,
+            "recommended_season": self.recommended_season,
             "auto_season_switch": self.auto_season_switch,
+            "target_low": self.target_low,
+            "target_high": self.target_high,
+            "cool_locked_out": self.cool_locked_out,
+            "gap_adjusted_from": self._gap_adjusted_from,
+            "heat_cool_min_gap": self.heat_cool_min_gap,
             "vacation_mode": (
                 self.vacation_mode.to_dict() if self.vacation_mode else None
             ),
@@ -951,14 +1140,16 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 pass
         return self.temp_max
 
-    def _calculate_desired_temp(self) -> tuple[float, str]:
+    def _calculate_desired_temp(self, season: str | None = None) -> tuple[float, str]:
         """Determine target temp and the reason for it.
 
         Priority: manual_override > vacation > occupancy > schedule > fallback.
-        Returns (temperature, action_reason).
+        Returns (temperature, action_reason). ``season`` asks for one side's
+        answer — heat/cool calls it once for each end of the band.
         """
-        comfort = self._get_comfort_reference()
-        in_cooling = self.season == SEASON_COOLING
+        season = season or self.season
+        comfort = self._get_comfort_reference(season)
+        in_cooling = season == SEASON_COOLING
 
         # 1. Manual override (highest priority)
         if self.manual_override and not self.manual_override.is_expired:
@@ -1029,19 +1220,20 @@ class GTTCCoordinator(DataUpdateCoordinator):
         temp = self.target_temp if self.target_temp is not None else self._default_comfort_temp
         return temp, ACTION_REASON_FALLBACK
 
-    def _get_comfort_reference(self) -> float:
+    def _get_comfort_reference(self, season: str | None = None) -> float:
         """Return the current comfort temperature for setback calculations.
 
         Uses the most recent scheduled comfort entry (season-aware), falling
         back to the season's default comfort temperature.
         """
+        season = season or self.season
         if self.schedule_enabled:
             entry = self.scheduler.get_current_entry()
             if entry:
-                if self.season == SEASON_COOLING and entry.cooling_temp is not None:
+                if season == SEASON_COOLING and entry.cooling_temp is not None:
                     return entry.cooling_temp
                 return entry.target_temp
-        if self.season == SEASON_COOLING:
+        if season == SEASON_COOLING:
             return self.cooling_comfort
         return self._default_comfort_temp
 
@@ -1162,7 +1354,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
             return False
         return 0 < minutes_until <= self._learned_ramp_minutes
 
-    def _apply_precondition(self, desired_temp: float) -> float:
+    def _apply_precondition(
+        self, desired_temp: float, season: str | None = None, track: bool = True
+    ) -> float:
         """Start ramping toward the next schedule entry's target before it starts.
 
         Uses an adaptively learned lead time (EMA of past ramp durations) instead
@@ -1183,19 +1377,22 @@ class GTTCCoordinator(DataUpdateCoordinator):
         if minutes_until > lead_time:
             return desired_temp
 
+        season = season or self.season
         next_temp = (
             next_entry.cooling_temp
-            if (self.season == SEASON_COOLING and next_entry.cooling_temp is not None)
+            if (season == SEASON_COOLING and next_entry.cooling_temp is not None)
             else next_entry.target_temp
         )
         gap = next_temp - desired_temp
         if abs(gap) < 1.0:
             # Close enough — record that we arrived on time
-            self._finish_ramp_observation(next_temp)
+            if track:
+                self._finish_ramp_observation(next_temp)
             return desired_temp
 
-        # Track ramp start for learning
-        if self._ramp_start is None and self.current_temp is not None:
+        # Track ramp start for learning (heat/cool tracks the heat end only,
+        # or the two ends would record one ramp twice)
+        if track and self._ramp_start is None and self.current_temp is not None:
             self._ramp_start = (
                 datetime.now(timezone.utc),
                 self.current_temp,
@@ -1403,7 +1600,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 )
             else:
                 effective_temp = entry.target_temp
-            return {
+            info = {
                 "time_start": entry.time_start,
                 "time_end": entry.time_end,
                 "target_temp": entry.target_temp,
@@ -1411,10 +1608,23 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 "effective_temp": effective_temp,
                 "zone_id": entry.zone_id,
             }
+            if self.season == SEASON_HEAT_COOL:
+                info["effective_low"] = entry.target_temp
+                info["effective_high"] = (
+                    entry.cooling_temp if entry.cooling_temp is not None else self.cooling_comfort
+                )
+            return info
         return None
 
     async def async_set_temperature(self, temperature: float) -> None:
         """Handle a temperature set from the virtual climate entity (manual adjustment)."""
+        if self.season == SEASON_HEAT_COOL:
+            # One number in heat/cool re-centres the band around it
+            low = self.target_low if self.target_low is not None else temperature - self.heat_cool_min_gap / 2
+            high = self.target_high if self.target_high is not None else temperature + self.heat_cool_min_gap / 2
+            half = max(self.heat_cool_min_gap, high - low) / 2
+            await self.async_set_range(temperature - half, temperature + half)
+            return
         # Clamp to valid range
         temperature = max(self.temp_min, min(self.temp_max, temperature))
 
@@ -1464,6 +1674,189 @@ class GTTCCoordinator(DataUpdateCoordinator):
         await self.async_save()
 
         self.async_set_updated_data(self._build_state_dict())
+
+    async def async_set_range(self, low: float, high: float) -> None:
+        """Hold a heat/cool band (from the climate entity or a dashboard).
+
+        No learning and no schedule-override tracking: those are heating
+        patterns, and a band is not one number to learn.
+        """
+        low = max(self.temp_min, min(self.temp_max, float(low)))
+        high = max(self.temp_min, min(self.temp_max, float(high)))
+        if high - low < self.heat_cool_min_gap:
+            low = high - self.heat_cool_min_gap
+        low, high = round(low, 1), round(high, 1)
+        self.manual_override = ManualOverride(
+            target_temp=round((low + high) / 2, 1),
+            started_at=datetime.now(timezone.utc).isoformat(),
+            duration_minutes=self.manual_override_minutes,
+            zone_id=self.zone_manager.active_zone_id,
+            target_low=low,
+            target_high=high,
+        )
+        self.target_low, self.target_high = low, high
+        if self.hvac_mode == HVACMode.HEAT_COOL:
+            await self._set_thermostat_range(low, high)
+            self._last_thermostat_range = (low, high)
+        self._log_action(ACTION_REASON_OVERRIDE, low, high)
+        await self.async_save()
+        self.async_set_updated_data(self._build_state_dict())
+
+    async def _set_thermostat_range(self, low: float, high: float) -> None:
+        """Write both heat/cool setpoints, widening before narrowing.
+
+        The thermostat applies the two setpoints one after the other and keeps
+        them at least its Auto Differential apart. Moving a band up by writing
+        the new heat end first would, for a moment, sit it inside the old cool
+        end — and the thermostat would push the cool end away by itself. So a
+        move first writes the union of old and new (always wide enough), then
+        the new band.
+        """
+        if not self._available:
+            _LOGGER.warning("Thermostat %s is not available", self.thermostat_entity)
+            return
+        low, high = round(low, 1), round(high, 1)
+        steps: list[tuple[float, float]] = []
+        prev = self._known_thermostat_range or self._read_thermostat_range()
+        if prev is not None:
+            wide = (min(prev[0], low), max(prev[1], high))
+            if wide != (low, high) and wide != prev:
+                steps.append(wide)
+        steps.append((low, high))
+        for step_low, step_high in steps:
+            self._note_own_write(step_low)
+            self._note_own_write(step_high)
+            self._known_thermostat_range = (step_low, step_high)
+            self._range_write_at = datetime.now(timezone.utc)
+            try:
+                await self.hass.services.async_call(
+                    "climate",
+                    "set_temperature",
+                    {
+                        "entity_id": self.thermostat_entity,
+                        "target_temp_low": step_low,
+                        "target_temp_high": step_high,
+                    },
+                    blocking=True,
+                )
+            except Exception as err:
+                _LOGGER.error(
+                    "Failed to set heat/cool band on %s to %.1f–%.1f: %s",
+                    self.thermostat_entity,
+                    step_low,
+                    step_high,
+                    err,
+                )
+                return
+
+    async def _update_heat_cool(self, active_zone) -> None:
+        """One control cycle in heat/cool: compute both ends and write the band."""
+        now = datetime.now(timezone.utc)
+        gap = self.heat_cool_min_gap
+        override = (
+            self.manual_override
+            if self.manual_override and not self.manual_override.is_expired
+            else None
+        )
+        self._gap_adjusted_from = None
+
+        if override is not None:
+            reason = (
+                ACTION_REASON_PHYSICAL_OVERRIDE if override.is_physical else ACTION_REASON_OVERRIDE
+            )
+            if override.is_range:
+                low, high = override.target_low, override.target_high
+            else:
+                # A single-number hold from before the switch: centre a band on it
+                low, high = override.target_temp - gap / 2, override.target_temp + gap / 2
+            low_reason = high_reason = reason
+        else:
+            low, low_reason = self._calculate_desired_temp(SEASON_HEATING)
+            high, high_reason = self._calculate_desired_temp(SEASON_COOLING)
+            pre = self._apply_precondition(low, SEASON_HEATING)
+            if pre != low:
+                low, low_reason = pre, ACTION_REASON_PRECONDITION
+            pre = self._apply_precondition(high, SEASON_COOLING, track=False)
+            if pre != high:
+                high, high_reason = pre, ACTION_REASON_PRECONDITION
+            stepped = self._apply_gradual_recovery(low)
+            if stepped != low:
+                low, low_reason = stepped, ACTION_REASON_HEAT_PUMP
+
+        cur = self.current_temp
+        reason = high_reason if cur is not None and cur > high else low_reason
+
+        t_low = self._calculate_thermostat_target(low, active_zone)
+        t_high = self._calculate_thermostat_target(high, active_zone)
+
+        # The AC stays off on a cold day; the fan moves the warm air instead
+        locked = self._outdoor_temp is not None and self._outdoor_temp < self.cool_lockout_temp
+        self.cool_locked_out = locked
+        if locked:
+            t_high = max(t_high, min(self.get_thermostat_max_temp(), COOL_LOCKOUT_PARK))
+            if cur is not None and cur > high:
+                reason = ACTION_REASON_COOL_LOCKOUT
+        want_fan = locked and cur is not None and cur > high + 0.5
+        if want_fan and not self._fan_precool_fan_on:
+            await self._fan_precool_set_fan("on")
+        elif not want_fan and self._fan_precool_fan_on:
+            await self._fan_precool_set_fan("Auto low")
+
+        # Keep the thermostat's own minimum gap by lowering the heat end
+        if t_high - t_low < gap:
+            shift = t_low - (t_high - gap)
+            self._gap_adjusted_from = round(low, 1)
+            low -= shift
+            t_low -= shift
+
+        t_low, t_high = round(t_low, 1), round(t_high, 1)
+        self.target_low, self.target_high = round(low, 1), round(high, 1)
+        # target_temp keeps meaning "the heating goal" so the heating fallback
+        # and boosts that read it behave as they do in heat season
+        self.target_temp = self.target_low
+        self._log_action(reason, self.target_low, self.target_high)
+
+        if self.hvac_mode != HVACMode.HEAT_COOL:
+            # Off, or mid-switch: never write a band into another mode
+            return
+
+        last = self._last_thermostat_range
+        if (
+            last is None
+            or abs(t_low - last[0]) >= TEMP_HYSTERESIS
+            or abs(t_high - last[1]) >= TEMP_HYSTERESIS
+        ):
+            await self._set_thermostat_range(t_low, t_high)
+            self._last_thermostat_range = (t_low, t_high)
+            self._range_mismatch_since = None
+            return
+
+        # Did the thermostat keep what we wrote?
+        reported = self._read_thermostat_range()
+        mismatch = reported is not None and (
+            abs(reported[0] - last[0]) >= PHYSICAL_CHANGE_THRESHOLD
+            or abs(reported[1] - last[1]) >= PHYSICAL_CHANGE_THRESHOLD
+        )
+        if not mismatch or self._within_range_settle() or override is not None:
+            self._range_mismatch_since = None
+            return
+        if self._range_mismatch_since is None:
+            self._range_mismatch_since = now
+            return
+        if now - self._range_mismatch_since < RANGE_MISMATCH_GRACE:
+            return
+        if self._range_rewrite_at is not None and now - self._range_rewrite_at < RANGE_REWRITE_INTERVAL:
+            return
+        _LOGGER.warning(
+            "Thermostat reports %.1f–%.1f° but GTTC wrote %.1f–%.1f° — writing again",
+            reported[0],
+            reported[1],
+            last[0],
+            last[1],
+        )
+        self._range_rewrite_at = now
+        self._range_mismatch_since = None
+        await self._set_thermostat_range(*last)
 
     async def _track_schedule_override(self, temperature: float) -> bool:
         """Detect when the user repeatedly overrides the same schedule entry.
@@ -1663,6 +2056,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
             # pushes the correct temp to the thermostat (old heat setpoint
             # is meaningless in cool mode and vice-versa).
             self._last_thermostat_temp = None
+            self._last_thermostat_range = None
+            self._known_thermostat_range = None
         except Exception as err:
             _LOGGER.error("Failed to set HVAC mode to %s: %s", hvac_mode, err)
 
@@ -1745,6 +2140,11 @@ class GTTCCoordinator(DataUpdateCoordinator):
             self.seasonal_recommend_hours = float(updates["seasonal_recommend_hours"])
         if "auto_season_switch" in updates:
             self.auto_season_switch = bool(updates["auto_season_switch"])
+        if "heat_cool_ladder" in updates:
+            self.heat_cool_ladder = bool(updates["heat_cool_ladder"])
+        for key in ("cool_lockout_temp", "heat_cool_settle_days", "heat_cool_min_gap"):
+            if key in updates:
+                setattr(self, key, float(updates[key]))
 
         await self.async_save()
         self.async_set_updated_data(self._build_state_dict())
@@ -1753,6 +2153,41 @@ class GTTCCoordinator(DataUpdateCoordinator):
     # Season management
     # ------------------------------------------------------------------
 
+    def _heat_cool_quiet(self) -> tuple[str | None, datetime | None]:
+        """In heat/cool: the season to leave for, and since when the other
+        side of the equipment has been quiet. (None, None) while both sides are
+        still working, or while neither is (mild weather is what heat/cool is
+        for — nothing to leave for)."""
+        hc, cc = self._last_heat_call, self._last_cool_call
+        if hc is None or cc is None:
+            return None, None
+        window = timedelta(days=self.heat_cool_settle_days)
+        now = datetime.now(timezone.utc)
+        if cc <= hc and now - hc <= window:
+            return SEASON_HEATING, cc
+        if hc < cc and now - cc <= window:
+            return SEASON_COOLING, hc
+        return None, None
+
+    @property
+    def season_threshold_hours(self) -> float:
+        """How long the current season's switch condition must hold."""
+        if self.season == SEASON_HEAT_COOL:
+            return round(self.heat_cool_settle_days * 24, 1)
+        return self.seasonal_recommend_hours
+
+    @property
+    def recommended_season(self) -> str | None:
+        """Where the current conditions point, whether or not they have held
+        long enough yet. The ladder goes through heat/cool, never across it."""
+        if self.season == SEASON_HEATING and self._cooling_conditions_since is not None:
+            return SEASON_HEAT_COOL if self.heat_cool_ladder else SEASON_COOLING
+        if self.season == SEASON_COOLING and self._heating_conditions_since is not None:
+            return SEASON_HEAT_COOL if self.heat_cool_ladder else SEASON_HEATING
+        if self.season == SEASON_HEAT_COOL:
+            return self._heat_cool_quiet()[0]
+        return None
+
     @property
     def suggest_season_switch(self) -> bool:
         """True when outdoor conditions have been opposite to the current season
@@ -1760,6 +2195,11 @@ class GTTCCoordinator(DataUpdateCoordinator):
         that it is likely time to switch — the system never acts on it
         automatically."""
         now = datetime.now(timezone.utc)
+        if self.season == SEASON_HEAT_COOL:
+            target, since = self._heat_cool_quiet()
+            if target is None:
+                return False
+            return (now - since).total_seconds() / 3600 >= self.season_threshold_hours
         if self.season == SEASON_HEATING and self._cooling_conditions_since is not None:
             elapsed = (now - self._cooling_conditions_since).total_seconds() / 3600
             return elapsed >= self.seasonal_recommend_hours
@@ -1773,6 +2213,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
         """Hours that opposite-season conditions have been sustained.
         Returns 0.0 when conditions are neutral or no outdoor sensor is available."""
         now = datetime.now(timezone.utc)
+        if self.season == SEASON_HEAT_COOL:
+            target, since = self._heat_cool_quiet()
+            return round((now - since).total_seconds() / 3600, 1) if target else 0.0
         if self.season == SEASON_HEATING and self._cooling_conditions_since is not None:
             return round(
                 (now - self._cooling_conditions_since).total_seconds() / 3600, 1
@@ -1804,12 +2247,22 @@ class GTTCCoordinator(DataUpdateCoordinator):
         Resets the countdown whenever conditions reverse, so a brief warm day
         in winter doesn't linger in the counter.
         """
+        now = datetime.now(timezone.utc)
+        if self.season == SEASON_HEAT_COOL:
+            # Which side of the equipment is still doing any work
+            if self.hvac_action == HVACAction.HEATING:
+                self._last_heat_call = now
+            elif self.hvac_action == HVACAction.COOLING:
+                self._last_cool_call = now
+            self._cooling_conditions_since = None
+            self._heating_conditions_since = None
+            self._maybe_auto_switch()
+            return
+
         if self._outdoor_temp is None or self.current_temp is None:
             self._cooling_conditions_since = None
             self._heating_conditions_since = None
             return
-
-        now = datetime.now(timezone.utc)
 
         # Demand, not weather, decides. The house must be past the OTHER
         # season's goal by SEASON_DEMAND_MARGIN, with the current season's
@@ -1864,14 +2317,18 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     )
                 self._heating_conditions_since = None
 
-        # Auto-switch: if enabled and the recommendation threshold has been
-        # reached, trigger a season change instead of just surfacing it.
+        self._maybe_auto_switch()
+
+    def _maybe_auto_switch(self) -> None:
+        """Act on a recommendation that has held long enough, if allowed."""
         if (
             self.auto_season_switch
             and self.suggest_season_switch
             and not self._auto_switch_pending
         ):
-            target = SEASON_COOLING if self.season == SEASON_HEATING else SEASON_HEATING
+            target = self.recommended_season
+            if target is None:
+                return
             _LOGGER.info(
                 "Auto-switching season %s → %s after %.1fh of sustained conditions",
                 self.season,
@@ -1895,12 +2352,36 @@ class GTTCCoordinator(DataUpdateCoordinator):
         Clears any pending recommendation tracking so the countdown starts fresh
         from the new season baseline.
         """
-        if season not in (SEASON_HEATING, SEASON_COOLING):
+        if season not in SEASONS:
             _LOGGER.warning("Invalid season value: %s", season)
+            return
+        if (
+            season == SEASON_HEAT_COOL
+            and apply_hvac
+            and HVACMode.HEAT_COOL not in self.get_thermostat_hvac_modes()
+        ):
+            _LOGGER.warning(
+                "Thermostat %s has no heat_cool mode — staying in %s season",
+                self.thermostat_entity,
+                self.season,
+            )
             return
 
         old_season = self.season
         self.season = season
+        if old_season != season:
+            if season == SEASON_HEAT_COOL:
+                now = datetime.now(timezone.utc)
+                self._last_heat_call = now
+                self._last_cool_call = now
+            if old_season == SEASON_HEAT_COOL:
+                self.target_low = self.target_high = None
+                self.cool_locked_out = False
+                self._gap_adjusted_from = None
+                self._last_thermostat_range = None
+                self._known_thermostat_range = None
+                if self._fan_precool_fan_on:
+                    await self._fan_precool_set_fan("Auto low")
 
         # Clear recommendation tracking — the user just made a deliberate call
         self._cooling_conditions_since = None
@@ -1964,6 +2445,15 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     "but HVAC mode unchanged (%s)",
                     self.hvac_mode,
                 )
+        elif self.season == SEASON_HEAT_COOL:
+            if HVACMode.HEAT_COOL in supported:
+                await self.async_set_hvac_mode(HVACMode.HEAT_COOL)
+                _LOGGER.info("HVAC mode → heat_cool (heat/cool season)")
+            else:
+                _LOGGER.warning(
+                    "Thermostat does not support heat_cool — HVAC mode unchanged (%s)",
+                    self.hvac_mode,
+                )
         else:  # SEASON_HEATING
             if HVACMode.HEAT in supported:
                 await self.async_set_hvac_mode(HVACMode.HEAT)
@@ -2013,19 +2503,29 @@ class GTTCCoordinator(DataUpdateCoordinator):
     # Action log
     # ------------------------------------------------------------------
 
-    def _log_action(self, reason: str, target_temp: float) -> None:
+    def _log_action(
+        self, reason: str, target_temp: float, target_high: float | None = None
+    ) -> None:
         """Append a setpoint decision to the ring buffer."""
         self._last_action_reason = reason
         # Record decisions, not cycles: a 30s loop repeating the same reason and
         # temperature filled the 200-entry buffer in 100 minutes.
         rounded = round(target_temp, 1)
-        if self.action_log and self.action_log[-1]["reason"] == reason and self.action_log[-1]["target_temp"] == rounded:
+        high = round(target_high, 1) if target_high is not None else None
+        if (
+            self.action_log
+            and self.action_log[-1]["reason"] == reason
+            and self.action_log[-1]["target_temp"] == rounded
+            and self.action_log[-1].get("target_high") == high
+        ):
             return
         entry = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "reason": reason,
-            "target_temp": round(target_temp, 1),
+            "target_temp": rounded,
         }
+        if high is not None:
+            entry["target_high"] = high
         self.action_log.append(entry)
         if len(self.action_log) > ACTION_LOG_MAX:
             self.action_log.pop(0)
@@ -2072,6 +2572,14 @@ class GTTCCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Unknown boost type: %s", boost_type)
             return
         cfg = BOOST_TYPES[boost_type]
+        if self.season == SEASON_HEAT_COOL and self.target_low is not None and self.target_high is not None:
+            await self.async_set_range(
+                self.target_low + cfg["delta"], self.target_high + cfg["delta"]
+            )
+            if self.manual_override is not None:
+                self.manual_override.duration_minutes = cfg["minutes"]
+                await self.async_save()
+            return
         base = self.target_temp or self._default_comfort_temp
         target = base + cfg["delta"]
         target = max(self.temp_min, min(self.temp_max, target))

@@ -236,9 +236,11 @@ class SeasonRecommendationSensor(CoordinatorEntity, SensorEntity):
         if coord._outdoor_temp is None:
             return "No Outdoor Sensor"
         if coord.suggest_season_switch:
-            if coord.season == SEASON_HEATING:
-                return "Cooling Recommended"
-            return "Heating Recommended"
+            return {
+                "cooling": "Cooling Recommended",
+                "heating": "Heating Recommended",
+                "heat_cool": "Heat/Cool Recommended",
+            }.get(coord.recommended_season, "No Change")
         return "No Change"
 
     @property
@@ -257,10 +259,11 @@ class SeasonRecommendationSensor(CoordinatorEntity, SensorEntity):
             ),
             "switch_margin_f": SEASONAL_SWITCH_MARGIN,
             "conditions_sustained_hours": coord.season_conditions_hours,
-            "threshold_hours": coord.seasonal_recommend_hours,
+            "threshold_hours": coord.season_threshold_hours,
+            "recommended_season": coord.recommended_season,
             "hours_until_recommendation": max(
                 0.0,
-                round(coord.seasonal_recommend_hours - coord.season_conditions_hours, 1),
+                round(coord.season_threshold_hours - coord.season_conditions_hours, 1),
             ) if coord.season_conditions_hours > 0 else None,
         }
 

@@ -113,11 +113,9 @@ class SeasonSwitchRecommendedBinarySensor(CoordinatorEntity, BinarySensorEntity)
         coord = self.coordinator
         return {
             "current_season": coord.season,
-            "recommended_season": (
-                "cooling" if coord.season == "heating" else "heating"
-            ),
+            "recommended_season": coord.recommended_season,
             "conditions_sustained_hours": coord.season_conditions_hours,
-            "threshold_hours": coord.seasonal_recommend_hours,
+            "threshold_hours": coord.season_threshold_hours,
             "outdoor_temp": coord._outdoor_temp,
             "indoor_temp": coord.current_temp,
         }

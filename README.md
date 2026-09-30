@@ -139,6 +139,16 @@ When enabled with the Dominion Energy Virginia provider, GTTC adjusts the thermo
 - Super off-peak (midnight–5 AM every day) is used for pre-conditioning
 - On-peak windows are visually overlaid on the schedule editor and temperature chart
 
+### Seasons: Heat, Heat/Cool, Cool
+
+A season picks which of a schedule block's two numbers runs (its heating target or its cooling target) and puts the thermostat in that mode. **Heat/Cool** runs both at once: the thermostat's `heat_cool` mode with the heating target below and the cooling target above, and the house drifts for free in between. It needs a thermostat that offers `heat_cool`; GTTC refuses the season otherwise.
+
+- **Minimum gap** (`heat_cool_min_gap`, default 3°F): set it to your thermostat's own auto-changeover differential. A block narrower than that has its heating end lowered, because a thermostat given a narrower band moves a setpoint by itself.
+- **No AC below** (`cool_lockout_temp`, default 55°F outside): in Heat/Cool the cooling setpoint is parked and the fan circulates instead.
+- **Ladder** (`heat_cool_ladder`, off by default): with auto season switch on, the switch goes Heat → Heat/Cool → Cool and back. It leaves Heat/Cool for a single season once only one side of the equipment has run for `heat_cool_settle_days` (default 5).
+- Automatic switches are demand-based. From Heat, the trigger is the house sitting 1° above the cooling goal with the heat idle. From Cool, it is the house 1° below the heating goal, on a cold day, with the AC idle. The house must hold there for the recommend threshold, and an open window resets the count.
+- A band changed at the wall is held like any other thermostat hold. Band writes widen before they narrow so the thermostat never sees a band narrower than its differential.
+
 ### Pre-conditioning
 When pre-conditioning is enabled, GTTC begins ramping the thermostat toward the next schedule entry's target temperature before the entry starts (default: 60 minutes ahead). Combined with TOU awareness, this means the house reaches comfort temperature right as on-peak rates end.
 
