@@ -326,6 +326,10 @@ async def ws_get_status(
         "current_entry": current_entry.to_dict() if current_entry else None,
         "schedule_enabled": coordinator.schedule_enabled,
         "windows_open": coordinator._are_windows_open(),
+        "season": coordinator.season,
+        "target_low": coordinator.target_low,
+        "target_high": coordinator.target_high,
+        "cool_locked_out": coordinator.cool_locked_out,
     }
     connection.send_result(msg["id"], result)
 
@@ -829,6 +833,8 @@ async def ws_get_diagnostics(
         "override_active": override_active,
         "override_remaining_minutes": override.remaining_minutes if override_active else 0,
         "override_target_temp": override.target_temp if override_active else None,
+        "override_target_low": override.target_low if override_active else None,
+        "override_target_high": override.target_high if override_active else None,
         "override_started_at": override.started_at if override_active else None,
         "override_source": override.source if override_active else None,
         "schedule_enabled": coordinator.schedule_enabled,
@@ -842,8 +848,25 @@ async def ws_get_diagnostics(
         "season": coordinator.season,
         "suggest_season_switch": coordinator.suggest_season_switch,
         "season_conditions_hours": coordinator.season_conditions_hours,
-        "seasonal_recommend_hours": coordinator.seasonal_recommend_hours,
+        "seasonal_recommend_hours": coordinator.season_threshold_hours,
         "auto_season_switch": coordinator.auto_season_switch,
+        "recommended_season": coordinator.recommended_season,
+        "heat_cool": {
+            "low": coordinator.target_low,
+            "high": coordinator.target_high,
+            "cool_locked_out": coordinator.cool_locked_out,
+            "gap_adjusted_from": coordinator._gap_adjusted_from,
+            "min_gap": coordinator.heat_cool_min_gap,
+            "ladder": coordinator.heat_cool_ladder,
+            "cool_lockout_temp": coordinator.cool_lockout_temp,
+            "settle_days": coordinator.heat_cool_settle_days,
+            "last_heat_call": (
+                coordinator._last_heat_call.isoformat() if coordinator._last_heat_call else None
+            ),
+            "last_cool_call": (
+                coordinator._last_cool_call.isoformat() if coordinator._last_cool_call else None
+            ),
+        },
         "cooling_comfort": coordinator.cooling_comfort,
         "cooling_away_temp": coordinator.cooling_away_temp,
         "zone_offset": zone_offset,
@@ -993,7 +1016,7 @@ async def ws_list_window_sensors(
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "gttc/set_season",
-        vol.Required("season"): vol.In(["heating", "cooling"]),
+        vol.Required("season"): vol.In(["heating", "cooling", "heat_cool"]),
         vol.Optional("entry_id"): str,
     }
 )
@@ -1056,6 +1079,10 @@ async def ws_get_config(
             "cooling_away_temp": coordinator.cooling_away_temp,
             "seasonal_recommend_hours": coordinator.seasonal_recommend_hours,
             "auto_season_switch": coordinator.auto_season_switch,
+            "heat_cool_ladder": coordinator.heat_cool_ladder,
+            "cool_lockout_temp": coordinator.cool_lockout_temp,
+            "heat_cool_settle_days": coordinator.heat_cool_settle_days,
+            "heat_cool_min_gap": coordinator.heat_cool_min_gap,
             "suggest_season_switch": coordinator.suggest_season_switch,
             "season_conditions_hours": coordinator.season_conditions_hours,
         },
@@ -1091,6 +1118,10 @@ async def ws_get_config(
             vol.Coerce(float), vol.Range(min=1, max=48)
         ),
         vol.Optional("auto_season_switch"): bool,
+        vol.Optional("heat_cool_ladder"): bool,
+        vol.Optional("cool_lockout_temp"): vol.All(vol.Coerce(float), vol.Range(min=30, max=70)),
+        vol.Optional("heat_cool_settle_days"): vol.All(vol.Coerce(float), vol.Range(min=1, max=30)),
+        vol.Optional("heat_cool_min_gap"): vol.All(vol.Coerce(float), vol.Range(min=0, max=10)),
     }
 )
 @websocket_api.async_response

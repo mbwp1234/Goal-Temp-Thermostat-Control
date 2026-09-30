@@ -38,6 +38,7 @@ from .const import (
     PRESET_LABEL_TO_KEY,
     PRESETS,
     SEASON_COOLING,
+    SEASON_HEAT_COOL,
     SEASON_HEATING,
 )
 from .coordinator import GTTCCoordinator
@@ -95,9 +96,20 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
         return UnitOfTemperature.FAHRENHEIT
 
     @property
+    def _banded(self) -> bool:
+        return self.coordinator.season == SEASON_HEAT_COOL
+
+    @property
     def supported_features(self) -> ClimateEntityFeature:
+        # Heat/cool adds the band, so the thermostat card draws two handles.
+        # The single setpoint stays supported in every mode: HA rejects a
+        # `temperature` call on an entity that does not advertise it, and
+        # scripts (nap mode) send one — in heat/cool it re-centres the band.
+        target = ClimateEntityFeature.TARGET_TEMPERATURE
+        if self._banded:
+            target |= ClimateEntityFeature.TARGET_TEMPERATURE_RANGE
         return (
-            ClimateEntityFeature.TARGET_TEMPERATURE
+            target
             | ClimateEntityFeature.PRESET_MODE
             | ClimateEntityFeature.TURN_ON
             | ClimateEntityFeature.TURN_OFF
@@ -121,7 +133,15 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
 
     @property
     def target_temperature(self) -> float | None:
-        return self.coordinator.target_temp
+        return None if self._banded else self.coordinator.target_temp
+
+    @property
+    def target_temperature_low(self) -> float | None:
+        return self.coordinator.target_low if self._banded else None
+
+    @property
+    def target_temperature_high(self) -> float | None:
+        return self.coordinator.target_high if self._banded else None
 
     @property
     def min_temp(self) -> float:
@@ -158,9 +178,18 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
             ATTR_WINDOWS_OPEN: data.get("windows_open", False),
             "hvac_action_reason": data.get("hvac_action_reason"),
             "vacation_mode": data.get("vacation_mode"),
+            "season": data.get("season"),
+            "cool_locked_out": data.get("cool_locked_out", False),
+            "gap_adjusted_from": data.get("gap_adjusted_from"),
+            "heat_cool_min_gap": data.get("heat_cool_min_gap"),
         }
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
+        low = kwargs.get("target_temp_low")
+        high = kwargs.get("target_temp_high")
+        if low is not None and high is not None:
+            await self.coordinator.async_set_range(float(low), float(high))
+            return
         temp = kwargs.get(ATTR_TEMPERATURE)
         if temp is not None:
             await self.coordinator.async_set_temperature(float(temp))
@@ -168,7 +197,11 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         # Heat and cool ARE the season: route them through it so GTTC's targets
         # follow, instead of writing heating goals into cool mode.
-        season = {HVACMode.HEAT: SEASON_HEATING, HVACMode.COOL: SEASON_COOLING}.get(hvac_mode)
+        season = {
+            HVACMode.HEAT: SEASON_HEATING,
+            HVACMode.COOL: SEASON_COOLING,
+            HVACMode.HEAT_COOL: SEASON_HEAT_COOL,
+        }.get(hvac_mode)
         if season is not None and season != self.coordinator.season:
             await self.coordinator.async_set_season(season)
             return

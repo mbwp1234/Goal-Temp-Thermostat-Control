@@ -16,6 +16,7 @@ from .const import (
     SCHEDULE_MODE_PER_DAY,
     SCHEDULE_MODE_WEEKDAY_WEEKEND,
     SEASON_COOLING,
+    SEASON_HEAT_COOL,
     SEASON_HEATING,
 )
 from .coordinator import GTTCCoordinator
@@ -115,6 +116,7 @@ class SeasonModeSelect(CoordinatorEntity, SelectEntity):
 
     _OPTION_HEATING = "Heating"
     _OPTION_COOLING = "Cooling"
+    _OPTION_HEAT_COOL = "Heat/Cool"
 
     def __init__(self, coordinator, config_entry, name):
         super().__init__(coordinator)
@@ -123,12 +125,14 @@ class SeasonModeSelect(CoordinatorEntity, SelectEntity):
 
     @property
     def options(self) -> list[str]:
-        return [self._OPTION_HEATING, self._OPTION_COOLING]
+        return [self._OPTION_HEATING, self._OPTION_HEAT_COOL, self._OPTION_COOLING]
 
     @property
     def current_option(self) -> str | None:
         if self.coordinator.season == SEASON_COOLING:
             return self._OPTION_COOLING
+        if self.coordinator.season == SEASON_HEAT_COOL:
+            return self._OPTION_HEAT_COOL
         return self._OPTION_HEATING
 
     @property
@@ -136,7 +140,8 @@ class SeasonModeSelect(CoordinatorEntity, SelectEntity):
         return {
             "suggest_switch": self.coordinator.suggest_season_switch,
             "conditions_sustained_hours": self.coordinator.season_conditions_hours,
-            "recommend_hours_threshold": self.coordinator.seasonal_recommend_hours,
+            "recommend_hours_threshold": self.coordinator.season_threshold_hours,
+            "recommended_season": self.coordinator.recommended_season,
         }
 
     async def async_select_option(self, option: str) -> None:
@@ -144,5 +149,7 @@ class SeasonModeSelect(CoordinatorEntity, SelectEntity):
             await self.coordinator.async_set_season(SEASON_COOLING)
         elif option == self._OPTION_HEATING:
             await self.coordinator.async_set_season(SEASON_HEATING)
+        elif option == self._OPTION_HEAT_COOL:
+            await self.coordinator.async_set_season(SEASON_HEAT_COOL)
         else:
             _LOGGER.warning("Unknown season option: %s", option)

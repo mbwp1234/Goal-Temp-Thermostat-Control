@@ -257,6 +257,10 @@ class ManualOverride:
     # Where the override came from: "manual" (dashboard/climate entity) or
     # "physical" (setpoint changed directly on the real thermostat).
     source: str = OVERRIDE_SOURCE_MANUAL
+    # A hold made in heat/cool is a band: both ends, not one number.
+    # target_temp then carries the midpoint for anything that shows one.
+    target_low: float | None = None
+    target_high: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -265,7 +269,14 @@ class ManualOverride:
             "duration_minutes": self.duration_minutes,
             "zone_id": self.zone_id,
             "source": self.source,
+            "target_low": self.target_low,
+            "target_high": self.target_high,
         }
+
+    @property
+    def is_range(self) -> bool:
+        """Whether this hold is a heat/cool band."""
+        return self.target_low is not None and self.target_high is not None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> ManualOverride:
@@ -277,6 +288,8 @@ class ManualOverride:
             # Overrides stored before v2.1.0 have no source — they predate
             # physical detection, so they can only have been manual.
             source=data.get("source", OVERRIDE_SOURCE_MANUAL),
+            target_low=data.get("target_low"),
+            target_high=data.get("target_high"),
         )
 
     @property

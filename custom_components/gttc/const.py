@@ -82,12 +82,43 @@ DEFAULT_PRECONDITION_MINUTES = 30
 # Season management
 SEASON_HEATING = "heating"
 SEASON_COOLING = "cooling"
+# Both at once: the thermostat runs in heat_cool with a heat setpoint below and
+# a cool setpoint above, and the house drifts for free between them.
+SEASON_HEAT_COOL = "heat_cool"
+SEASONS = (SEASON_HEATING, SEASON_COOLING, SEASON_HEAT_COOL)
 
 # Config keys for seasonal / warm-weather settings
 CONF_COOLING_COMFORT = "cooling_comfort"
 CONF_COOLING_AWAY_TEMP = "cooling_away_temp"
 CONF_SEASONAL_RECOMMEND_HOURS = "seasonal_recommend_hours"
 CONF_AUTO_SEASON_SWITCH = "auto_season_switch"
+CONF_HEAT_COOL_LADDER = "heat_cool_ladder"
+CONF_COOL_LOCKOUT_TEMP = "cool_lockout_temp"
+CONF_HEAT_COOL_SETTLE_DAYS = "heat_cool_settle_days"
+CONF_HEAT_COOL_MIN_GAP = "heat_cool_min_gap"
+
+# Auto season switch goes Heat → Heat/Cool → Cool (and back) instead of
+# straight across. Off by default: an install without a heat_cool-capable
+# thermostat keeps the two-season behaviour.
+DEFAULT_HEAT_COOL_LADDER = False
+# In heat/cool the AC is held off below this outdoor temperature (°F) and the
+# fan circulates instead. Most residential compressors are not meant to cool
+# on a cold night, and it is the wrong equipment for a warm upstairs anyway.
+DEFAULT_COOL_LOCKOUT_TEMP = 55.0
+# Leave heat/cool for a single season after this many days with only one side
+# of the equipment running.
+DEFAULT_HEAT_COOL_SETTLE_DAYS = 5.0
+# The thermostat keeps heat and cool setpoints at least this far apart (the T6
+# calls it Auto Differential). GTTC lowers the heat goal to keep it — writing
+# a narrower band makes the thermostat move a setpoint on its own, which then
+# reads as someone at the wall.
+DEFAULT_HEAT_COOL_MIN_GAP = 3.0
+# Parking band for an open window in heat/cool: neither side runs unless the
+# house is genuinely freezing or baking.
+HEAT_COOL_PARK_LOW = 50.0
+HEAT_COOL_PARK_HIGH = 90.0
+# Cooling setpoint while the AC is locked out on a cold day.
+COOL_LOCKOUT_PARK = 85.0
 
 # Warm-weather (cooling season) defaults (°F)
 DEFAULT_COOLING_COMFORT = 74.0   # comfort setpoint when AC is running (daytime)
@@ -151,6 +182,7 @@ ACTION_REASON_HEAT_PUMP = "heat_pump_step"
 ACTION_REASON_FAN_PRECOOL = "fan_precool"
 ACTION_REASON_FALLBACK = "fallback"
 ACTION_REASON_WINDOW = "window_open"
+ACTION_REASON_COOL_LOCKOUT = "cool_lockout"
 
 # In-memory ring buffer size for the action log
 ACTION_LOG_MAX = 200

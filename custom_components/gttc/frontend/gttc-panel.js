@@ -523,18 +523,24 @@ class GttcPanel extends HTMLElement {
       const leftPct = (startMin / 1440) * 100;
       const widthPct = ((endMin - startMin) / 1440) * 100;
       const cooling = this._isCooling();
+      const band = this._isHeatCool() ? this._seasonBand(entry) : null;
       const temp = this._seasonTemp(entry);
-      const other = this._otherSeasonTemp(entry);
+      const other = band ? null : this._otherSeasonTemp(entry);
       const clamp = this._clampNote(entry);
-      const color = temp != null ? tempColor(temp, s.temp_min, s.temp_max) : "var(--divider)";
+      const color = band
+        ? `linear-gradient(90deg, ${tempColor(band.low, s.temp_min, s.temp_max)}, ${tempColor(band.high, s.temp_min, s.temp_max)})`
+        : temp != null ? tempColor(temp, s.temp_min, s.temp_max) : "var(--divider)";
       const textColor = "rgba(255,255,255,0.95)";
       const zoneLabel = entry.zone_id ? ` [${this._getZoneName(entry.zone_id)}]` : "";
       const extraBadges = [
         clamp ? `<span class="block-badge clamp-badge" title="${clamp.text}">⚠</span>` : "",
         other != null ? `<span class="block-badge ${cooling ? "heat-badge" : "cool-badge"}">${cooling ? "▲" : "▼"}${other}°</span>` : "",
-        entry.away_temp != null && !cooling ? `<span class="block-badge away-badge">away ${entry.away_temp}°</span>` : "",
+        entry.away_temp != null && !cooling && !band ? `<span class="block-badge away-badge">away ${entry.away_temp}°</span>` : "",
+        band && band.moved != null ? `<span class="block-badge gap-badge" title="Heat lowered from ${band.moved}° to keep the thermostat's ${this._minGap()}° gap">gap</span>` : "",
       ].filter(Boolean).join("");
-      const tempText = `${this._fmtTemp(temp)}${this._seasonTempIsFallback(entry) ? "*" : ""}`;
+      const tempText = band
+        ? `${this._fmtBand(band)}${this._seasonTempIsFallback(entry) ? "*" : ""}`
+        : `${this._fmtTemp(temp)}${this._seasonTempIsFallback(entry) ? "*" : ""}`;
       return `
         <div class="timeline-block ${compact ? "compact" : ""}"
              style="left:${leftPct}%;width:${widthPct}%;background:${color};color:${textColor}"
@@ -569,8 +575,12 @@ class GttcPanel extends HTMLElement {
         <div class="entry-color" style="background:${color}"></div>
         <div class="entry-info">
           <span class="entry-time">${formatTime12(entry.time_start)} — ${formatTime12(entry.time_end)}</span>
-          <span class="entry-temp">${this._fmtTemp(temp)}<span class="entry-temp-kind">${cooling ? "cool" : "heat"}${this._seasonTempIsFallback(entry) ? " · default" : ""}</span></span>
-          <span class="entry-other">${cooling ? "heat" : "cool"} ${other != null ? other + "°" : "default"}${entry.away_temp != null ? ` · away ${entry.away_temp}°` : ""}</span>
+          ${this._isHeatCool() ? (() => {
+            const band = this._seasonBand(entry);
+            return `<span class="entry-temp">${this._fmtBand(band)}<span class="entry-temp-kind">heat·cool${this._seasonTempIsFallback(entry) ? " · default cool" : ""}</span></span>
+              <span class="entry-other">${band && band.moved != null ? `heat ${band.moved}° lowered for the ${this._minGap()}° gap` : `heat ${entry.target_temp}° · cool ${band ? band.high + "°" : "default"}`}</span>`;
+          })() : `<span class="entry-temp">${this._fmtTemp(temp)}<span class="entry-temp-kind">${cooling ? "cool" : "heat"}${this._seasonTempIsFallback(entry) ? " · default" : ""}</span></span>
+          <span class="entry-other">${cooling ? "heat" : "cool"} ${other != null ? other + "°" : "default"}${entry.away_temp != null ? ` · away ${entry.away_temp}°` : ""}</span>`}
           ${zoneLabel ? `<span class="entry-zone">${zoneLabel}</span>` : ""}
           ${clamp ? `<span class="entry-clamp">⚠ ${clamp.text}</span>` : ""}
         </div>
@@ -596,11 +606,36 @@ class GttcPanel extends HTMLElement {
     return this._season() === "cooling";
   }
 
+  _isHeatCool() {
+    return this._season() === "heat_cool";
+  }
+
+  _minGap() {
+    return this._diagData?.heat_cool?.min_gap ?? this._settingsData?.heat_cool_min_gap ?? 3;
+  }
+
+  // Mirrors _update_heat_cool: both numbers of a block, with the heat end
+  // lowered when the block is narrower than the thermostat's minimum gap.
+  _seasonBand(entry) {
+    if (!entry) return null;
+    const high = entry.cooling_temp != null
+      ? entry.cooling_temp
+      : this._diagData?.cooling_comfort ?? this._settingsData?.cooling_comfort ?? null;
+    if (high == null || entry.target_temp == null) return null;
+    const gap = this._minGap();
+    const low = Math.min(entry.target_temp, Math.round((high - gap) * 10) / 10);
+    return { low, high, moved: low < entry.target_temp ? entry.target_temp : null };
+  }
+
+  _fmtBand(b) {
+    return b ? `${b.low}–${b.high}°` : "—";
+  }
+
   // Mirrors _calculate_desired_temp: cooling uses the entry's cooling_temp,
   // falling back to the global cooling comfort when the entry has none.
   _seasonTemp(entry) {
     if (!entry) return null;
-    if (this._isCooling()) {
+    if (this._isCooling() || this._isHeatCool()) {
       if (entry.cooling_temp != null) return entry.cooling_temp;
       return this._diagData?.cooling_comfort ?? this._settingsData?.cooling_comfort ?? null;
     }
@@ -609,7 +644,7 @@ class GttcPanel extends HTMLElement {
 
   // True when a cooling-season number is the global fallback, not the entry's own.
   _seasonTempIsFallback(entry) {
-    return this._isCooling() && entry && entry.cooling_temp == null;
+    return (this._isCooling() || this._isHeatCool()) && entry && entry.cooling_temp == null;
   }
 
   _otherSeasonTemp(entry) {
@@ -645,15 +680,31 @@ class GttcPanel extends HTMLElement {
     const d = this._diagData;
     if (!d) return "";
     const s = this._schedule;
-    const cooling = this._isCooling();
-    const other = cooling ? "heating" : "cooling";
-    const otherLabel = cooling ? "Heating" : "Cooling";
+    const season = this._season();
+    const cooling = season === "cooling";
+    const both = season === "heat_cool";
+    const LABEL = { heating: "Heating", cooling: "Cooling", heat_cool: "Heat·Cool" };
+    const other = d.recommended_season || (cooling ? "heating" : "cooling");
+    const otherLabel = LABEL[other] || "Cooling";
     const hours = d.season_conditions_hours || 0;
     const need = d.seasonal_recommend_hours || 0;
     const pct = need > 0 ? Math.min(100, (hours / need) * 100) : 0;
     const outdoor = d.features?.outdoor_temp;
+    const hc = d.heat_cool || {};
+    const days = (h) => h >= 48 ? `${(h / 24).toFixed(1)}d` : `${h.toFixed(1)}h`;
     let meta;
-    if (d.suggest_season_switch) {
+    if (both) {
+      // In heat/cool the question is which side is still doing any work
+      const quiet = other === "heating" ? "cooling" : "heating";
+      if (d.suggest_season_switch) {
+        meta = `<b>No ${quiet} for ${days(hours)}</b> — ${otherLabel} recommended`;
+      } else if (hours > 0) {
+        meta = `<b>No ${quiet} for ${days(hours)} of ${days(need)}</b>`;
+      } else {
+        meta = `<b>Heat and cool both in use</b>${outdoor != null ? ` · outside ${outdoor.toFixed(1)}°` : ""}`;
+      }
+      if (hc.cool_locked_out) meta += ` · <b>AC off below ${hc.cool_lockout_temp}°</b>`;
+    } else if (d.suggest_season_switch) {
       meta = `<b>${otherLabel} conditions for ${hours.toFixed(1)}h</b> — switch recommended`;
     } else if (hours > 0) {
       meta = `<b>${otherLabel} conditions ${hours.toFixed(1)}h of ${need}h</b>`;
@@ -664,8 +715,11 @@ class GttcPanel extends HTMLElement {
     return `
       <div class="season-strip ${d.suggest_season_switch ? "season-strip-suggest" : ""}">
         <div class="season-seg" role="group" aria-label="Season">
-          <button class="season-seg-btn seg-heat" id="seasonHeatBtn" aria-pressed="${!cooling}">
+          <button class="season-seg-btn seg-heat" id="seasonHeatBtn" aria-pressed="${season === "heating"}">
             <ha-icon icon="mdi:fire"></ha-icon> Heat
+          </button>
+          <button class="season-seg-btn seg-both" id="seasonBothBtn" aria-pressed="${both}">
+            <ha-icon icon="mdi:sun-snowflake-variant"></ha-icon> Heat·Cool
           </button>
           <button class="season-seg-btn seg-cool" id="seasonCoolBtn" aria-pressed="${cooling}">
             <ha-icon icon="mdi:snowflake"></ha-icon> Cool
@@ -699,7 +753,9 @@ class GttcPanel extends HTMLElement {
       await this._loadData();
       this._showToast(season === "cooling"
         ? "Cooling season — thermostat set to Cool."
-        : "Heating season — thermostat set to Heat.");
+        : season === "heat_cool"
+          ? "Heat·Cool — the thermostat heats below the band and cools above it."
+          : "Heating season — thermostat set to Heat.");
     } catch (err) {
       this._showToast(`Season not changed: ${err.message || err}`, "error");
     }
@@ -788,7 +844,7 @@ class GttcPanel extends HTMLElement {
     const fallback = this._diagData?.cooling_comfort ?? this._settingsData?.cooling_comfort;
     return `
             <div class="form-row">
-              <label>Cooling target (°F)${this._isCooling() ? ` <span class="form-label-now">in use now</span>` : ""}
+              <label>Cooling target (°F)${this._isCooling() || this._isHeatCool() ? ` <span class="form-label-now">in use now</span>` : ""}
                 <span class="form-label-hint">blank = cooling comfort${fallback != null ? ` (${fallback}°)` : ""}</span></label>
               <div class="temp-input-row">
                 <input type="range" id="editCoolingTempRange" min="${s.temp_min}" max="${s.temp_max}" step="1"
@@ -962,6 +1018,7 @@ class GttcPanel extends HTMLElement {
     // Season strip
     this._addClick("seasonHeatBtn", () => this._setSeason("heating"));
     this._addClick("seasonCoolBtn", () => this._setSeason("cooling"));
+    this._addClick("seasonBothBtn", () => this._setSeason("heat_cool"));
     root.querySelectorAll("[data-season-switch]").forEach(btn => {
       btn.addEventListener("click", () => this._setSeason(btn.dataset.seasonSwitch));
     });
@@ -1863,6 +1920,7 @@ class GttcPanel extends HTMLElement {
       fan_precool: "Fan pre-cool",
       window_open: "Windows open",
       fallback: "Fallback",
+      cool_lockout: "AC locked out",
     };
     return map[reason] || (d.schedule_enabled ? "Schedule" : "Manual");
   }
@@ -2701,6 +2759,8 @@ class GttcPanel extends HTMLElement {
   _goalWhy(d) {
     const e = d.current_entry;
     switch (d.hvac_action_reason) {
+      // The lockout has its own note under the hero; the why names the block
+      case "cool_lockout":
       case "schedule":
         return e ? `Schedule · ${this._fmt12(e.time_start)}–${this._fmt12(e.time_end)} block` : "Schedule";
       case "precondition": return "Pre-conditioning for the next block";
@@ -2717,11 +2777,14 @@ class GttcPanel extends HTMLElement {
     const banners = [];
     if (d.override_active) {
       const physical = d.override_source === "physical";
-      const resume = d.schedule_enabled && d.current_entry ? this._seasonTemp(d.current_entry) : null;
+      const resumeBand = this._isHeatCool() && d.schedule_enabled && d.current_entry ? this._seasonBand(d.current_entry) : null;
+      const resume = resumeBand ? this._fmtBand(resumeBand).replace(/°$/, "")
+        : d.schedule_enabled && d.current_entry ? this._seasonTemp(d.current_entry) : null;
       banners.push(`
         <div class="now-banner banner-hold">
           <ha-icon icon="${physical ? "mdi:hand-back-right" : "mdi:clock-edit"}"></ha-icon>
-          <span><b>${physical ? "Held at the thermostat" : `Override ${d.override_target_temp}°`}</b>
+          <span><b>${physical ? "Held at the thermostat" : d.override_target_low != null
+            ? `Override ${d.override_target_low}–${d.override_target_high}°` : `Override ${d.override_target_temp}°`}</b>
             · ${d.override_remaining_minutes} min left${resume != null ? `, then back to ${resume}°` : ""}</span>
           <button class="btn btn-sm js-cancel-override">Resume schedule</button>
         </div>`);
@@ -2750,6 +2813,20 @@ class GttcPanel extends HTMLElement {
     return banners.join("");
   }
 
+  // The two things heat/cool does on its own, said only while it is doing them
+  _heatCoolNotes(d) {
+    if (!this._isHeatCool()) return "";
+    const hc = d.heat_cool || {};
+    const notes = [];
+    if (hc.cool_locked_out) {
+      notes.push(`<ha-icon icon="mdi:snowflake-off"></ha-icon> AC off below ${hc.cool_lockout_temp}° outside — the fan circulates instead.`);
+    }
+    if (hc.gap_adjusted_from != null && hc.low != null) {
+      notes.push(`<ha-icon icon="mdi:arrow-expand-horizontal"></ha-icon> Heat lowered ${hc.gap_adjusted_from}° → ${hc.low}° to keep the thermostat's ${hc.min_gap}° gap.`);
+    }
+    return notes.map(n => `<div class="hc-note">${n}</div>`).join("");
+  }
+
   _renderNowHero(d) {
     const action = d.hvac_action;
     const actionLabel = action ? action.charAt(0).toUpperCase() + action.slice(1) : "—";
@@ -2762,12 +2839,15 @@ class GttcPanel extends HTMLElement {
         <div class="hero-row">
           <div class="hero-temp">${d.current_temp != null ? d.current_temp.toFixed(1) : "—"}<small>°</small></div>
           <div class="hero-goal">
-            <span class="hero-goal-num">→ ${d.target_temp != null ? d.target_temp.toFixed(1) + "°" : "—"}</span>
+            <span class="hero-goal-num">→ ${this._isHeatCool() && d.heat_cool?.low != null
+              ? `${d.heat_cool.low}–${d.heat_cool.high}°`
+              : d.target_temp != null ? d.target_temp.toFixed(1) + "°" : "—"}</span>
             ${banners ? "" : `<span class="hero-why">${this._goalWhy(d)}</span>`}
             <span class="hero-action ${action === "heating" ? "is-heat" : action === "cooling" ? "is-cool" : ""}">${actionLabel}</span>
           </div>
         </div>
         ${banners}
+        ${this._heatCoolNotes(d)}
         <div class="rooms">
           ${zones.map(z => `
             <button class="room ${z.is_active ? "room-active" : ""}" data-now-zone="${z.id}" ${z.is_active ? "disabled" : ""}
@@ -2787,7 +2867,12 @@ class GttcPanel extends HTMLElement {
   _renderNowActions(d) {
     const f = d.features || {};
     const w = d.windows || {};
-    const boosts = this._isCooling()
+    const boosts = this._isHeatCool()
+      ? [
+          { id: "warm_up", big: "+3°", sub: "Warmer band · 60 min", cls: "tile-heat" },
+          { id: "cool_down", big: "−3°", sub: "Cooler band · 60 min", cls: "tile-cool" },
+        ]
+      : this._isCooling()
       ? [
           { id: "max_cool", big: "−4°", sub: "Max cool · 90 min", cls: "tile-cool" },
           { id: "cool_down", big: "−3°", sub: "Cool down · 60 min", cls: "tile-cool" },
@@ -2835,7 +2920,7 @@ class GttcPanel extends HTMLElement {
     return `
       <section class="now-card now-today">
         <div class="today-head">
-          <div class="eyebrow">Today · ${DAY_LABELS_FULL[today]} · ${label} · ${this._isCooling() ? "cooling" : "heating"} targets</div>
+          <div class="eyebrow">Today · ${DAY_LABELS_FULL[today]} · ${label} · ${this._isHeatCool() ? "heat·cool bands" : this._isCooling() ? "cooling targets" : "heating targets"}</div>
           <button class="btn btn-outline btn-sm" id="goScheduleBtn">Edit schedule</button>
         </div>
         <div class="week-row-timeline today-timeline">
@@ -2912,6 +2997,7 @@ class GttcPanel extends HTMLElement {
       vacation: "Vacation", occupancy_away: "Nobody home", precondition: "Pre-conditioning",
       tou_adjustment: "Peak-rate adjustment", heat_pump_step: "Heat pump step",
       fan_precool: "Fan pre-cool", window_open: "Windows open", fallback: "Fallback",
+      cool_lockout: "AC locked out",
     })[reason] || reason;
   }
 
@@ -2930,8 +3016,8 @@ class GttcPanel extends HTMLElement {
       for (const e of al.log) {
         if (!e || isNaN(new Date(e.ts).getTime())) continue;
         const last = runs[runs.length - 1];
-        if (last && last.reason === e.reason && last.target_temp === e.target_temp) continue;
-        runs.push({ ts: e.ts, reason: e.reason, target_temp: e.target_temp });
+        if (last && last.reason === e.reason && last.target_temp === e.target_temp && last.target_high === e.target_high) continue;
+        runs.push({ ts: e.ts, reason: e.reason, target_temp: e.target_temp, target_high: e.target_high });
       }
       const now = Date.now();
       const today = new Date().toDateString();
@@ -2946,7 +3032,7 @@ class GttcPanel extends HTMLElement {
         return `<li class="log-row ${i === runs.length - 1 ? "log-current" : ""}">
           <span class="log-when">${when}</span>
           <span class="log-reason">${this._reasonLabel(r.reason)}</span>
-          <span class="log-temp">${r.target_temp}°</span>
+          <span class="log-temp">${r.target_high != null ? `${r.target_temp}–${r.target_high}°` : `${r.target_temp}°`}</span>
           <span class="log-dur">${i === runs.length - 1 ? `${dur} so far` : dur}</span>
         </li>`;
       }).reverse().slice(0, 40).join("")}</ol>`;
@@ -3099,7 +3185,12 @@ class GttcPanel extends HTMLElement {
   _renderSettings_season() {
     const d = this._settingsData;
     return `
-      <p class="set-lede">Currently <b>${d.season === "cooling" ? "cooling" : "heating"}</b>. Switch season with the Heat / Cool control above — it applies immediately. These are the rules for when GTTC recommends or makes the switch itself.</p>
+      <p class="set-lede">Currently <b>${d.season === "cooling" ? "cooling" : d.season === "heat_cool" ? "heat·cool" : "heating"}</b>. Switch with the Heat · Heat·Cool · Cool control above — it applies immediately. These are the rules for when GTTC recommends or makes the switch itself.</p>
+      ${this._boolField("heat_cool_ladder", "Heat·Cool in spring and fall",
+        "Auto-switch goes Heat → Heat·Cool → Cool and back, never straight across. Off: straight between Heat and Cool.")}
+      ${this._numField("cool_lockout_temp", "No AC below", "In Heat·Cool, outside temperature under which the AC stays off and the fan circulates instead.", { min: 30, max: 70, step: 1 })}
+      ${this._rangeField("heat_cool_settle_days", "Back to one mode after", "Days with only heat, or only cooling, before Heat·Cool hands over to that season.", { min: 1, max: 30, step: 1, suffix: " d" })}
+      ${this._numField("heat_cool_min_gap", "Minimum gap", "Match the thermostat's own Auto Differential. Blocks narrower than this have their heat end lowered.", { min: 0, max: 10, step: 0.5 })}
       ${this._boolField("auto_season_switch", "Switch automatically",
         "Switch to the other season once the threshold below is reached. Off: GTTC only recommends.")}
       ${this._rangeField("seasonal_recommend_hours", "Hours before recommending a switch",
@@ -4238,6 +4329,11 @@ class GttcPanel extends HTMLElement {
       .season-seg-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
       .season-seg-btn.seg-heat[aria-pressed="true"] { background: #e65100; color: #fff; }
       .season-seg-btn.seg-cool[aria-pressed="true"] { background: #0277bd; color: #fff; }
+      .season-seg-btn.seg-both[aria-pressed="true"] { background: linear-gradient(90deg, #e65100, #0277bd); color: #fff; }
+      .hc-note { display: flex; gap: 8px; align-items: center; font-size: 13px; color: var(--secondary-text);
+        background: var(--secondary-background-color, rgba(0,0,0,.04)); border-radius: 8px; padding: 8px 12px; margin-top: 10px; }
+      .hc-note ha-icon { --mdc-icon-size: 16px; flex: none; }
+      .block-badge.gap-badge { background: rgba(0,0,0,.28); }
       .season-meta { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--secondary-text); min-width: 0; }
       .season-meta b { color: var(--primary-text); font-weight: 600; }
       .season-meter { display: block; width: 140px; height: 4px; border-radius: 2px; background: var(--divider); overflow: hidden; }
