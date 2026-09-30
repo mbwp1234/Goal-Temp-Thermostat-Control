@@ -206,7 +206,7 @@ async def test_cold_outside_parks_the_cool_end_and_circulates_a_warm_house():
 
 @pytest.mark.asyncio
 async def test_lockout_lifts_when_it_warms_up():
-    coord = _coord(DAY, indoor=72.0, outdoor=62.0)
+    coord = _coord(DAY, indoor=72.0, outdoor=71.0)
     coord._fan_precool_fan_on = True
     await coord._update_heat_cool(None)
     assert coord.cool_locked_out is False
@@ -440,3 +440,40 @@ def test_a_band_hold_round_trips():
                        duration_minutes=120, target_low=71.0, target_high=74.0)
     back = ManualOverride.from_dict(o.to_dict())
     assert back.is_range and (back.target_low, back.target_high) == (71.0, 74.0)
+
+
+# ---------------------------------------------------------------------------
+# Fan pre-cool on the cool end (v2.4.1)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_cool_air_outside_runs_the_fan_before_the_compressor():
+    """9/29 20:30: upstairs 74°, outside 67° — Cool mode was fan-only."""
+    coord = _coord(ScheduleEntry(time_start="20:00", time_end="23:59", target_temp=69.0, cooling_temp=70.0),
+                   indoor=74.0, outdoor=67.0)
+    await coord._update_heat_cool(None)
+    written = _calls(coord, "set_temperature")[-1]
+    assert written["target_temp_high"] > 70.0          # compressor held off
+    assert coord.target_high == 70.0                   # the band still means 70
+    assert coord._last_action_reason == "fan_precool"
+    assert {"entity_id": "climate.test", "fan_mode": "on"} in _calls(coord, "set_fan_mode")
+
+
+@pytest.mark.asyncio
+async def test_the_heat_end_does_not_move_when_fan_precool_switches():
+    entry = ScheduleEntry(time_start="20:00", time_end="23:59", target_temp=69.0, cooling_temp=70.0)
+    coord = _coord(entry, indoor=74.0, outdoor=67.0)
+    await coord._update_heat_cool(None)
+    with_fan = coord.target_low
+    coord2 = _coord(entry, indoor=74.0, outdoor=72.0)   # too warm out for the fan
+    await coord2._update_heat_cool(None)
+    assert with_fan == coord2.target_low == 67.0
+
+
+@pytest.mark.asyncio
+async def test_lockout_takes_the_fan_from_fan_precool():
+    coord = _coord(DAY, indoor=75.0, outdoor=50.0)
+    coord._fan_precool_start_time = datetime.now(timezone.utc)   # a window left over from a warmer hour
+    await coord._update_heat_cool(None)
+    assert coord._fan_precool_start_time is None       # no pre-cool window running
+    assert coord._last_action_reason == "cool_lockout"
