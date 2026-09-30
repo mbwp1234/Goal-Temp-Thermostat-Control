@@ -1786,31 +1786,48 @@ class GTTCCoordinator(DataUpdateCoordinator):
         cur = self.current_temp
         reason = high_reason if cur is not None and cur > high else low_reason
 
-        t_low = self._calculate_thermostat_target(low, active_zone)
-        t_high = self._calculate_thermostat_target(high, active_zone)
-
         # The AC stays off on a cold day; the fan moves the warm air instead
         locked = self._outdoor_temp is not None and self._outdoor_temp < self.cool_lockout_temp
         self.cool_locked_out = locked
+        # Goal-level cool end the house is judged against (fan pre-cool may
+        # inflate what is written, never what "above the band" means)
+        cool_goal = high
+        if locked:
+            self._reset_fan_precool_state()
+            want_fan = cur is not None and cur > cool_goal + 0.5
+            if want_fan and not self._fan_precool_fan_on:
+                await self._fan_precool_set_fan("on")
+            elif not want_fan and self._fan_precool_fan_on:
+                await self._fan_precool_set_fan("Auto low")
+        else:
+            # Between the lockout and FAN_PRECOOL_MAX_OUTDOOR, cool outside air
+            # is still worth a fan run before the compressor — exactly what
+            # Cool mode does, so heat/cool must not cost more AC than it.
+            precooled = await self._apply_fan_precool(high)
+            if precooled != high:
+                high = precooled
+                if cur is not None and cur > cool_goal:
+                    reason = ACTION_REASON_FAN_PRECOOL
+
+        t_low = self._calculate_thermostat_target(low, active_zone)
+        t_high = self._calculate_thermostat_target(high, active_zone)
         if locked:
             t_high = max(t_high, min(self.get_thermostat_max_temp(), COOL_LOCKOUT_PARK))
-            if cur is not None and cur > high:
+            if cur is not None and cur > cool_goal:
                 reason = ACTION_REASON_COOL_LOCKOUT
-        want_fan = locked and cur is not None and cur > high + 0.5
-        if want_fan and not self._fan_precool_fan_on:
-            await self._fan_precool_set_fan("on")
-        elif not want_fan and self._fan_precool_fan_on:
-            await self._fan_precool_set_fan("Auto low")
 
-        # Keep the thermostat's own minimum gap by lowering the heat end
-        if t_high - t_low < gap:
-            shift = t_low - (t_high - gap)
+        # Keep the thermostat's own minimum gap by lowering the heat end —
+        # measured against the cool GOAL, so the heat end does not jump each
+        # time fan pre-cool or the lockout raises what is written above it
+        t_cool_goal = self._calculate_thermostat_target(cool_goal, active_zone)
+        if t_cool_goal - t_low < gap:
+            shift = t_low - (t_cool_goal - gap)
             self._gap_adjusted_from = round(low, 1)
             low -= shift
             t_low -= shift
 
         t_low, t_high = round(t_low, 1), round(t_high, 1)
-        self.target_low, self.target_high = round(low, 1), round(high, 1)
+        self.target_low, self.target_high = round(low, 1), round(cool_goal, 1)
         # target_temp keeps meaning "the heating goal" so the heating fallback
         # and boosts that read it behave as they do in heat season
         self.target_temp = self.target_low
@@ -2639,7 +2656,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
 
         # ── Precondition checks ──────────────────────────────────────────────
         conditions_met = (
-            self.season == SEASON_COOLING
+            self.season in (SEASON_COOLING, SEASON_HEAT_COOL)
             and self._outdoor_temp is not None
             and self.current_temp is not None
             and self._outdoor_temp <= FAN_PRECOOL_MAX_OUTDOOR
