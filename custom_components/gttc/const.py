@@ -102,9 +102,30 @@ CONF_HEAT_COOL_MIN_GAP = "heat_cool_min_gap"
 # thermostat keeps the two-season behaviour.
 DEFAULT_HEAT_COOL_LADDER = False
 # In heat/cool the AC is held off below this outdoor temperature (°F) and the
-# fan circulates instead. Most residential compressors are not meant to cool
-# on a cold night, and it is the wrong equipment for a warm upstairs anyway.
-DEFAULT_COOL_LOCKOUT_TEMP = 55.0
+# fan circulates instead — unless someone asks for cooling (a hold or a boost
+# always gets it). 55 was too high: a full house on a 54° evening needs the AC.
+DEFAULT_COOL_LOCKOUT_TEMP = 50.0
+# The default before v2.4.2. A stored value equal to it was never chosen by
+# anyone, so it moves to the new default once (tracked by cool_lockout_rev).
+LEGACY_COOL_LOCKOUT_TEMP = 55.0
+COOL_LOCKOUT_REV = 2
+# A zone the schedule is not watching can still be hot — a full downstairs
+# while the evening blocks watch the bedrooms. When the warmest zone sits this
+# far over the cool goal for WARM_ZONE_MINUTES, GTTC cools against it until it
+# is back within WARM_ZONE_CLEAR of the goal.
+WARM_ZONE_MARGIN = 1.5
+WARM_ZONE_MINUTES = 10
+WARM_ZONE_CLEAR = 0.5
+# ...and stops early if the watched zone would drop this close to its heat goal.
+WARM_ZONE_FLOOR_MARGIN = 1.0
+# The lockout is "don't run the AC to shave a degree on a cold night", not
+# "never cool": a party or the oven can push a zone well past its goal with
+# 49° outside. Any zone this far over the cool goal for WARM_ZONE_MINUTES
+# lifts the lockout until it is back within WARM_ZONE_CLEAR.
+OVERHEAT_MARGIN = 3.0
+# Below this outdoor temperature the AC never runs on GTTC's own say-so —
+# most heat pumps are not rated to cool here (coil icing). A hold still does.
+COOL_HARD_FLOOR = 40.0
 # Leave heat/cool for a single season after this many days with only one side
 # of the equipment running.
 DEFAULT_HEAT_COOL_SETTLE_DAYS = 5.0
@@ -183,6 +204,8 @@ ACTION_REASON_FAN_PRECOOL = "fan_precool"
 ACTION_REASON_FALLBACK = "fallback"
 ACTION_REASON_WINDOW = "window_open"
 ACTION_REASON_COOL_LOCKOUT = "cool_lockout"
+ACTION_REASON_WARM_ZONE = "warm_zone"
+ACTION_REASON_OVERHEAT = "overheat"
 
 # In-memory ring buffer size for the action log
 ACTION_LOG_MAX = 200

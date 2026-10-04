@@ -193,7 +193,7 @@ async def test_a_small_drift_does_not_rewrite():
 
 @pytest.mark.asyncio
 async def test_cold_outside_parks_the_cool_end_and_circulates_a_warm_house():
-    coord = _coord(DAY, indoor=75.0, outdoor=50.0)
+    coord = _coord(DAY, indoor=75.0, outdoor=45.0)
     await coord._update_heat_cool(None)
 
     written = _calls(coord, "set_temperature")[-1]
@@ -216,7 +216,7 @@ async def test_lockout_lifts_when_it_warms_up():
 
 @pytest.mark.asyncio
 async def test_a_comfortable_house_under_lockout_leaves_the_fan_alone():
-    coord = _coord(DAY, indoor=72.0, outdoor=50.0)
+    coord = _coord(DAY, indoor=72.0, outdoor=45.0)
     await coord._update_heat_cool(None)
     assert _calls(coord, "set_fan_mode") == []
 
@@ -472,7 +472,7 @@ async def test_the_heat_end_does_not_move_when_fan_precool_switches():
 
 @pytest.mark.asyncio
 async def test_lockout_takes_the_fan_from_fan_precool():
-    coord = _coord(DAY, indoor=75.0, outdoor=50.0)
+    coord = _coord(DAY, indoor=75.0, outdoor=45.0)
     coord._fan_precool_start_time = datetime.now(timezone.utc)   # a window left over from a warmer hour
     await coord._update_heat_cool(None)
     assert coord._fan_precool_start_time is None       # no pre-cool window running

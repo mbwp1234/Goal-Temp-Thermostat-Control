@@ -1921,6 +1921,8 @@ class GttcPanel extends HTMLElement {
       window_open: "Windows open",
       fallback: "Fallback",
       cool_lockout: "AC locked out",
+      warm_zone: "Warm zone",
+      overheat: "Overheat — AC on",
     };
     return map[reason] || (d.schedule_enabled ? "Schedule" : "Manual");
   }
@@ -2768,6 +2770,8 @@ class GttcPanel extends HTMLElement {
       case "tou_adjustment": return "Peak-rate adjustment";
       case "heat_pump_step": return "Heat pump stepping up";
       case "fan_precool": return "Fan pre-cooling before the AC";
+      case "overheat": return "Too warm inside — AC on despite the cold";
+      case "warm_zone": return d.warm_zone ? `Cooling ${d.warm_zone} — it ran warm` : "Cooling the warmest zone";
       case "fallback": return "No schedule block — fallback";
       default: return d.schedule_enabled ? "Schedule" : "Schedule off";
     }
@@ -2997,7 +3001,7 @@ class GttcPanel extends HTMLElement {
       vacation: "Vacation", occupancy_away: "Nobody home", precondition: "Pre-conditioning",
       tou_adjustment: "Peak-rate adjustment", heat_pump_step: "Heat pump step",
       fan_precool: "Fan pre-cool", window_open: "Windows open", fallback: "Fallback",
-      cool_lockout: "AC locked out",
+      cool_lockout: "AC locked out", warm_zone: "Warm zone", overheat: "Overheat — AC on",
     })[reason] || reason;
   }
 
@@ -3188,7 +3192,7 @@ class GttcPanel extends HTMLElement {
       <p class="set-lede">Currently <b>${d.season === "cooling" ? "cooling" : d.season === "heat_cool" ? "heat·cool" : "heating"}</b>. Switch with the Heat · Heat·Cool · Cool control above — it applies immediately. These are the rules for when GTTC recommends or makes the switch itself.</p>
       ${this._boolField("heat_cool_ladder", "Heat·Cool in spring and fall",
         "Auto-switch goes Heat → Heat·Cool → Cool and back, never straight across. Off: straight between Heat and Cool.")}
-      ${this._numField("cool_lockout_temp", "No AC below", "In Heat·Cool, outside temperature under which the AC stays off and the fan circulates instead.", { min: 30, max: 70, step: 1 })}
+      ${this._numField("cool_lockout_temp", "No AC below", "In Heat·Cool, outside temperature under which the AC stays off and the fan circulates instead. A hold or boost still cools, and so does a zone 3° over its goal (above 40° outside).", { min: 30, max: 70, step: 1 })}
       ${this._rangeField("heat_cool_settle_days", "Back to one mode after", "Days with only heat, or only cooling, before Heat·Cool hands over to that season.", { min: 1, max: 30, step: 1, suffix: " d" })}
       ${this._numField("heat_cool_min_gap", "Minimum gap", "Match the thermostat's own Auto Differential. Blocks narrower than this have their heat end lowered.", { min: 0, max: 10, step: 0.5 })}
       ${this._boolField("auto_season_switch", "Switch automatically",
