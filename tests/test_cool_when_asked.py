@@ -175,3 +175,76 @@ async def test_below_the_lockout_a_warm_zone_does_not_start_the_ac():
     await coord._update_heat_cool(up)
     assert coord.cool_locked_out is True
     assert _calls(coord, "set_temperature")[-1]["target_temp_high"] == 85.0
+
+
+# ---------------------------------------------------------------------------
+# Overheat lifts the lockout (a party, the oven)
+# ---------------------------------------------------------------------------
+
+def _age_over(coord):
+    coord._overheat_since = datetime.now(timezone.utc) - timedelta(minutes=WARM_ZONE_MINUTES + 1)
+
+
+@pytest.mark.asyncio
+async def test_49_outside_and_76_inside_runs_the_ac():
+    coord = _coord(EVENING, outdoor=49.0)
+    up = _house(coord, up=76.0, down=74.0, wall=76.0)
+    await coord._update_heat_cool(up)
+    assert coord.cool_locked_out is True          # not yet — ten minutes first
+    _age_over(coord)
+    await coord._update_heat_cool(up)
+    assert coord.cool_locked_out is False
+    assert coord.overheat_active is True
+    assert coord._last_action_reason == "overheat"
+    assert _calls(coord, "set_temperature")[-1]["target_temp_high"] < 85.0
+
+
+@pytest.mark.asyncio
+async def test_overheat_in_an_unwatched_zone_lifts_the_lockout():
+    coord = _coord(EVENING, outdoor=45.0)
+    up = _house(coord, up=72.0, down=75.5, wall=77.0)
+    await coord._update_heat_cool(up)
+    _age_over(coord)
+    await coord._update_heat_cool(up)
+    assert coord.overheat_active is True
+    # cools against downstairs: 72 + (77 − 75.5)
+    assert _calls(coord, "set_temperature")[-1]["target_temp_high"] == pytest.approx(73.5, abs=0.05)
+
+
+@pytest.mark.asyncio
+async def test_overheat_hands_back_to_the_lockout_near_the_goal():
+    coord = _coord(EVENING, outdoor=45.0)
+    up = _house(coord, up=76.0, down=74.0)
+    await coord._update_heat_cool(up)
+    _age_over(coord)
+    await coord._update_heat_cool(up)
+    for z in coord.zone_manager.zones.values():
+        z.current_temp = 72.3
+    coord.current_temp = 72.3
+    await coord._update_heat_cool(up)
+    assert coord.overheat_active is False
+    assert coord.cool_locked_out is True
+    assert _calls(coord, "set_temperature")[-1]["target_temp_high"] == 85.0
+
+
+@pytest.mark.asyncio
+async def test_two_degrees_over_on_a_cold_night_is_still_fan_only():
+    coord = _coord(EVENING, outdoor=45.0)
+    up = _house(coord, up=74.0, down=73.0)
+    await coord._update_heat_cool(up)
+    _age_over(coord)
+    await coord._update_heat_cool(up)
+    assert coord.cool_locked_out is True
+
+
+@pytest.mark.asyncio
+async def test_below_the_hard_floor_only_a_hold_cools():
+    coord = _coord(EVENING, outdoor=38.0)
+    up = _house(coord, up=78.0, down=78.0)
+    await coord._update_heat_cool(up)
+    _age_over(coord)
+    await coord._update_heat_cool(up)
+    assert coord.cool_locked_out is True
+    await coord.async_set_range(68.0, 72.0)
+    await coord._update_heat_cool(up)
+    assert _calls(coord, "set_temperature")[-1]["target_temp_high"] == 72.0

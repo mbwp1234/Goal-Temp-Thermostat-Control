@@ -29,6 +29,7 @@ from .const import (
     ACTION_REASON_VACATION,
     ACTION_REASON_WINDOW,
     ACTION_REASON_COOL_LOCKOUT,
+    ACTION_REASON_OVERHEAT,
     ACTION_REASON_WARM_ZONE,
     BOOST_TYPES,
     BRIAN_NOTIFY_SERVICE,
@@ -88,7 +89,9 @@ from .const import (
     CONF_HEAT_COOL_MIN_GAP,
     CONF_HEAT_COOL_SETTLE_DAYS,
     COOL_LOCKOUT_PARK,
+    COOL_HARD_FLOOR,
     COOL_LOCKOUT_REV,
+    OVERHEAT_MARGIN,
     LEGACY_COOL_LOCKOUT_TEMP,
     WARM_ZONE_CLEAR,
     WARM_ZONE_FLOOR_MARGIN,
@@ -239,6 +242,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
         # cool goal, and the zone being cooled against while it is engaged
         self._warm_zone_since: datetime | None = None
         self.warm_zone = None
+        # Overheat: a zone far over the cool goal lifts the lockout
+        self._overheat_since: datetime | None = None
+        self.overheat_active: bool = False
         # When each side of the equipment last ran while in heat/cool — the
         # ladder leaves for a single season once one side has been quiet for
         # heat_cool_settle_days. Persisted, or every restart restarts the wait.
@@ -1033,6 +1039,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
             "target_high": self.target_high,
             "cool_locked_out": self.cool_locked_out,
             "warm_zone": self.warm_zone.name if self.warm_zone else None,
+            "overheat_active": self.overheat_active,
             "gap_adjusted_from": self._gap_adjusted_from,
             "heat_cool_min_gap": self.heat_cool_min_gap,
             "vacation_mode": (
@@ -1823,6 +1830,54 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self.warm_zone = None
         return None
 
+    def _hottest_zone(self):
+        zones = [z for z in self.zone_manager.zones.values() if z.current_temp is not None]
+        return max(zones, key=lambda z: z.current_temp, default=None)
+
+    def _update_overheat(self, cool_goal, heat_goal, active_zone, track: bool):
+        """(engaged, zone to cool against) — the lockout's escape hatch.
+
+        Any zone (the watched one included) OVERHEAT_MARGIN over the cool goal
+        for WARM_ZONE_MINUTES lifts the lockout until it is within
+        WARM_ZONE_CLEAR. ``track`` False (no lockout in force, or below the
+        hard floor) clears it.
+        """
+        hot = self._hottest_zone()
+        hot_temp = hot.current_temp if hot is not None else self.current_temp
+        watched = active_zone.current_temp if active_zone is not None else None
+        chills_watched = (
+            hot is not None
+            and active_zone is not None
+            and hot.id != active_zone.id
+            and watched is not None
+            and heat_goal is not None
+            and watched <= heat_goal + WARM_ZONE_FLOOR_MARGIN
+        )
+        if not track or cool_goal is None or hot_temp is None or chills_watched:
+            self._overheat_since = None
+            self.overheat_active = False
+            return False, None
+        if self.overheat_active:
+            if hot_temp > cool_goal + WARM_ZONE_CLEAR:
+                return True, hot
+            self._overheat_since = None
+            self.overheat_active = False
+            return False, None
+        if hot_temp <= cool_goal + OVERHEAT_MARGIN:
+            self._overheat_since = None
+            return False, None
+        now = datetime.now(timezone.utc)
+        if self._overheat_since is None:
+            self._overheat_since = now
+        if now - self._overheat_since >= timedelta(minutes=WARM_ZONE_MINUTES):
+            _LOGGER.info(
+                "%.1f° against a %.1f° cool goal on a cold day — lifting the AC lockout",
+                hot_temp, cool_goal,
+            )
+            self.overheat_active = True
+            return True, hot
+        return False, None
+
     async def _update_heat_cool(self, active_zone) -> None:
         """One control cycle in heat/cool: compute both ends and write the band."""
         now = datetime.now(timezone.utc)
@@ -1870,12 +1925,22 @@ class GTTCCoordinator(DataUpdateCoordinator):
             and self._outdoor_temp is not None
             and self._outdoor_temp < self.cool_lockout_temp
         )
+        # A real overheat (a party, the oven) lifts the lockout — except below
+        # the hard floor, where only a hold runs the compressor
+        over, over_zone = self._update_overheat(
+            cool_goal, low, active_zone,
+            track=locked and self._outdoor_temp >= COOL_HARD_FLOOR,
+        )
+        if over:
+            locked = False
         self.cool_locked_out = locked
         warm = (
             self._update_warm_zone(cool_goal, low, active_zone)
             if override is None
             else self._update_warm_zone(None, None, None)
         )
+        if over:
+            warm = over_zone
         if locked:
             self._reset_fan_precool_state()
             # Judge the fan by the warmest zone, not only the watched one
@@ -1889,13 +1954,15 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 await self._fan_precool_set_fan("on")
             elif not want_fan and self._fan_precool_fan_on:
                 await self._fan_precool_set_fan("Auto low")
-        elif warm is not None or override is not None:
+        elif over or warm is not None or override is not None:
             # Someone asked for cooling, or a zone has been hot too long: the
             # compressor runs now, not after a fan-only trial
             self._reset_fan_precool_state()
             if self._fan_precool_fan_on:
                 await self._fan_precool_set_fan("Auto low")
-            if warm is not None:
+            if over:
+                reason = ACTION_REASON_OVERHEAT
+            elif warm is not None:
                 reason = ACTION_REASON_WARM_ZONE
         else:
             # Between the lockout and FAN_PRECOOL_MAX_OUTDOOR, cool outside air

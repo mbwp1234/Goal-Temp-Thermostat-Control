@@ -181,6 +181,7 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
             "season": data.get("season"),
             "cool_locked_out": data.get("cool_locked_out", False),
             "warm_zone": data.get("warm_zone"),
+            "overheat_active": data.get("overheat_active", False),
             "gap_adjusted_from": data.get("gap_adjusted_from"),
             "heat_cool_min_gap": data.get("heat_cool_min_gap"),
         }

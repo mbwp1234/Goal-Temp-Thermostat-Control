@@ -118,6 +118,14 @@ WARM_ZONE_MINUTES = 10
 WARM_ZONE_CLEAR = 0.5
 # ...and stops early if the watched zone would drop this close to its heat goal.
 WARM_ZONE_FLOOR_MARGIN = 1.0
+# The lockout is "don't run the AC to shave a degree on a cold night", not
+# "never cool": a party or the oven can push a zone well past its goal with
+# 49° outside. Any zone this far over the cool goal for WARM_ZONE_MINUTES
+# lifts the lockout until it is back within WARM_ZONE_CLEAR.
+OVERHEAT_MARGIN = 3.0
+# Below this outdoor temperature the AC never runs on GTTC's own say-so —
+# most heat pumps are not rated to cool here (coil icing). A hold still does.
+COOL_HARD_FLOOR = 40.0
 # Leave heat/cool for a single season after this many days with only one side
 # of the equipment running.
 DEFAULT_HEAT_COOL_SETTLE_DAYS = 5.0
@@ -197,6 +205,7 @@ ACTION_REASON_FALLBACK = "fallback"
 ACTION_REASON_WINDOW = "window_open"
 ACTION_REASON_COOL_LOCKOUT = "cool_lockout"
 ACTION_REASON_WARM_ZONE = "warm_zone"
+ACTION_REASON_OVERHEAT = "overheat"
 
 # In-memory ring buffer size for the action log
 ACTION_LOG_MAX = 200
