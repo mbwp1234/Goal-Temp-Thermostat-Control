@@ -1,7 +1,9 @@
 """Data coordinator for GTTC."""
 from __future__ import annotations
 
+import dataclasses
 import logging
+import math
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
 
@@ -70,6 +72,7 @@ from .const import (
     HEAT_PUMP_MAX_SETBACK,
     HEAT_PUMP_RECOVERY_STEP,
     HEATING_FAILURE_RUN_MINUTES,
+    HEATING_FAILURE_SHORTFALL,
     HEATING_FAILURE_TEMP_DELTA,
     LEARNING_TEMP_TOLERANCE,
     OUTDOOR_COLD_THRESHOLD,
@@ -89,6 +92,7 @@ from .const import (
     CONF_HEAT_COOL_MIN_GAP,
     CONF_HEAT_COOL_SETTLE_DAYS,
     COOL_LOCKOUT_PARK,
+    FAN_ON_PREFERENCE,
     COOL_HARD_FLOOR,
     COOL_LOCKOUT_REV,
     OVERHEAT_MARGIN,
@@ -126,6 +130,10 @@ _LOGGER = logging.getLogger(__name__)
 UPDATE_INTERVAL = timedelta(seconds=30)
 TEMP_HYSTERESIS = 0.5  # Minimum change (degrees) before updating thermostat
 MAX_TEMP_OFFSET = 5.0  # Maximum offset correction between zone and thermostat sensors
+OFFSET_TAU = timedelta(minutes=20)  # smoothing of the zone↔wall offset
+OFFSET_STALE_DECAY = timedelta(hours=3)  # a lost zone's offset fades over this
+OUTDOOR_STALE_MAX = timedelta(hours=3)  # last outdoor reading stays usable this long
+WINDOW_OPEN_GRACE = timedelta(minutes=2)  # a door must stay open this long to park the HVAC
 
 # Physical (at-the-wall) setpoint change detection.
 # A Z-Wave thermostat echoes our own writes back as a state change, often a
@@ -194,6 +202,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
         provider_cls = TOU_PROVIDERS.get(tou_provider_key, TOUProvider)
         self.tou_provider: TOUProvider = provider_cls()
         self._outdoor_temp: float | None = None
+        self._outdoor_last: tuple[float, datetime] | None = None
+        self._window_open_since: datetime | None = None
 
         # Season management — Heating or Cooling.
         # When auto_season_switch is True the coordinator automatically calls
@@ -242,9 +252,11 @@ class GTTCCoordinator(DataUpdateCoordinator):
         # cool goal, and the zone being cooled against while it is engaged
         self._warm_zone_since: datetime | None = None
         self.warm_zone = None
+        self._warm_zone_paused: bool = False
         # Overheat: a zone far over the cool goal lifts the lockout
         self._overheat_since: datetime | None = None
         self.overheat_active: bool = False
+        self._overheat_paused: bool = False
         # When each side of the equipment last ran while in heat/cool — the
         # ladder leaves for a single season once one side has been quiet for
         # heat_cool_settle_days. Persisted, or every restart restarts the wait.
@@ -341,6 +353,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self._fan_precool_start_temp: float | None = None
         self._fan_precool_disengaged: bool = False
         self._fan_precool_fan_on: bool = False
+        self._fan_restore_mode: str | None = None
+        # zone id → (smoothed wall−zone offset, when)
+        self._offset_filter: dict[str, tuple[float, datetime]] = {}
 
     @property
     def available(self) -> bool:
@@ -1311,12 +1326,20 @@ class GTTCCoordinator(DataUpdateCoordinator):
         """Read the configured outdoor temperature sensor."""
         if not self.outdoor_temp_sensor:
             return None
+        now = datetime.now(timezone.utc)
         try:
             state = self.hass.states.get(self.outdoor_temp_sensor)
             if state and state.state not in ("unavailable", "unknown"):
-                return float(state.state)
+                value = float(state.state)
+                self._outdoor_last = (value, now)
+                return value
         except (ValueError, TypeError):
             pass
+        # A dropped sensor must not read as "no idea how cold it is" — that
+        # lifted the AC lockout and paused the season logic. Outdoor
+        # temperature moves slowly; the last reading is good for a while.
+        if self._outdoor_last is not None and now - self._outdoor_last[1] <= OUTDOOR_STALE_MAX:
+            return self._outdoor_last[0]
         return None
 
     def _apply_heat_pump_setback_limit(
@@ -1588,35 +1611,57 @@ class GTTCCoordinator(DataUpdateCoordinator):
         if self.manual_override and not self.manual_override.is_expired:
             return desired_temp
 
-        thermostat_reading = self._get_thermostat_current_temp()
-        zone_reading = (
-            active_zone.current_temp
-            if active_zone and active_zone.current_temp is not None
-            else None
-        )
-
-        if thermostat_reading is not None and zone_reading is not None:
-            offset = thermostat_reading - zone_reading
+        offset = self._zone_offset(active_zone)
+        if offset is not None:
             # Cap offset to prevent extreme corrections
             offset = max(-MAX_TEMP_OFFSET, min(MAX_TEMP_OFFSET, offset))
             adjusted = desired_temp + offset
-            # Clamp to valid range
-            adjusted = max(self.temp_min, min(self.temp_max, adjusted))
-
-            if abs(offset) >= 0.5:
-                _LOGGER.info(
-                    "Zone temp: %.1f°, Thermostat reads: %.1f°, "
-                    "Offset: %+.1f°, Goal: %.1f°, Adjusted thermostat target: %.1f°",
-                    zone_reading,
-                    thermostat_reading,
-                    offset,
-                    desired_temp,
-                    adjusted,
-                )
+            # temp_min/temp_max bound the GOAL (dial, holds, schedule); the
+            # wall target may sit an offset beyond them, or a warm upstairs
+            # never reaches its cooling goal
+            adjusted = max(
+                self.temp_min - MAX_TEMP_OFFSET, min(self.temp_max + MAX_TEMP_OFFSET, adjusted)
+            )
             return adjusted
 
         # No zone data available — fall back to direct control
         return desired_temp
+
+    def _zone_offset(self, zone) -> float | None:
+        """Wall reading minus zone reading, smoothed.
+
+        The T6 reports whole degrees, so a raw offset jumps a full degree each
+        time its display flickers 73↔74 — and every jump rewrote the setpoint.
+        The thermostat starts or stops the compressor on a setpoint change
+        (only a 5-min minimum OFF protects it), so the flicker was
+        short-cycling it: 36 starts a day, a third under 5 minutes. An
+        exponential average over OFFSET_TAU recovers the true fractional
+        offset. When the zone's sensors drop out, the last offset is kept
+        (and decays toward zero over hours) instead of steering by the wall.
+        """
+        if zone is None:
+            return None
+        now = datetime.now(timezone.utc)
+        wall = self._get_thermostat_current_temp()
+        reading = zone.current_temp
+        prev = self._offset_filter.get(zone.id)
+        if wall is None or reading is None:
+            if prev is None:
+                return None
+            value, at = prev
+            age = (now - at).total_seconds()
+            return value * math.exp(-age / OFFSET_STALE_DECAY.total_seconds())
+        raw = wall - reading
+        if prev is None:
+            value = raw
+        else:
+            value, at = prev
+            dt = (now - at).total_seconds()
+            if dt <= 0:
+                return value
+            value += (raw - value) * (1 - math.exp(-dt / OFFSET_TAU.total_seconds()))
+        self._offset_filter[zone.id] = (value, now)
+        return value
 
     def _get_current_schedule_info(self) -> dict[str, Any] | None:
         if not self.schedule_enabled:
@@ -1799,15 +1844,20 @@ class GTTCCoordinator(DataUpdateCoordinator):
             warm is None
             or cool_goal is None
             or (active_zone is not None and warm.id == active_zone.id)
-            or (
-                watched is not None
-                and heat_goal is not None
-                and watched <= heat_goal + WARM_ZONE_FLOOR_MARGIN
-            )
         ):
             self._warm_zone_since = None
             self.warm_zone = None
+            self._warm_zone_paused = False
             return None
+        # Cooling the warm zone cools the watched one faster. Stop at the
+        # watched zone's heat goal + WARM_ZONE_FLOOR_MARGIN, but PAUSE — keep
+        # the clock and the engaged zone, resume 0.5° later — rather than
+        # dropping out and waiting another ten minutes each time
+        if watched is not None and heat_goal is not None:
+            limit = heat_goal + WARM_ZONE_FLOOR_MARGIN + (0.5 if self._warm_zone_paused else 0.0)
+            self._warm_zone_paused = watched <= limit
+            if self._warm_zone_paused:
+                return None
         if self.warm_zone is not None and self.warm_zone.id == warm.id:
             if warm.current_temp > cool_goal + WARM_ZONE_CLEAR:
                 return warm
@@ -1845,18 +1895,21 @@ class GTTCCoordinator(DataUpdateCoordinator):
         hot = self._hottest_zone()
         hot_temp = hot.current_temp if hot is not None else self.current_temp
         watched = active_zone.current_temp if active_zone is not None else None
-        chills_watched = (
-            hot is not None
-            and active_zone is not None
-            and hot.id != active_zone.id
-            and watched is not None
-            and heat_goal is not None
-            and watched <= heat_goal + WARM_ZONE_FLOOR_MARGIN
-        )
-        if not track or cool_goal is None or hot_temp is None or chills_watched:
+        if not track or cool_goal is None or hot_temp is None:
             self._overheat_since = None
             self.overheat_active = False
+            self._overheat_paused = False
             return False, None
+        # Cooling a hot downstairs cools the watched floor faster (2.3 vs
+        # 1.3 °F/h here). Let it go down to its heat goal, then PAUSE — keep
+        # the timer and the engaged state, resume 0.5° later — instead of
+        # dropping out and waiting another ten minutes each time.
+        if hot is not None and active_zone is not None and hot.id != active_zone.id \
+                and watched is not None and heat_goal is not None:
+            limit = heat_goal + (0.5 if self._overheat_paused else 0.0)
+            self._overheat_paused = watched <= limit
+            if self._overheat_paused:
+                return False, None
         if self.overheat_active:
             if hot_temp > cool_goal + WARM_ZONE_CLEAR:
                 return True, hot
@@ -2170,11 +2223,18 @@ class GTTCCoordinator(DataUpdateCoordinator):
         learned_time = time(learned_minutes // 60, learned_minutes % 60)
         preset = self.scheduler.presets[preset_name]
         updated = False
+        # Only the kind of day it was learned on: three weekday-morning taps
+        # used to rewrite Saturday and Sunday too
+        weekend = datetime.now(timezone.utc).astimezone().weekday() >= 5
+        days = [d for d in preset.schedule if (d in ("saturday", "sunday")) == weekend]
 
-        for day_schedule in preset.schedule.values():
+        for day in days:
+            day_schedule = preset.schedule[day]
             entry = self.scheduler._find_entry_for_time(day_schedule, learned_time)
             if entry is not None and entry.target_temp != learned_temp:
-                entry.target_temp = learned_temp
+                # Replace, never mutate: entries can be shared between days
+                idx = day_schedule.entries.index(entry)
+                day_schedule.entries[idx] = dataclasses.replace(entry, target_temp=learned_temp)
                 updated = True
 
         if updated:
@@ -2663,6 +2723,19 @@ class GTTCCoordinator(DataUpdateCoordinator):
         """
         if self.windows_open_override:
             return True
+        # A door opened to let the dog out is not a window left open: park
+        # only once something has stayed open WINDOW_OPEN_GRACE. Parking
+        # stops a running compressor, and the 5-min minimum off then costs a
+        # restart for a 40-second door.
+        if not self._window_raw_open():
+            self._window_open_since = None
+            return False
+        now = datetime.now(timezone.utc)
+        if self._window_open_since is None:
+            self._window_open_since = now
+        return now - self._window_open_since >= WINDOW_OPEN_GRACE
+
+    def _window_raw_open(self) -> bool:
         for entity_id in self.window_sensors:
             try:
                 state = self.hass.states.get(entity_id)
@@ -2784,18 +2857,80 @@ class GTTCCoordinator(DataUpdateCoordinator):
     # Fan pre-cooling
     # ------------------------------------------------------------------
 
-    async def _fan_precool_set_fan(self, mode: str) -> None:
-        """Set thermostat fan mode and track whether fan-only is active."""
+    def _thermostat_fan_modes(self) -> list[str]:
+        state = self.hass.states.get(self.thermostat_entity)
+        if state is None:
+            return []
+        return list(state.attributes.get("fan_modes") or [])
+
+    def _fan_on_mode(self) -> str | None:
+        """The thermostat's own name for "fan running continuously".
+
+        The T6 offers Auto low / Low / Circulation — there is no "on", and a
+        set_fan_mode of "on" is refused (logged by HA, invisible to a
+        non-blocking caller). Before v2.5.0 every fan pre-cool and lockout
+        fan request was that refused "on".
+        """
+        modes = self._thermostat_fan_modes()
+        for mode in FAN_ON_PREFERENCE:
+            if mode in modes:
+                return mode
+        return None
+
+    def _fan_auto_mode(self) -> str | None:
+        for mode in self._thermostat_fan_modes():
+            if "auto" in mode.lower():
+                return mode
+        return None
+
+    async def _set_fan_mode(self, mode: str) -> bool:
         try:
             await self.hass.services.async_call(
                 "climate",
                 "set_fan_mode",
                 {"entity_id": self.thermostat_entity, "fan_mode": mode},
-                blocking=False,
+                blocking=True,
             )
-            self._fan_precool_fan_on = mode == "on"
-        except Exception:
-            pass  # fan mode may not be supported
+            return True
+        except Exception as err:
+            _LOGGER.warning("Thermostat refused fan mode %s: %s", mode, err)
+            return False
+
+    async def _fan_run(self) -> bool:
+        """Run the fan continuously. False when the thermostat cannot."""
+        if self._fan_precool_fan_on:
+            return True
+        mode = self._fan_on_mode()
+        if mode is None:
+            return False
+        state = self.hass.states.get(self.thermostat_entity)
+        current = state.attributes.get("fan_mode") if state else None
+        if not await self._set_fan_mode(mode):
+            return False
+        self._fan_restore_mode = current if current != mode else self._fan_auto_mode()
+        self._fan_precool_fan_on = True
+        return True
+
+    async def _fan_release(self) -> None:
+        """Hand the fan back as it was — unless someone else changed it since."""
+        if not self._fan_precool_fan_on:
+            return
+        self._fan_precool_fan_on = False
+        state = self.hass.states.get(self.thermostat_entity)
+        current = state.attributes.get("fan_mode") if state else None
+        if current is not None and current != self._fan_on_mode():
+            return  # a vacuum sweep, a person: theirs now
+        modes = self._thermostat_fan_modes()
+        restore = self._fan_restore_mode if self._fan_restore_mode in modes else self._fan_auto_mode()
+        if restore:
+            await self._set_fan_mode(restore)
+
+    async def _fan_precool_set_fan(self, mode: str) -> None:
+        """"on" runs the fan, anything else hands it back."""
+        if mode == "on":
+            await self._fan_run()
+        else:
+            await self._fan_release()
 
     def _reset_fan_precool_state(self) -> None:
         """Clear the effectiveness-tracking window (does NOT change fan mode)."""
@@ -2850,22 +2985,24 @@ class GTTCCoordinator(DataUpdateCoordinator):
 
         gap = self.current_temp - desired_temp  # °F above goal
 
-        # ── Already at or below goal: gentle maintenance, no AC inflation ───
+        # ── At or below goal: nothing to do. (This used to run the fan
+        # continuously as "maintenance" — all night on any cool evening. It
+        # never actually ran, because the fan request was always refused.)
         if gap <= 0:
-            if not self._fan_precool_fan_on:
-                await self._fan_precool_set_fan("on")
-            _LOGGER.debug(
-                "Fan pre-cool: maintenance — indoor %.1f° at goal %.1f°, outdoor %.1f°",
-                self.current_temp, desired_temp, self._outdoor_temp,
-            )
+            await self._fan_release()
+            self._reset_fan_precool_state()
             return desired_temp
 
         # ── Active cooling needed (gap > 0) ─────────────────────────────────
         if self._fan_precool_start_time is None:
-            # First activation — start effectiveness window
+            # First activation — start effectiveness window. No fan, no
+            # pre-cool: holding the AC off for a fan that never started just
+            # leaves the house warm.
+            if not await self._fan_run():
+                self._fan_precool_disengaged = True
+                return desired_temp
             self._fan_precool_start_time = now
             self._fan_precool_start_temp = self.current_temp
-            await self._fan_precool_set_fan("on")
             _LOGGER.debug(
                 "Fan pre-cool: START — indoor %.1f°, goal %.1f°, outdoor %.1f°",
                 self.current_temp, desired_temp, self._outdoor_temp,
@@ -2907,7 +3044,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
     async def _update_runtime_tracking(self) -> None:
         """Accumulate daily HVAC runtime and detect heating failures."""
         now = datetime.now(timezone.utc)
-        today = now.strftime("%Y-%m-%d")
+        # Local calendar day — a UTC day rolled the runtime over at 8 pm
+        today = now.astimezone().strftime("%Y-%m-%d")
 
         # Roll over to a new day
         if self._today_date != today:
@@ -2927,25 +3065,36 @@ class GTTCCoordinator(DataUpdateCoordinator):
         elif is_cooling:
             self._today_cooling_min += 0.5
 
-        # Track start of HVAC run for failure detection
+        # Track start of HVAC run for failure detection — against the
+        # thermostat's own reading, the one its setpoint is judged by
+        wall = self._get_thermostat_current_temp()
         if is_active and self._hvac_run_start is None:
             self._hvac_run_start = now
-            self._hvac_run_start_temp = self.current_temp
+            self._hvac_run_start_temp = wall
         elif not is_active:
             self._hvac_run_start = None
             self._hvac_run_start_temp = None
 
-        # Heating failure check: if heating has run for HEATING_FAILURE_RUN_MINUTES
-        # without the temperature rising, notify Brian
+        # Heating failure: a long run that has not moved the wall AND is still
+        # well short of the setpoint. A heat pump holding temperature on a
+        # cold night runs for hours with no rise — that is not a failure.
+        heat_sp = None
+        if self.hvac_mode == HVACMode.HEAT:
+            heat_sp = self._read_thermostat_setpoint()
+        elif self.hvac_mode == HVACMode.HEAT_COOL:
+            band = self._read_thermostat_range()
+            heat_sp = band[0] if band else None
         if (
             is_heating
             and self._hvac_run_start is not None
             and self._hvac_run_start_temp is not None
-            and self.current_temp is not None
+            and wall is not None
+            and heat_sp is not None
+            and heat_sp - wall >= HEATING_FAILURE_SHORTFALL
         ):
             run_minutes = (now - self._hvac_run_start).total_seconds() / 60
             if run_minutes >= HEATING_FAILURE_RUN_MINUTES:
-                temp_change = self.current_temp - self._hvac_run_start_temp
+                temp_change = wall - self._hvac_run_start_temp
                 if temp_change < HEATING_FAILURE_TEMP_DELTA:
                     _LOGGER.warning(
                         "Heating failure detected: ran %.0f min, temp changed only %.1f°",
@@ -2954,7 +3103,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     await self._notify_heating_failure(run_minutes, temp_change)
                     # Reset so we don't spam — check again after another full window
                     self._hvac_run_start = now
-                    self._hvac_run_start_temp = self.current_temp
+                    self._hvac_run_start_temp = wall
 
     def _save_daily_runtime(self, date: str) -> None:
         """Append the current day's runtime totals to the history."""

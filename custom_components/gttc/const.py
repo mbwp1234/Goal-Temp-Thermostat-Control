@@ -226,10 +226,14 @@ FAN_PRECOOL_COMFORT_MARGIN = 1.5
 FAN_PRECOOL_CHECK_WINDOW = 15
 # Minimum °F drop required within the check window to keep fan pre-cool active
 FAN_PRECOOL_MIN_DROP = 0.5
+# Fan modes that mean "run continuously", in order of preference. The T6 Pro
+# calls it "Low"; generic thermostats "on".
+FAN_ON_PREFERENCE = ("on", "On", "Low", "low", "On Low", "on_low", "Circulation", "circulation")
 
 # Heating failure detection
-HEATING_FAILURE_RUN_MINUTES = 20   # HVAC must run this long before we check
+HEATING_FAILURE_RUN_MINUTES = 45   # HVAC must run this long before we check
 HEATING_FAILURE_TEMP_DELTA = 0.5   # minimum expected temperature change (°F)
+HEATING_FAILURE_SHORTFALL = 1.5    # ...while still this far below the heat setpoint
 BRIAN_NOTIFY_SERVICE = "mobile_app_brians_iphone"
 
 # Timed presets / boost buttons

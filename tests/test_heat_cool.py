@@ -48,6 +48,11 @@ def _coord(entry=DAY, indoor=72.0, outdoor=65.0, action=None):
         return_value=[HVACMode.HEAT, HVACMode.COOL, HVACMode.HEAT_COOL]
     )
     coord.async_request_refresh = MagicMock(side_effect=lambda: _noop())
+    # The T6's own fan modes — it has no "on"
+    t6 = MagicMock()
+    t6.state = "heat_cool"
+    t6.attributes = {"fan_modes": ["Auto low", "Low", "Circulation"], "fan_mode": "Low"}
+    coord.hass.states.get = MagicMock(side_effect=lambda e: t6 if e == "climate.test" else None)
     return coord
 
 
@@ -180,9 +185,10 @@ async def test_a_small_drift_does_not_rewrite():
     coord = _coord(DAY)
     coord._last_thermostat_range = (71.0, 74.0)
     coord._range_write_at = datetime.now(timezone.utc) - timedelta(minutes=10)
-    coord.hass.states.get.return_value = MagicMock(
+    _st = MagicMock(
         state="heat_cool", attributes={"target_temp_low": 71.0, "target_temp_high": 74.0}
     )
+    coord.hass.states.get = MagicMock(return_value=_st)
     await coord._update_heat_cool(None)
     assert _calls(coord, "set_temperature") == []
 
@@ -201,7 +207,7 @@ async def test_cold_outside_parks_the_cool_end_and_circulates_a_warm_house():
     assert written["target_temp_low"] == 71.0
     assert coord.cool_locked_out is True
     assert coord._last_action_reason == "cool_lockout"
-    assert {"entity_id": "climate.test", "fan_mode": "on"} in _calls(coord, "set_fan_mode")
+    assert {"entity_id": "climate.test", "fan_mode": "Low"} in _calls(coord, "set_fan_mode")
 
 
 @pytest.mark.asyncio
@@ -272,9 +278,10 @@ async def test_a_band_the_thermostat_did_not_keep_is_written_again_after_the_gra
     coord = _coord(DAY)
     coord._last_thermostat_range = (71.0, 74.0)
     coord._range_write_at = datetime.now(timezone.utc) - timedelta(minutes=10)
-    coord.hass.states.get.return_value = MagicMock(
+    _st = MagicMock(
         state="heat_cool", attributes={"target_temp_low": 69.0, "target_temp_high": 74.0}
     )
+    coord.hass.states.get = MagicMock(return_value=_st)
     await coord._update_heat_cool(None)          # first sighting starts the grace
     assert _calls(coord, "set_temperature") == []
     coord._range_mismatch_since -= RANGE_MISMATCH_GRACE + timedelta(seconds=1)
@@ -456,7 +463,7 @@ async def test_cool_air_outside_runs_the_fan_before_the_compressor():
     assert written["target_temp_high"] > 70.0          # compressor held off
     assert coord.target_high == 70.0                   # the band still means 70
     assert coord._last_action_reason == "fan_precool"
-    assert {"entity_id": "climate.test", "fan_mode": "on"} in _calls(coord, "set_fan_mode")
+    assert {"entity_id": "climate.test", "fan_mode": "Low"} in _calls(coord, "set_fan_mode")
 
 
 @pytest.mark.asyncio

@@ -80,7 +80,7 @@ async def test_lockout_fan_follows_the_warmest_zone():
     up = _house(coord)
     await coord._update_heat_cool(up)
     assert coord.cool_locked_out is True
-    assert {"entity_id": "climate.test", "fan_mode": "on"} in _calls(coord, "set_fan_mode")
+    assert {"entity_id": "climate.test", "fan_mode": "Low"} in _calls(coord, "set_fan_mode")
 
 
 def test_untouched_old_default_moves_to_the_new_one():
