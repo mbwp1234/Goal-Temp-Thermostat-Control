@@ -29,6 +29,7 @@ from .const import (
     ACTION_REASON_VACATION,
     ACTION_REASON_WINDOW,
     ACTION_REASON_COOL_LOCKOUT,
+    ACTION_REASON_WARM_ZONE,
     BOOST_TYPES,
     BRIAN_NOTIFY_SERVICE,
     CONF_AUTO_SEASON_SWITCH,
@@ -87,6 +88,12 @@ from .const import (
     CONF_HEAT_COOL_MIN_GAP,
     CONF_HEAT_COOL_SETTLE_DAYS,
     COOL_LOCKOUT_PARK,
+    COOL_LOCKOUT_REV,
+    LEGACY_COOL_LOCKOUT_TEMP,
+    WARM_ZONE_CLEAR,
+    WARM_ZONE_FLOOR_MARGIN,
+    WARM_ZONE_MARGIN,
+    WARM_ZONE_MINUTES,
     DEFAULT_COOL_LOCKOUT_TEMP,
     DEFAULT_HEAT_COOL_LADDER,
     DEFAULT_HEAT_COOL_MIN_GAP,
@@ -228,6 +235,10 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self.target_high: float | None = None
         self.cool_locked_out: bool = False
         self._gap_adjusted_from: float | None = None
+        # Warm-zone cooling: since when the warmest zone has been over the
+        # cool goal, and the zone being cooled against while it is engaged
+        self._warm_zone_since: datetime | None = None
+        self.warm_zone = None
         # When each side of the equipment last ran while in heat/cool — the
         # ladder leaves for a single season once one side has been quiet for
         # heat_cool_settle_days. Persisted, or every restart restarts the wait.
@@ -686,6 +697,11 @@ class GTTCCoordinator(DataUpdateCoordinator):
                         setattr(self, key, float(data[key]))
                     except (ValueError, TypeError):
                         pass
+            if (
+                data.get("cool_lockout_rev") is None
+                and self.cool_lockout_temp == LEGACY_COOL_LOCKOUT_TEMP
+            ):
+                self.cool_lockout_temp = DEFAULT_COOL_LOCKOUT_TEMP
             for key in ("_last_heat_call", "_last_cool_call"):
                 raw = data.get(key.lstrip("_"))
                 if raw:
@@ -740,6 +756,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 "auto_season_switch": self.auto_season_switch,
                 "heat_cool_ladder": self.heat_cool_ladder,
                 "cool_lockout_temp": self.cool_lockout_temp,
+                "cool_lockout_rev": COOL_LOCKOUT_REV,
                 "heat_cool_settle_days": self.heat_cool_settle_days,
                 "heat_cool_min_gap": self.heat_cool_min_gap,
                 "last_heat_call": (
@@ -917,10 +934,19 @@ class GTTCCoordinator(DataUpdateCoordinator):
             # Skip entirely when manual override is active — the user wants the
             # AC/heat to respond to the override immediately, not be held off by
             # fan-only ventilation.
-            if self.manual_override and not self.manual_override.is_expired:
+            overridden = self.manual_override and not self.manual_override.is_expired
+            warm = None
+            if self.season == SEASON_COOLING and not overridden:
+                heat_goal, _ = self._calculate_desired_temp(SEASON_HEATING)
+                warm = self._update_warm_zone(desired_temp, heat_goal, active_zone)
+            else:
+                self._update_warm_zone(None, None, None)
+            if overridden or warm is not None:
                 if self._fan_precool_fan_on:
                     await self._fan_precool_set_fan("Auto low")
                 self._reset_fan_precool_state()
+                if warm is not None:
+                    action_reason = ACTION_REASON_WARM_ZONE
             else:
                 fan_precool_temp = await self._apply_fan_precool(desired_temp)
                 if fan_precool_temp != desired_temp:
@@ -932,7 +958,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
 
             # Calculate offset-adjusted target for the real thermostat.
             thermostat_target = self._calculate_thermostat_target(
-                desired_temp, active_zone
+                desired_temp, warm or active_zone
             )
 
             # Apply to thermostat if changed beyond hysteresis threshold
@@ -1006,6 +1032,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
             "target_low": self.target_low,
             "target_high": self.target_high,
             "cool_locked_out": self.cool_locked_out,
+            "warm_zone": self.warm_zone.name if self.warm_zone else None,
             "gap_adjusted_from": self._gap_adjusted_from,
             "heat_cool_min_gap": self.heat_cool_min_gap,
             "vacation_mode": (
@@ -1749,6 +1776,53 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 )
                 return
 
+    def _update_warm_zone(self, cool_goal, heat_goal, active_zone):
+        """The zone to cool against instead of the active one, or None.
+
+        The schedule watches one zone; the people may be in another. When the
+        warmest zone stays WARM_ZONE_MARGIN over the cool goal for
+        WARM_ZONE_MINUTES, cool against it until it is within WARM_ZONE_CLEAR
+        — unless that would chill the watched zone toward its heat goal.
+        """
+        now = datetime.now(timezone.utc)
+        zones = [z for z in self.zone_manager.zones.values() if z.current_temp is not None]
+        warm = max(zones, key=lambda z: z.current_temp, default=None)
+        watched = active_zone.current_temp if active_zone is not None else None
+        if (
+            warm is None
+            or cool_goal is None
+            or (active_zone is not None and warm.id == active_zone.id)
+            or (
+                watched is not None
+                and heat_goal is not None
+                and watched <= heat_goal + WARM_ZONE_FLOOR_MARGIN
+            )
+        ):
+            self._warm_zone_since = None
+            self.warm_zone = None
+            return None
+        if self.warm_zone is not None and self.warm_zone.id == warm.id:
+            if warm.current_temp > cool_goal + WARM_ZONE_CLEAR:
+                return warm
+            self._warm_zone_since = None
+            self.warm_zone = None
+            return None
+        if warm.current_temp <= cool_goal + WARM_ZONE_MARGIN:
+            self._warm_zone_since = None
+            self.warm_zone = None
+            return None
+        if self._warm_zone_since is None:
+            self._warm_zone_since = now
+        if now - self._warm_zone_since >= timedelta(minutes=WARM_ZONE_MINUTES):
+            _LOGGER.info(
+                "%s is %.1f° against a %.1f° cool goal — cooling against it",
+                warm.name, warm.current_temp, cool_goal,
+            )
+            self.warm_zone = warm
+            return warm
+        self.warm_zone = None
+        return None
+
     async def _update_heat_cool(self, active_zone) -> None:
         """One control cycle in heat/cool: compute both ends and write the band."""
         now = datetime.now(timezone.utc)
@@ -1786,19 +1860,43 @@ class GTTCCoordinator(DataUpdateCoordinator):
         cur = self.current_temp
         reason = high_reason if cur is not None and cur > high else low_reason
 
-        # The AC stays off on a cold day; the fan moves the warm air instead
-        locked = self._outdoor_temp is not None and self._outdoor_temp < self.cool_lockout_temp
-        self.cool_locked_out = locked
         # Goal-level cool end the house is judged against (fan pre-cool may
         # inflate what is written, never what "above the band" means)
         cool_goal = high
+        # The AC stays off on a cold day; the fan moves the warm air instead.
+        # A hold or a boost is someone asking for it — it always gets the AC.
+        locked = (
+            override is None
+            and self._outdoor_temp is not None
+            and self._outdoor_temp < self.cool_lockout_temp
+        )
+        self.cool_locked_out = locked
+        warm = (
+            self._update_warm_zone(cool_goal, low, active_zone)
+            if override is None
+            else self._update_warm_zone(None, None, None)
+        )
         if locked:
             self._reset_fan_precool_state()
-            want_fan = cur is not None and cur > cool_goal + 0.5
+            # Judge the fan by the warmest zone, not only the watched one
+            hottest = max(
+                (t for t in [cur] + [z.current_temp for z in self.zone_manager.zones.values()]
+                 if t is not None),
+                default=None,
+            )
+            want_fan = hottest is not None and hottest > cool_goal + 0.5
             if want_fan and not self._fan_precool_fan_on:
                 await self._fan_precool_set_fan("on")
             elif not want_fan and self._fan_precool_fan_on:
                 await self._fan_precool_set_fan("Auto low")
+        elif warm is not None or override is not None:
+            # Someone asked for cooling, or a zone has been hot too long: the
+            # compressor runs now, not after a fan-only trial
+            self._reset_fan_precool_state()
+            if self._fan_precool_fan_on:
+                await self._fan_precool_set_fan("Auto low")
+            if warm is not None:
+                reason = ACTION_REASON_WARM_ZONE
         else:
             # Between the lockout and FAN_PRECOOL_MAX_OUTDOOR, cool outside air
             # is still worth a fan run before the compressor — exactly what
@@ -1810,7 +1908,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     reason = ACTION_REASON_FAN_PRECOOL
 
         t_low = self._calculate_thermostat_target(low, active_zone)
-        t_high = self._calculate_thermostat_target(high, active_zone)
+        t_high = self._calculate_thermostat_target(high, warm or active_zone)
         if locked:
             t_high = max(t_high, min(self.get_thermostat_max_temp(), COOL_LOCKOUT_PARK))
             if cur is not None and cur > cool_goal:
@@ -1819,7 +1917,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
         # Keep the thermostat's own minimum gap by lowering the heat end —
         # measured against the cool GOAL, so the heat end does not jump each
         # time fan pre-cool or the lockout raises what is written above it
-        t_cool_goal = self._calculate_thermostat_target(cool_goal, active_zone)
+        t_cool_goal = self._calculate_thermostat_target(cool_goal, warm or active_zone)
         if t_cool_goal - t_low < gap:
             shift = t_low - (t_cool_goal - gap)
             self._gap_adjusted_from = round(low, 1)

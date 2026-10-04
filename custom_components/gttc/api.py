@@ -330,6 +330,7 @@ async def ws_get_status(
         "target_low": coordinator.target_low,
         "target_high": coordinator.target_high,
         "cool_locked_out": coordinator.cool_locked_out,
+        "warm_zone": coordinator.warm_zone.name if coordinator.warm_zone else None,
     }
     connection.send_result(msg["id"], result)
 
