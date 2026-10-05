@@ -197,17 +197,25 @@ class Scheduler:
         self, day_schedule: DaySchedule, current_time: time
     ) -> ScheduleEntry | None:
         """Find the entry that covers the given time."""
+        now_s = current_time.hour * 3600 + current_time.minute * 60 + current_time.second
         for entry in day_schedule.entries:
             try:
                 start = entry.start_time
                 end = entry.end_time
+                start_s = start.hour * 3600 + start.minute * 60
+                end_s = end.hour * 3600 + end.minute * 60
+                # "05:59", "17:59", "23:59" mean through the end of that
+                # minute — exclusive, they left a minute of fallback at every
+                # seam (and the band jumped to the fallback and back)
+                if end.minute == 59:
+                    end_s += 60
 
-                if start <= end:
-                    if start <= current_time < end:
+                if start_s <= end_s:
+                    if start_s <= now_s < end_s:
                         return entry
                 else:
                     # Overnight range (e.g., 22:00 - 06:00)
-                    if current_time >= start or current_time < end:
+                    if now_s >= start_s or now_s < end_s:
                         return entry
             except Exception as err:
                 _LOGGER.debug("Error evaluating schedule entry: %s", err)

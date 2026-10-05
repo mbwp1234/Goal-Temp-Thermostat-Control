@@ -117,7 +117,7 @@ WARM_ZONE_MARGIN = 1.5
 WARM_ZONE_MINUTES = 10
 WARM_ZONE_CLEAR = 0.5
 # ...and stops early if the watched zone would drop this close to its heat goal.
-WARM_ZONE_FLOOR_MARGIN = 1.0
+WARM_ZONE_FLOOR_MARGIN = 0.0
 # The lockout is "don't run the AC to shave a degree on a cold night", not
 # "never cool": a party or the oven can push a zone well past its goal with
 # 49° outside. Any zone this far over the cool goal for WARM_ZONE_MINUTES
@@ -226,10 +226,16 @@ FAN_PRECOOL_COMFORT_MARGIN = 1.5
 FAN_PRECOOL_CHECK_WINDOW = 15
 # Minimum °F drop required within the check window to keep fan pre-cool active
 FAN_PRECOOL_MIN_DROP = 0.5
+# Fan modes that mean "run continuously", in order of preference. The T6 Pro
+# calls it "Low"; generic thermostats "on".
+FAN_ON_PREFERENCE = ("on", "On", "Low", "low", "On Low", "on_low", "Circulation", "circulation")
 
 # Heating failure detection
-HEATING_FAILURE_RUN_MINUTES = 20   # HVAC must run this long before we check
+HEATING_FAILURE_RUN_MINUTES = 45   # HVAC must run this long before we check
 HEATING_FAILURE_TEMP_DELTA = 0.5   # minimum expected temperature change (°F)
+HEATING_FAILURE_SHORTFALL = 1.5    # ...while still this far below the heat setpoint
+HEATING_FAILURE_MIN_OUTDOOR = 25.0 # colder than this, a heat pump falling short is expected
+HEATING_FAILURE_COOLDOWN_H = 12    # at most one alert per this many hours
 BRIAN_NOTIFY_SERVICE = "mobile_app_brians_iphone"
 
 # Timed presets / boost buttons
