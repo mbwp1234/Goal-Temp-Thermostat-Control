@@ -71,6 +71,8 @@ from .const import (
     FAN_PRECOOL_MIN_DROP,
     HEAT_PUMP_MAX_SETBACK,
     HEAT_PUMP_RECOVERY_STEP,
+    HEATING_FAILURE_COOLDOWN_H,
+    HEATING_FAILURE_MIN_OUTDOOR,
     HEATING_FAILURE_RUN_MINUTES,
     HEATING_FAILURE_SHORTFALL,
     HEATING_FAILURE_TEMP_DELTA,
@@ -204,6 +206,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self._outdoor_temp: float | None = None
         self._outdoor_last: tuple[float, datetime] | None = None
         self._window_open_since: datetime | None = None
+        self._last_failure_alert: datetime | None = None
 
         # Season management — Heating or Cooling.
         # When auto_season_switch is True the coordinator automatically calls
@@ -3091,11 +3094,17 @@ class GTTCCoordinator(DataUpdateCoordinator):
             and wall is not None
             and heat_sp is not None
             and heat_sp - wall >= HEATING_FAILURE_SHORTFALL
+            and (self._outdoor_temp is None or self._outdoor_temp >= HEATING_FAILURE_MIN_OUTDOOR)
         ):
             run_minutes = (now - self._hvac_run_start).total_seconds() / 60
             if run_minutes >= HEATING_FAILURE_RUN_MINUTES:
                 temp_change = wall - self._hvac_run_start_temp
-                if temp_change < HEATING_FAILURE_TEMP_DELTA:
+                recent = (
+                    self._last_failure_alert is not None
+                    and now - self._last_failure_alert < timedelta(hours=HEATING_FAILURE_COOLDOWN_H)
+                )
+                if temp_change < HEATING_FAILURE_TEMP_DELTA and not recent:
+                    self._last_failure_alert = now
                     _LOGGER.warning(
                         "Heating failure detected: ran %.0f min, temp changed only %.1f°",
                         run_minutes, temp_change,

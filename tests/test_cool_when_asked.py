@@ -149,7 +149,7 @@ async def test_the_warm_zone_lets_go_near_the_goal():
 @pytest.mark.asyncio
 async def test_never_chills_the_watched_zone_to_its_heat_goal():
     coord = _coord(EVENING, outdoor=54.7)
-    up = _house(coord, up=68.8, down=74.5)      # nursery floor near the 68 heat goal
+    up = _house(coord, up=67.9, down=74.5)      # nursery floor at its 68 heat goal
     await coord._update_heat_cool(up)
     _age(coord)
     await coord._update_heat_cool(up)
