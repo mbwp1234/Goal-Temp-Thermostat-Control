@@ -516,6 +516,21 @@ class GTTCCoordinator(DataUpdateCoordinator):
         if setpoint is None:
             return
 
+        # A report whose setpoint did not move is about something else — the
+        # fan, the action, humidity. Comparing it against what GTTC has just
+        # *asked* for (and the wall has not applied yet) turns GTTC's own
+        # pending write into a phantom hold: the fan pre-cool sets the fan
+        # first, the fan report still carries the old setpoint, and that old
+        # setpoint was held for two hours. Only a moving setpoint is a change.
+        if old_state is not None and old_state.state == new_state.state:
+            try:
+                before_raw = old_state.attributes.get(ATTR_TEMPERATURE)
+                before = float(before_raw) if before_raw is not None else None
+            except (TypeError, ValueError):
+                before = None
+            if before is not None and abs(setpoint - before) < PHYSICAL_CHANGE_THRESHOLD:
+                return
+
         previous = self._known_thermostat_setpoint
         self._known_thermostat_setpoint = setpoint
 

@@ -307,3 +307,61 @@ class TestOverrideSource:
 
         assert restored.source == OVERRIDE_SOURCE_MANUAL
         assert restored.is_physical is False
+
+
+class TestUnmovedSetpointIsNotAChange:
+    """v2.5.1: a report that only moves the fan must not become a hold.
+
+    2026-10-05 19:12 and 20:25 — fan pre-cool noted its inflated write
+    (74.5, then 71.7), set the fan first, and the fan report still carried
+    the wall's old 72.8. That old value was held for 120 minutes, twice.
+    """
+
+    @staticmethod
+    def _report(old_sp: float, new_sp: float) -> MagicMock:
+        old_state = MagicMock()
+        old_state.state = "cool"
+        old_state.attributes = {"temperature": old_sp, "fan_mode": "Auto low"}
+        new_state = MagicMock()
+        new_state.state = "cool"
+        new_state.attributes = {"temperature": new_sp, "fan_mode": "Low"}
+        event = MagicMock()
+        event.data = {"old_state": old_state, "new_state": new_state}
+        return event
+
+    @pytest.mark.asyncio
+    async def test_fan_report_during_pending_write_is_not_a_hold(self):
+        coord = _make_coordinator()
+        coord._known_thermostat_setpoint = 72.8
+        coord._note_own_write(74.5)  # pre-cool's inflated target, not applied yet
+
+        coord._handle_thermostat_state_event(self._report(72.8, 72.8))
+        for coro in coord._created_tasks:
+            await coro
+
+        assert coord.manual_override is None
+
+    @pytest.mark.asyncio
+    async def test_echo_after_fan_report_still_ignored(self):
+        coord = _make_coordinator()
+        coord._known_thermostat_setpoint = 72.8
+        coord._note_own_write(74.5)
+
+        coord._handle_thermostat_state_event(self._report(72.8, 72.8))
+        coord._handle_thermostat_state_event(self._report(72.8, 74.5))
+        for coro in coord._created_tasks:
+            await coro
+
+        assert coord.manual_override is None
+
+    @pytest.mark.asyncio
+    async def test_real_wall_press_between_reports_still_holds(self):
+        coord = _make_coordinator()
+        coord._known_thermostat_setpoint = 72.8
+
+        coord._handle_thermostat_state_event(self._report(72.8, 75.0))
+        for coro in coord._created_tasks:
+            await coro
+
+        assert coord.manual_override is not None
+        assert coord.manual_override.target_temp == 75.0
