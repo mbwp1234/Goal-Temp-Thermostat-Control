@@ -45,6 +45,7 @@ def async_register_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_get_schedule)
     websocket_api.async_register_command(hass, ws_update_entry)
     websocket_api.async_register_command(hass, ws_delete_entry)
+    websocket_api.async_register_command(hass, ws_set_day_entries)
     websocket_api.async_register_command(hass, ws_get_status)
     websocket_api.async_register_command(hass, ws_bulk_add_entry)
     websocket_api.async_register_command(hass, ws_copy_entry_to_days)
@@ -279,6 +280,95 @@ async def ws_delete_entry(
     if len(entries_list) == original_len:
         connection.send_error(msg["id"], "not_found", "Entry not found")
         return
+
+    await coordinator.async_save()
+    connection.send_result(msg["id"], {"success": True})
+
+
+# ── Replace whole days ──────────────────────────────────────────────────────
+# The panel edits a block once for a group of days ("every day", "weekdays").
+# Done as N deletes + N updates that is 2N undo snapshots, so "Undo" walked
+# back one day of a seven-day save. This replaces each day's list in one step
+# and pushes ONE snapshot.
+
+_ENTRY_SCHEMA = vol.Schema(
+    {
+        vol.Required("time_start"): str,
+        vol.Required("time_end"): str,
+        vol.Required("target_temp"): vol.Coerce(float),
+        vol.Optional("cooling_temp"): vol.Any(None, vol.Coerce(float)),
+        vol.Optional("away_temp"): vol.Any(None, vol.Coerce(float)),
+        vol.Optional("zone_id"): vol.Any(None, str),
+    }
+)
+
+
+def _replace_day_entries(scheduler, preset_name, days, entries):
+    """Replace the entry list of every day in `days`. Returns a bad day or None.
+
+    Every day is resolved before anything is written, so a bad day name
+    leaves the schedule untouched rather than half-saved.
+    """
+    from .models import ScheduleEntry
+
+    lists = []
+    for day in days:
+        lst = _get_entries_list(scheduler, preset_name, day)
+        if lst is None:
+            return day
+        # weekday/weekend mode maps five days onto one list — write it once
+        if not any(lst is seen for seen in lists):
+            lists.append(lst)
+    for lst in lists:
+        lst[:] = sorted(
+            (
+                ScheduleEntry(
+                    time_start=e["time_start"],
+                    time_end=e["time_end"],
+                    target_temp=e["target_temp"],
+                    cooling_temp=e.get("cooling_temp"),
+                    away_temp=e.get("away_temp"),
+                    zone_id=e.get("zone_id"),
+                )
+                for e in entries
+            ),
+            key=lambda e: e.time_start,
+        )
+    return None
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "gttc/set_day_entries",
+        vol.Required("days"): [str],
+        vol.Required("entries"): [_ENTRY_SCHEMA],
+        vol.Optional("preset"): str,
+        vol.Optional("entry_id"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_set_day_entries(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Replace the whole entry list of one or more days, as one undo step."""
+    coordinator = _get_coordinator(hass, msg.get("entry_id"))
+    if coordinator is None:
+        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
+        return
+
+    scheduler = coordinator.scheduler
+    preset_name = msg.get("preset") or scheduler.schedule.active_preset
+    snapshot = copy.deepcopy(scheduler.save())
+    bad = _replace_day_entries(scheduler, preset_name, msg["days"], msg["entries"])
+    if bad is not None:
+        connection.send_error(msg["id"], "invalid_day", f"Cannot find schedule for day '{bad}'")
+        return
+
+    key = _get_undo_key(coordinator)
+    _UNDO_STACKS.setdefault(key, []).append(snapshot)
+    if len(_UNDO_STACKS[key]) > _MAX_UNDO:
+        _UNDO_STACKS[key].pop(0)
+    _REDO_STACKS[key] = []
 
     await coordinator.async_save()
     connection.send_result(msg["id"], {"success": True})

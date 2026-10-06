@@ -51,7 +51,7 @@ After installation a **GTTC** entry appears in the Home Assistant sidebar. The C
   - Schedule goal step-function overlay
   - HVAC state bands (orange = heating, blue = cooling)
   - On-peak hour shading (when TOU is enabled)
-- **Schedule Editor** — Full drag-and-drop schedule editor with preset selector, day tabs, week overview, and day detail — all without switching pages
+- **Schedule** — Every plan as a card (the running one marked), the chosen plan's day drawn from 6 AM so a night is one block, each block's goal and the room it is measured in, what the thermostat will do with it in each season, and a list of gaps and blocks with no room. Days are edited together (every day, weekdays/weekends, or each day) in a side editor, and each save is one undo step
 
 ## Entities Created
 

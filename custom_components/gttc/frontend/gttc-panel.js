@@ -176,7 +176,7 @@ class GttcPanel extends HTMLElement {
   // True while the user is in the middle of something a repaint would destroy:
   // an open modal, a drag, or focus in a form field.
   _isBusy() {
-    if (this._editingEntry || this._showCopyModal || this._showCopyDayModal || this._showPresetModal
+    if (this._blk || this._editingEntry || this._showCopyModal || this._showCopyDayModal || this._showPresetModal
         || this._showExportModal || this._showImportModal || this._showVacationModal) return true;
     if (this._dragActive) return true;
     if (this._activeMainTab === "settings") return true;
@@ -519,6 +519,10 @@ class GttcPanel extends HTMLElement {
     return entries.map((entry, i) => {
       let startMin = timeToMinutes(entry.time_start);
       let endMin = timeToMinutes(entry.time_end);
+      if (/:59$/.test(entry.time_end)) endMin += 1;
+      // A block that runs past midnight is also the start of this day's list
+      // (the list is read circularly), so draw its morning piece too.
+      const morning = endMin > 0 && endMin < startMin ? endMin : 0;
       if (endMin <= startMin) endMin = 1440;
       const leftPct = (startMin / 1440) * 100;
       const widthPct = ((endMin - startMin) / 1440) * 100;
@@ -541,7 +545,8 @@ class GttcPanel extends HTMLElement {
       const tempText = band
         ? `${this._fmtBand(band)}${this._seasonTempIsFallback(entry) ? "*" : ""}`
         : `${this._fmtTemp(temp)}${this._seasonTempIsFallback(entry) ? "*" : ""}`;
-      return `
+      return (morning ? `<div class="timeline-block ${compact ? "compact" : ""}" style="left:0;width:${(morning / 1440) * 100}%;background:${color}"
+             data-day="${day}" data-index="${i}" title="${formatTime12(entry.time_start)} - ${formatTime12(entry.time_end)}"></div>` : "") + `
         <div class="timeline-block ${compact ? "compact" : ""}"
              style="left:${leftPct}%;width:${widthPct}%;background:${color};color:${textColor}"
              data-day="${day}" data-index="${i}"
@@ -1102,6 +1107,7 @@ class GttcPanel extends HTMLElement {
     });
 
     this._attachSettingsListeners();
+    if (this._activeMainTab === "schedule") this._attachScheduleTabListeners();
 
     // Day tabs
     root.querySelectorAll(".day-tab").forEach(btn => {
@@ -1131,9 +1137,14 @@ class GttcPanel extends HTMLElement {
         const idx = parseInt(block.dataset.index);
         const entries = this._getEntriesForDay(day);
         if (entries[idx]) {
-          this._selectedDay = day;
-          this._editingEntry = { entry: { ...entries[idx] }, isNew: false, day, index: idx };
-          this._render();
+          // Today's strip opens the same editor as the Schedule tab, on the
+          // block this entry belongs to (a night stored in two halves is one).
+          this._activeMainTab = "schedule";
+          this._planView = null; this._planModeSel = null; this._planPart = null; this._planDay = null;
+          const plan = this._viewPlan();
+          const blocks = this._blocksOf(this._planDayList(plan, this._planTarget(plan).rep));
+          const bi = blocks.findIndex(b => b.parts.some(p => p.time_start === entries[idx].time_start && p.time_end === entries[idx].time_end));
+          if (bi >= 0) this._openBlock(bi); else this._render();
         }
       });
     });
@@ -1242,13 +1253,13 @@ class GttcPanel extends HTMLElement {
     });
     this._addClick("deletePresetBtn", () => {
       this._presetModalMode = "delete";
-      this._presetModalTarget = this._schedule.active_preset;
+      this._presetModalTarget = this._viewPlan() || this._schedule.active_preset;
       this._showPresetModal = true;
       this._render();
     });
     this._addClick("renamePresetBtn", () => {
       this._presetModalMode = "rename";
-      this._presetModalTarget = this._schedule.active_preset;
+      this._presetModalTarget = this._viewPlan() || this._schedule.active_preset;
       this._showPresetModal = true;
       this._render();
     });
@@ -2940,35 +2951,656 @@ class GttcPanel extends HTMLElement {
     `;
   }
 
+  // ── Schedule tab ──────────────────────────────────────────────────────────
+  // Plans as cards; the viewed plan's day drawn from 6 AM, so a night is one
+  // block instead of two halves split at midnight; one number per block; and
+  // an editor that writes a whole day group as ONE undo step
+  // (gttc/set_day_entries). The list is per calendar day and read circularly,
+  // which is how _find_entry_for_time reads it: "19:00 → 06:00" on Monday is
+  // Monday's evening AND Monday's early morning.
+
+  _planKeys() {
+    const s = this._schedule;
+    const keys = Object.keys(s.presets || {});
+    // The base lists only run when no plan is picked, so they are a plan of
+    // their own only then. Otherwise they are a decoy that never runs.
+    return s.active_preset ? keys : [...keys, ""];
+  }
+
+  _planLabel(k) {
+    const s = this._schedule;
+    return k ? (s.preset_labels?.[k] || s.presets?.[k]?.label || k) : "Base schedule";
+  }
+
+  _viewPlan() {
+    const keys = this._planKeys();
+    if (this._planView != null && keys.includes(this._planView)) return this._planView;
+    return this._schedule.active_preset || "";
+  }
+
+  _planDayList(plan, day) {
+    const s = this._schedule;
+    if (plan) return s.presets?.[plan]?.schedule?.[day] || [];
+    if (s.mode === "per_day") return s.per_day?.[day] || [];
+    return ["saturday", "sunday"].includes(day) ? (s.weekend || []) : (s.weekday || []);
+  }
+
+  _planSig(plan, day) {
+    return JSON.stringify(this._planDayList(plan, day)
+      .map(e => [e.time_start, e.time_end, e.target_temp, e.cooling_temp ?? null, e.away_temp ?? null, e.zone_id || null])
+      .sort());
+  }
+
+  // How the plan's days actually group: identical all week, weekdays vs
+  // weekends, or each day its own.
+  _planShape(plan) {
+    const sig = DAYS_ORDERED.map(d => this._planSig(plan, d));
+    if (sig.every(x => x === sig[0])) return "all";
+    const wd = sig.slice(0, 5), we = sig.slice(5);
+    if (wd.every(x => x === wd[0]) && we.every(x => x === we[0])) return "split";
+    return "each";
+  }
+
+  _todayKey() {
+    const g = new Date().getDay();
+    return DAYS_ORDERED[g === 0 ? 6 : g - 1];
+  }
+
+  _planMode(plan) {
+    const canEach = !!plan || this._schedule.mode === "per_day";
+    const m = this._planModeSel || this._planShape(plan);
+    return m === "each" && !canEach ? "split" : m;
+  }
+
+  // The days an edit writes to, and the day whose list stands for them.
+  _planTarget(plan) {
+    const mode = this._planMode(plan);
+    const today = this._todayKey();
+    if (mode === "all") return { days: [...DAYS_ORDERED], rep: today };
+    if (mode === "split") {
+      const part = this._planPart || (["saturday", "sunday"].includes(today) ? "weekend" : "weekdays");
+      const days = part === "weekend" ? ["saturday", "sunday"] : DAYS_ORDERED.slice(0, 5);
+      return { days, rep: days.includes(today) ? today : days[0], part };
+    }
+    const day = this._planDay || today;
+    return { days: [day], rep: day };
+  }
+
+  // "17:59" runs through the end of that minute (v2.5.0), so it ends at :00.
+  _endMin(t) {
+    const m = timeToMinutes(t);
+    return /:59$/.test(t) ? m + 1 : m;
+  }
+
+  _span(e) {
+    const a = timeToMinutes(e.time_start);
+    const b = this._endMin(e.time_end);
+    return { a, len: b > a ? b - a : b < a ? b + 1440 - a : 0 };
+  }
+
+  _entryKey(e) {
+    return JSON.stringify([e.target_temp, e.cooling_temp ?? null, e.away_temp ?? null, e.zone_id || null]);
+  }
+
+  // Entries → blocks. Touching entries with the same settings merge, which is
+  // what turns a night stored as 20:00–23:59 + 00:00–05:59 back into one.
+  _blocksOf(list) {
+    let blocks = list.map(e => ({ ...this._span(e), key: this._entryKey(e), parts: [e] }))
+      .filter(b => b.len > 0);
+    for (let guard = 0; guard < 8; guard++) {
+      let merged = false;
+      for (const x of blocks) {
+        const y = blocks.find(o => o !== x && o.key === x.key && o.a === (x.a + x.len) % 1440);
+        if (y && x.len + y.len <= 1440) {
+          x.len += y.len; x.parts = [...x.parts, ...y.parts];
+          blocks = blocks.filter(o => o !== y); merged = true; break;
+        }
+      }
+      if (!merged) break;
+    }
+    const ax = m => (m - 360 + 1440) % 1440;
+    return blocks.sort((p, q) => ax(p.a) - ax(q.a)).map(b => ({ ...b, e: b.parts[0], name: this._blockName(b) }));
+  }
+
+  _blockName(b) {
+    if (b.len >= 1439) return "All day";
+    const s = b.a, e = b.a + b.len;
+    if (e > 1440 || s < 300) return "Overnight";
+    if (s <= 720 && e > 720) return "Day";
+    if (s < 720) return "Morning";
+    if (s < 1020) return "Afternoon";
+    return "Evening";
+  }
+
+  _gapsOf(list) {
+    const cov = new Array(1440).fill(false);
+    list.forEach(e => { const { a, len } = this._span(e); for (let k = 0; k < len; k++) cov[(a + k) % 1440] = true; });
+    if (!cov.some(Boolean)) return [];
+    const gaps = [];
+    for (let k = 0; k < 1440;) {
+      const m = (360 + k) % 1440;
+      if (cov[m]) { k++; continue; }
+      let n = 0;
+      while (k + n < 1440 && !cov[(360 + k + n) % 1440]) n++;
+      if (n > 1) gaps.push([m, (m + n) % 1440]);
+      k += n;
+    }
+    return gaps;
+  }
+
+  _clock(m) {
+    m = ((m % 1440) + 1440) % 1440;
+    const h = Math.floor(m / 60), mm = m % 60;
+    const h12 = h % 12 === 0 ? 12 : h % 12;
+    return `${h12}:${String(mm).padStart(2, "0")} ${h < 12 ? "AM" : "PM"}`;
+  }
+
+  _hhmm(m) {
+    m = ((m % 1440) + 1440) % 1440;
+    return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+  }
+
+  _blockRange(b) {
+    if (b.len >= 1439) return "all day";
+    return `${this._clock(b.a)} → ${this._clock(b.a + b.len)}`;
+  }
+
+  // Paint a day's minutes: the list minus `remove`, then `add` on top, read
+  // back as entries. Overlaps resolve to the newest block, so moving a block
+  // over its neighbour trims the neighbour instead of leaving two answers.
+  _paintDay(list, remove, add) {
+    const slot = new Array(1440).fill(null);
+    const gone = e => remove.some(p => p.time_start === e.time_start && p.time_end === e.time_end);
+    list.forEach(e => {
+      if (gone(e)) return;
+      const { a, len } = this._span(e);
+      for (let k = 0; k < len; k++) slot[(a + k) % 1440] = e;
+    });
+    if (add) for (let k = 0; k < add.len; k++) slot[(add.a + k) % 1440] = add.e;
+    let start = slot.findIndex((v, i) => v !== slot[(i + 1439) % 1440]);
+    const out = [];
+    const emit = (e, a, len) => {
+      if (!e) return;
+      const end = a + len;
+      out.push({
+        time_start: this._hhmm(a),
+        time_end: len >= 1440 ? "23:59" : end === 1440 ? "23:59" : this._hhmm(end),
+        target_temp: e.target_temp,
+        cooling_temp: e.cooling_temp ?? null,
+        away_temp: e.away_temp ?? null,
+        zone_id: e.zone_id || null,
+      });
+    };
+    if (start < 0) { emit(slot[0], 0, 1440); return out; }
+    let runStart = start, cur = slot[start];
+    for (let k = 1; k <= 1440; k++) {
+      const m = (start + k) % 1440;
+      if (k === 1440 || slot[m] !== cur) {
+        emit(cur, runStart, (k + start - runStart + 1440) % 1440 || 1440);
+        runStart = m; cur = slot[m];
+      }
+    }
+    return out.sort((p, q) => p.time_start.localeCompare(q.time_start));
+  }
+
+  _zoneNow(zoneId) {
+    const z = (this._diagData?.zones || []).find(x => x.id === zoneId);
+    return z && z.current_temp != null ? z.current_temp : null;
+  }
+
+  _coolOf(e) {
+    return e.cooling_temp != null ? e.cooling_temp : (this._diagData?.cooling_comfort ?? this._settingsData?.cooling_comfort ?? null);
+  }
+
+  // One number when heat and cool agree (or cool is unset); both otherwise.
+  _asksFor(e) {
+    const cool = this._coolOf(e);
+    if (e.cooling_temp == null) return `Heat to <b>${e.target_temp}°</b> <span class="sx-dim">· cool uses the default${cool != null ? ` (${cool}°)` : ""}</span>`;
+    if (e.cooling_temp === e.target_temp) return `Keep it at <b>${e.target_temp}°</b> <span class="sx-dim">· heat below, cool above</span>`;
+    return `Heat to <b>${e.target_temp}°</b>, cool to <b>${e.cooling_temp}°</b>`;
+  }
+
+  // The number the block holds in the season the house is in.
+  _blockTemp(e) {
+    if (this._isHeatCool()) return this._fmtBand(this._seasonBand(e));
+    return this._fmtTemp(this._seasonTemp(e));
+  }
+
+  _planIssues(plan) {
+    const out = [];
+    const label = this._planLabel(plan);
+    const seen = new Set();
+    DAYS_ORDERED.forEach(day => {
+      const list = this._planDayList(plan, day);
+      const sig = this._planSig(plan, day);
+      if (seen.has(sig)) return;
+      seen.add(sig);
+      const days = DAYS_ORDERED.filter(d => this._planSig(plan, d) === sig);
+      const when = days.length === 7 ? "" : ` on ${this._groupLabel(days)}`;
+      if (!list.length) { out.push({ plan, text: `<b>${label} has nothing scheduled${when}.</b> GTTC keeps the last goal then.` }); return; }
+      this._gapsOf(list).forEach(([a, b]) => out.push({ plan,
+        text: `<b>${label} has nothing scheduled ${this._clock(a)}–${this._clock(b)}${when}.</b> GTTC keeps the last goal${this._isCooling() || this._isHeatCool() ? " (or the cool default)" : ""} until the next block.` }));
+      if (list.some(e => !e.zone_id)) out.push({ plan,
+        text: `<b>${label} has blocks that don't say which room counts${when}.</b> They keep measuring whichever room the last block picked.` });
+    });
+    return out;
+  }
+
   _renderScheduleTab() {
     const s = this._schedule;
-    const label = s.active_preset ? (s.preset_labels?.[s.active_preset] || s.active_preset) : "Base fallback";
+    const d = this._diagData || {};
+    const plan = this._viewPlan();
+    const running = s.active_preset || "";
+    const isRunning = plan === running;
+    const mode = this._planMode(plan);
+    const tgt = this._planTarget(plan);
+    const list = this._planDayList(plan, tgt.rep);
+    const blocks = this._blocksOf(list);
+    const cur = d.current_entry || this._status?.current_entry;
+    const live = b => isRunning && tgt.days.includes(this._todayKey()) && cur
+      && b.parts.some(p => p.time_start === cur.time_start && p.time_end === cur.time_end);
+    const differ = tgt.days.some(x => this._planSig(plan, x) !== this._planSig(plan, tgt.rep));
+    const canEach = !!plan || s.mode === "per_day";
+    const custom = plan && s.presets?.[plan] && !s.presets[plan].is_builtin;
+
+    const cards = this._planKeys().map(k => {
+      const kb = this._blocksOf(this._planDayList(k, this._todayKey()));
+      const n = this._planIssues(k).length;
+      const zones = [...new Set(kb.map(b => b.e.zone_id ? this._getZoneName(b.e.zone_id) : "no room set"))];
+      const sum = kb.length > 3 ? `${kb.length} blocks` : kb.map(b => `${this._blockTemp(b.e)} ${b.name.toLowerCase()}`).join(" · ");
+      return `
+        <button class="sx-plan ${k === plan ? "sx-plan-on" : ""}" data-plan="${k}" aria-pressed="${k === plan}">
+          <span class="sx-plan-top"><b>${this._planLabel(k)}</b>${k === running
+            ? `<span class="sx-run">Running</span>`
+            : n ? `<span class="sx-check">${n} to check</span>` : ""}</span>
+          <span class="sx-mini">${this._miniBar(kb)}</span>
+          <span class="sx-plan-sum">${sum || "Nothing scheduled"}${zones.length ? ` · ${zones.join(", ")}` : ""}</span>
+        </button>`;
+    }).join("");
+
+    const now = new Date();
+    const nowM = now.getHours() * 60 + now.getMinutes();
+    const showNow = tgt.days.includes(this._todayKey());
+    const ax = m => ((m - 360 + 1440) % 1440) / 1440 * 100;
+    const segs = blocks.map(b => {
+      const t = this._seasonTemp(b.e);
+      const pieces = ax(b.a) + b.len / 14.4 > 100.01
+        ? [[ax(b.a), 100 - ax(b.a)], [0, b.len / 14.4 - (100 - ax(b.a))]] : [[ax(b.a), b.len / 14.4]];
+      return pieces.map(([l, w], i) => `
+        <button class="sx-seg ${live(b) ? "sx-seg-live" : ""}" data-block="${blocks.indexOf(b)}"
+             style="left:${l}%;width:${w}%;background:${t != null ? tempColor(t, s.temp_min, s.temp_max) : "var(--divider)"}"
+             title="${b.name} · ${this._blockRange(b)}">
+          ${i === 0 && w > 7 ? `<span class="sx-seg-n">${b.name}</span><span class="sx-seg-t">${this._blockTemp(b.e)}</span>` : ""}
+        </button>`).join("");
+    }).join("");
+    const gapsHere = this._gapsOf(list);
+
+    const heldLine = isRunning && cur && d.hvac_action_reason !== undefined ? (() => {
+      const lb = blocks.find(live);
+      const next = lb ? blocks[(blocks.indexOf(lb) + 1) % blocks.length] : null;
+      const zone = d.active_zone_name ? ` on the ${d.active_zone_name}` : "";
+      return lb ? `Holding <b>${this._blockTemp(lb.e)}</b>${zone} until <b>${this._clock(lb.a + lb.len)}</b>${next && next !== lb ? `, then ${this._blockTemp(next.e)}` : ""}.` : "";
+    })() : "";
+
+    const rows = blocks.map((b, i) => {
+      const zn = b.e.zone_id ? this._getZoneName(b.e.zone_id) : null;
+      const zt = b.e.zone_id ? this._zoneNow(b.e.zone_id) : null;
+      return `
+        <div class="sx-row ${live(b) ? "sx-row-live" : ""}">
+          <div><div class="sx-row-n">${b.name}${live(b) ? ` <span class="sx-now">Now</span>` : ""}</div>
+            <div class="sx-dim">${this._blockRange(b)}</div></div>
+          <div class="sx-row-ask">${this._asksFor(b.e)}</div>
+          <div>${zn ? `<div class="sx-row-z">${zn}</div><div class="sx-dim">${zt != null ? zt.toFixed(1) + "° now" : "no reading"}</div>`
+            : `<div class="sx-row-z sx-warn-t">No room set</div><div class="sx-dim">whichever ran last</div>`}</div>
+          <button class="btn btn-cancel sx-edit" data-block="${i}">Edit</button>
+        </div>`;
+    }).join("");
+
+    const tabs = [["all", "Same every day"], ["split", "Weekdays / Weekends"], ...(canEach ? [["each", "Each day"]] : [])]
+      .map(([k, l]) => `<button class="sx-segbtn" data-pmode="${k}" aria-pressed="${mode === k}">${l}</button>`).join("");
+    const sub = mode === "split"
+      ? [["weekdays", "Mon–Fri"], ["weekend", "Sat–Sun"]].map(([k, l]) =>
+          `<button class="sx-segbtn" data-ppart="${k}" aria-pressed="${tgt.part === k}">${l}</button>`).join("")
+      : mode === "each"
+        ? DAYS_ORDERED.map(x => `<button class="sx-segbtn" data-pday="${x}" aria-pressed="${tgt.rep === x}">${DAY_LABELS[x]}</button>`).join("")
+        : "";
+    const modeNote = differ
+      ? `These days aren't the same right now. Showing ${DAY_LABELS_FULL[tgt.rep]}; saving a block makes ${tgt.days.length === 7 ? "all seven" : "them all"} match it.`
+      : mode === "all" ? "All seven days are the same, so you edit them once."
+      : mode === "split" ? `Editing ${tgt.part === "weekend" ? "Saturday and Sunday" : "Monday to Friday"} together.`
+      : `Editing ${DAY_LABELS_FULL[tgt.rep]} on its own.`;
+
+    // Season table: what each block does in each season. The current season's
+    // row is the one in force.
+    const season = this._season();
+    const cols = blocks.slice(0, 4);
+    const gap = this._minGap();
+    const cell = (k, e) => {
+      if (k === "heating") return `heats to ${e.target_temp}°`;
+      if (k === "cooling") { const c = this._coolOf(e); return c == null ? "cools to the default" : `cools to ${c}°${e.cooling_temp == null ? " (default)" : ""}`; }
+      const band = this._seasonBand(e);
+      return band ? `holds ${this._fmtBand(band)}${band.moved != null ? "*" : ""}` : "—";
+    };
+    const anyMoved = cols.some(b => this._seasonBand(b.e)?.moved != null);
+    const table = cols.length ? `
+      <div class="sx-tbl" style="grid-template-columns: 92px repeat(${cols.length}, minmax(0, 1fr))">
+        <span class="sx-th">Season</span>${cols.map(b => `<span class="sx-th">${b.name}</span>`).join("")}
+        ${[["heating", "Heat"], ["cooling", "Cool"], ["heat_cool", "Heat·Cool"]].map(([k, l]) => `
+          <span class="sx-td sx-td-h ${season === k ? "sx-td-on" : ""}">${l}${season === k ? " · now" : ""}</span>
+          ${cols.map(b => `<span class="sx-td ${season === k ? "sx-td-on" : ""}">${cell(k, b.e)}</span>`).join("")}`).join("")}
+      </div>
+      ${anyMoved ? `<div class="sx-dim sx-foot">* The thermostat keeps heat and cool at least ${gap}° apart, so in Heat·Cool heating waits until ${gap}° under the cool number.</div>` : ""}
+      ${blocks.length > 4 ? `<div class="sx-dim sx-foot">The first four blocks from 6 AM are shown.</div>` : ""}` : `<div class="sx-dim">No blocks yet.</div>`;
+
+    const issues = this._planKeys().flatMap(k => this._planIssues(k));
+    const okLines = [];
+    if (blocks.length && !gapsHere.length) okLines.push(`${this._planLabel(plan)} covers all 24 hours${tgt.days.length < 7 ? ` on ${this._groupLabel(tgt.days)}` : ""} with no gaps.`);
+    if (d.learning) okLines.push(d.learning.enabled
+      ? "Learning is on: overriding the same block three times can change it for you."
+      : "Learning is off. The schedule only changes when you change it.");
+    const warnIco = `<svg viewBox="0 0 20 20" class="sx-ico sx-warn-c"><path d="M10 3 18 17H2z"/><path d="M10 8v4M10 14.5v.01"/></svg>`;
+    const okIco = `<svg viewBox="0 0 20 20" class="sx-ico sx-ok-c"><path d="m4 10.5 4 4 8-9"/></svg>`;
+
     return `
-      <div class="schedule-section">
-        <div class="schedule-section-header">
-          <div class="section-label"><ha-icon icon="mdi:calendar-clock"></ha-icon> ${label} schedule</div>
-          <div class="schedule-controls-row">
-            ${this._renderUndoRedo()}
-            ${this._renderScheduleMode()}
-            ${this._renderPresetSelector()}
-            ${this._renderToolbar()}
-          </div>
+      <div class="sx">
+        <div class="sx-head">
+          <h2>Plans</h2>
+          <span class="sx-dim">${running ? `${this._planLabel(running)} is running. A plan changes only when someone picks one.` : "No plan is picked, so the base schedule runs."} Pick a card to see or edit it.</span>
         </div>
-        <div class="schedule-section-body">
-          <div class="day-tabs">
-            ${DAYS_ORDERED.map(day => `
-              <button class="day-tab ${day === this._selectedDay ? "active" : ""}" data-day="${day}">
-                <span class="day-short">${DAY_LABELS[day]}</span>
-              </button>
-            `).join("")}
-          </div>
-          <div class="schedule-view">
-            ${this._renderWeekOverview()}
-            ${this._renderDayDetail()}
+        <div class="sx-plans">${cards}</div>
+        <div class="sx-tools">
+          <button class="btn btn-cancel btn-sm" id="createPresetBtn">+ New plan</button>
+          ${custom ? `<button class="btn btn-cancel btn-sm" id="renamePresetBtn">Rename</button>
+            <button class="btn btn-cancel btn-sm btn-danger" id="deletePresetBtn">Delete plan</button>` : ""}
+          <span class="sx-grow"></span>
+          <button class="btn btn-cancel btn-sm" id="exportBtn">Export</button>
+          <button class="btn btn-cancel btn-sm" id="importBtn">Import</button>
+        </div>
+
+        <div class="sx-main">
+          <section class="sx-card sx-detail">
+            <div class="sx-dhead">
+              <div>
+                <div class="sx-title">${this._planLabel(plan)}</div>
+                <div class="${isRunning ? "sx-ok-t" : "sx-dim"}">${isRunning
+                  ? "This plan is running now. Changes take effect straight away."
+                  : "Not running now. Changes save to this plan and take effect the next time it is picked."}</div>
+                ${heldLine ? `<div class="sx-held">${heldLine}</div>` : ""}
+              </div>
+              <div class="sx-dbtns">
+                ${isRunning ? "" : `<button class="btn btn-cancel" data-run-plan="${plan}">Run this plan</button>`}
+                <button class="btn btn-cancel" id="undoBtn" ${s.can_undo ? "" : "disabled"}>Undo</button>
+                <button class="btn btn-cancel" id="redoBtn" ${s.can_redo ? "" : "disabled"}>Redo</button>
+                <button class="btn btn-add" id="sxAddBtn">Add a block</button>
+              </div>
+            </div>
+            ${plan ? "" : this._renderScheduleMode()}
+            <div class="sx-days">
+              <span class="sx-lbl">Days</span>
+              <div class="sx-segs">${tabs}</div>
+              ${sub ? `<div class="sx-segs">${sub}</div>` : ""}
+            </div>
+            <div class="${differ ? "sx-warn-t" : "sx-dim"} sx-modenote">${modeNote}</div>
+            <div class="sx-shape">
+              ${segs}
+              ${showNow && blocks.length ? `<i class="sx-nowline" style="left:${ax(nowM)}%"><b>NOW</b></i>` : ""}
+            </div>
+            <div class="sx-axis"><span>6a</span><span>9a</span><span>12p</span><span>3p</span><span>6p</span><span>9p</span><span>12a</span><span>3a</span><span>6a</span></div>
+            ${gapsHere.map(([a, b]) => `<div class="sx-gap">${warnIco}<span><b>Nothing scheduled ${this._clock(a)}–${this._clock(b)}.</b> GTTC keeps the last goal then. Stretch a block over it, or add one.</span></div>`).join("")}
+            <div class="sx-rows">
+              ${blocks.length ? `<div class="sx-row sx-row-h"><span>Block</span><span>What it asks for</span><span>Measured at</span><span></span></div>${rows}`
+                : `<div class="sx-dim">Nothing scheduled. Add a block to start.</div>`}
+            </div>
+          </section>
+
+          <div class="sx-side">
+            <section class="sx-card">
+              <div class="sx-ctitle">What the thermostat will do</div>
+              <div class="sx-dim">${this._planLabel(plan)}${tgt.days.length < 7 ? `, ${this._groupLabel(tgt.days)}` : ""}, in each season.</div>
+              ${table}
+            </section>
+            <section class="sx-card">
+              <div class="sx-ctitle">Things to check</div>
+              ${issues.map(x => `<div class="sx-chk">${warnIco}<span>${x.text}${x.plan !== plan ? ` <button class="sx-link" data-plan="${x.plan}">Open plan</button>` : ""}</span></div>`).join("")}
+              ${okLines.map(t => `<div class="sx-chk">${okIco}<span>${t}</span></div>`).join("")}
+            </section>
           </div>
         </div>
       </div>
+      ${this._blk ? this._renderBlockDrawer() : ""}
     `;
+  }
+
+  _miniBar(blocks) {
+    const s = this._schedule;
+    const ax = m => ((m - 360 + 1440) % 1440) / 1440 * 100;
+    return blocks.map(b => {
+      const t = this._seasonTemp(b.e);
+      const col = t != null ? tempColor(t, s.temp_min, s.temp_max) : "var(--divider)";
+      const l = ax(b.a), w = b.len / 14.4;
+      return l + w > 100.01
+        ? `<i style="left:${l}%;width:${100 - l}%;background:${col}"></i><i style="left:0;width:${w - (100 - l)}%;background:${col}"></i>`
+        : `<i style="left:${l}%;width:${w}%;background:${col}"></i>`;
+    }).join("");
+  }
+
+  // ── Block editor ──────────────────────────────────────────────────────────
+
+  _openBlock(idx) {
+    const plan = this._viewPlan();
+    const tgt = this._planTarget(plan);
+    const list = this._planDayList(plan, tgt.rep);
+    const blocks = this._blocksOf(list);
+    const zones = this._schedule.zones || [];
+    const activeZone = this._diagData?.zones?.find(z => z.is_active)?.id || zones[0]?.id || "";
+    let parts = [], draft;
+    if (idx == null) {
+      // A new block fills the first gap if there is one, otherwise 6–10 PM.
+      const g = this._gapsOf(list)[0];
+      const a = g ? g[0] : 1080, b = g ? g[1] : 1320;
+      const ref = blocks[0]?.e;
+      draft = { start: this._hhmm(a), end: this._hhmm(b), temp: ref?.target_temp ?? 70, cool: ref?.cooling_temp ?? ref?.target_temp ?? 72,
+        split: false, zone: ref?.zone_id || activeZone, away: null, name: "New block" };
+    } else {
+      const b = blocks[idx];
+      if (!b) return;
+      parts = b.parts;
+      const split = b.e.cooling_temp != null && b.e.cooling_temp !== b.e.target_temp;
+      draft = { start: this._hhmm(b.a), end: this._hhmm(b.a + b.len), temp: b.e.target_temp,
+        cool: b.e.cooling_temp ?? b.e.target_temp, split, zone: b.e.zone_id || "", away: b.e.away_temp ?? null,
+        name: b.name, coolWasDefault: b.e.cooling_temp == null };
+    }
+    this._blk = { plan, days: tgt.days, rep: tgt.rep, parts, draft, isNew: idx == null,
+      pv: this._isHeatCool() ? "heat_cool" : this._isCooling() ? "cooling" : "heating", armDelete: false };
+    this._render();
+  }
+
+  _blkSpan() {
+    const d = this._blk.draft;
+    const a = timeToMinutes(d.start), e = timeToMinutes(d.end);
+    return { a, len: e > a ? e - a : e < a ? e + 1440 - a : 1440 };
+  }
+
+  _blkEntry() {
+    const d = this._blk.draft;
+    return { target_temp: d.temp, cooling_temp: d.split ? d.cool : d.temp, away_temp: d.away, zone_id: d.zone || null };
+  }
+
+  _renderBlockDrawer() {
+    const B = this._blk;
+    const d = B.draft;
+    const s = this._schedule;
+    const zones = s.zones || [];
+    const dz = this._diagData?.zones || [];
+    const { a, len } = this._blkSpan();
+    const hrs = len / 60;
+    const durTxt = len >= 1440 ? "All 24 hours." : `${Number.isInteger(hrs) ? hrs : hrs.toFixed(1)} hours${a + len > 1440 ? ", ending the next morning" : ""}.`;
+    const list = this._planDayList(B.plan, B.rep);
+    const after = this._paintDay(list, B.parts, { a, len, e: this._blkEntry() });
+    const others = this._blocksOf(list).filter(b => !b.parts.some(p => B.parts.includes(p)));
+    const trimmed = others.filter(b => {
+      for (let k = 0; k < b.len; k++) { const m = (b.a + k) % 1440; if (((m - a + 1440) % 1440) < len) return true; }
+      return false;
+    });
+    const newGaps = this._gapsOf(after);
+    const zoneName = d.zone ? this._getZoneName(d.zone) : "the room the last block picked";
+    const zt = d.zone ? this._zoneNow(d.zone) : null;
+    const cool = d.split ? d.cool : d.temp;
+    const low = Math.min(d.temp, Math.round((cool - this._minGap()) * 10) / 10);
+    const season = this._season();
+    let pvHead, pvMain, pvNote;
+    if (B.pv === "heating") {
+      pvHead = "In Heat"; pvMain = `Heats when the ${zoneName} drops below ${d.temp}°.`;
+      pvNote = zt != null ? `It is ${zt.toFixed(1)}° there now, so heat would ${zt < d.temp ? "run" : "stay off"}.` : "";
+    } else if (B.pv === "cooling") {
+      pvHead = "In Cool"; pvMain = `Cools when the ${zoneName} rises above ${cool}°.`;
+      pvNote = zt != null ? `It is ${zt.toFixed(1)}° there now, so it would ${zt > cool ? "cool" : "stay off"}.` : "";
+    } else {
+      pvHead = "In Heat · Cool"; pvMain = `Holds the ${zoneName} between ${low}° and ${cool}°.`;
+      pvNote = low < d.temp
+        ? `The thermostat needs heat and cool ${this._minGap()}° apart, so heating waits until ${low}°, not ${d.temp}°.${d.split ? "" : " Tick \u201cSeparate heat and cool numbers\u201d to set both ends yourself."}`
+        : `Both ends are at least ${this._minGap()}° apart, so nothing is moved.`;
+    }
+    if (B.pv === season) pvHead += ", the season it is in now";
+    const zt2 = id => { const z = dz.find(x => x.id === id); return z && z.current_temp != null ? z.current_temp.toFixed(1) + "°" : "—"; };
+    const where = B.days.length === 7 ? "every day" : this._groupLabel(B.days);
+    return `
+      <div class="sx-scrim" id="sxScrim"></div>
+      <aside class="sx-drawer" role="dialog" aria-label="Edit block">
+        <div class="sx-drh">
+          <div>
+            <div class="sx-ok-t">${this._planLabel(B.plan)}${B.plan === (s.active_preset || "") ? " · the plan running now" : ""}</div>
+            <div class="sx-title">${B.isNew ? "Add a block" : `Edit ${d.name}`}</div>
+          </div>
+          <button class="btn btn-cancel sx-x" id="sxClose" aria-label="Close">✕</button>
+        </div>
+        <div class="sx-drb">
+          <div class="sx-pair">
+            <label class="sx-f">Starts<input type="time" id="sxStart" value="${d.start}"></label>
+            <label class="sx-f">Ends<input type="time" id="sxEnd" value="${d.end}"></label>
+          </div>
+          <div class="sx-dim">${durTxt}${trimmed.length ? ` Overlaps ${trimmed.map(b => b.name).join(" and ")}, which ${trimmed.length > 1 ? "are" : "is"} trimmed to make room.` : ""}</div>
+          ${newGaps.length ? `<div class="sx-warn-t">Leaves nothing scheduled ${newGaps.map(([x, y]) => `${this._clock(x)}–${this._clock(y)}`).join(", ")}.</div>` : ""}
+
+          <div class="sx-lbl">Which room decides</div>
+          <div class="sx-zones">
+            ${zones.map(z => `
+              <button class="sx-zone" data-szone="${z.id}" aria-pressed="${d.zone === z.id}">
+                <span class="sx-zone-top"><b>${z.name}</b><span>${zt2(z.id)}</span></span>
+                <span class="sx-dim">${(z.sensor_entities || []).length} sensor${(z.sensor_entities || []).length === 1 ? "" : "s"}</span>
+              </button>`).join("")}
+          </div>
+
+          <div class="sx-temph">
+            <span class="sx-lbl">Temperature</span>
+            <label class="sx-chkbox"><input type="checkbox" id="sxSplit" ${d.split ? "checked" : ""}> Separate heat and cool numbers</label>
+          </div>
+          ${d.split ? `
+            <div class="sx-pair">
+              <div class="sx-pc sx-pc-heat"><span>Heat to</span><div class="sx-stepper">
+                <button class="sx-step" data-sstep="temp:-1" aria-label="Lower heat">−</button><b>${d.temp}°</b>
+                <button class="sx-step" data-sstep="temp:1" aria-label="Raise heat">+</button></div></div>
+              <div class="sx-pc sx-pc-cool"><span>Cool to</span><div class="sx-stepper">
+                <button class="sx-step" data-sstep="cool:-1" aria-label="Lower cool">−</button><b>${d.cool}°</b>
+                <button class="sx-step" data-sstep="cool:1" aria-label="Raise cool">+</button></div></div>
+            </div>` : `
+            <div class="sx-big">
+              <button class="sx-step sx-step-l" data-sstep="temp:-1" aria-label="Lower">−</button>
+              <b>${d.temp}°</b>
+              <button class="sx-step sx-step-l" data-sstep="temp:1" aria-label="Raise">+</button>
+              <span class="sx-dim">One number. GTTC heats up to it or cools down to it, whichever the season needs.</span>
+            </div>`}
+          ${d.coolWasDefault && !d.split ? `<div class="sx-dim">This block used the cool default until now; saving sets cool to ${d.temp}° too.</div>` : ""}
+
+          <div class="sx-pv">
+            <div class="sx-pvtabs">
+              ${[["heating", "Heat"], ["cooling", "Cool"], ["heat_cool", "Heat · Cool"]].map(([k, l]) =>
+                `<button class="sx-segbtn" data-spv="${k}" aria-pressed="${B.pv === k}">${l}${season === k ? " · now" : ""}</button>`).join("")}
+            </div>
+            <div class="sx-pvb">
+              <div class="sx-lbl">${pvHead}</div>
+              <div class="sx-pvmain">${pvMain}</div>
+              ${pvNote ? `<div class="sx-dim">${pvNote}</div>` : ""}
+            </div>
+          </div>
+          <div class="sx-dim">Saves to ${where} in ${this._planLabel(B.plan)}.</div>
+        </div>
+        <div class="sx-drf">
+          <button class="btn btn-add sx-big-btn" id="sxSave">Save to ${this._planLabel(B.plan)}</button>
+          <button class="btn btn-cancel sx-big-btn" id="sxCancel">Cancel</button>
+          <span class="sx-grow"></span>
+          ${B.isNew ? "" : `<button class="btn btn-cancel btn-danger sx-big-btn" id="sxDelete">${B.armDelete ? "Tap again to delete" : "Delete block"}</button>`}
+        </div>
+      </aside>`;
+  }
+
+  async _saveBlock(remove) {
+    const B = this._blk;
+    if (!B) return;
+    const list = this._planDayList(B.plan, B.rep);
+    const add = remove ? null : { ...this._blkSpan(), e: this._blkEntry() };
+    const entries = this._paintDay(list, B.parts, add);
+    const msg = { type: "gttc/set_day_entries", days: B.days, entries };
+    if (B.plan) msg.preset = B.plan;
+    try {
+      await this._hass.callWS(msg);
+      this._blk = null;
+      await this._loadData();
+      this._showToast(remove ? "Block deleted." : `Saved to ${this._planLabel(B.plan)}.`);
+    } catch (err) {
+      this._showToast(`Not saved: ${err.message || err}`, "error");
+    }
+  }
+
+  _attachScheduleTabListeners() {
+    const root = this.shadowRoot;
+    const rerender = () => this._render();
+    root.querySelectorAll("[data-plan]").forEach(b => b.addEventListener("click", () => {
+      this._planView = b.dataset.plan; this._planModeSel = null; this._planPart = null; this._planDay = null; rerender();
+    }));
+    root.querySelectorAll("[data-run-plan]").forEach(b => b.addEventListener("click", () => this._setPreset(b.dataset.runPlan)));
+    root.querySelectorAll("[data-pmode]").forEach(b => b.addEventListener("click", () => { this._planModeSel = b.dataset.pmode; rerender(); }));
+    root.querySelectorAll("[data-ppart]").forEach(b => b.addEventListener("click", () => { this._planPart = b.dataset.ppart; rerender(); }));
+    root.querySelectorAll("[data-pday]").forEach(b => b.addEventListener("click", () => { this._planDay = b.dataset.pday; rerender(); }));
+    root.querySelectorAll(".sx-edit, .sx-seg").forEach(b => b.addEventListener("click", () => this._openBlock(parseInt(b.dataset.block))));
+    this._addClick("sxAddBtn", () => this._openBlock(null));
+    if (!this._blk) return;
+    const d = this._blk.draft;
+    const close = () => { this._blk = null; rerender(); };
+    this._addClick("sxClose", close);
+    this._addClick("sxCancel", close);
+    this._addClick("sxScrim", close);
+    this._addClick("sxSave", () => this._saveBlock(false));
+    this._addClick("sxDelete", () => {
+      if (!this._blk.armDelete) {
+        this._blk.armDelete = true; rerender();
+        clearTimeout(this._armTimer);
+        this._armTimer = setTimeout(() => { if (this._blk) { this._blk.armDelete = false; this._render(); } }, 5000);
+        return;
+      }
+      this._saveBlock(true);
+    });
+    const time = (id, key) => {
+      const el = root.getElementById(id);
+      if (el) el.addEventListener("change", () => { if (/^\d\d:\d\d$/.test(el.value)) { d[key] = el.value; rerender(); } });
+    };
+    time("sxStart", "start");
+    time("sxEnd", "end");
+    root.querySelectorAll("[data-szone]").forEach(b => b.addEventListener("click", () => { d.zone = b.dataset.szone; rerender(); }));
+    root.querySelectorAll("[data-spv]").forEach(b => b.addEventListener("click", () => { this._blk.pv = b.dataset.spv; rerender(); }));
+    const split = root.getElementById("sxSplit");
+    if (split) split.addEventListener("change", () => {
+      d.split = split.checked;
+      if (d.split && d.cool <= d.temp) d.cool = d.temp + this._minGap();
+      rerender();
+    });
+    const s = this._schedule;
+    root.querySelectorAll("[data-sstep]").forEach(b => b.addEventListener("click", () => {
+      const [k, n] = b.dataset.sstep.split(":");
+      d[k] = Math.max(s.temp_min, Math.min(s.temp_max, d[k] + Number(n)));
+      if (!d.split) d.cool = d.temp;
+      rerender();
+    }));
   }
 
   _renderHistoryTab() {
@@ -4056,6 +4688,124 @@ class GttcPanel extends HTMLElement {
         padding: 8px 20px; border-radius: 8px; font-size: 14px; font-weight: 500; cursor: pointer;
       }
       .btn-primary:hover { filter: brightness(1.1); }
+
+      /* Schedule tab (v2.6) */
+      .sx { display: flex; flex-direction: column; gap: 16px; font-variant-numeric: tabular-nums; }
+      .sx-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+      .sx-head h2 { margin: 0; font-size: 18px; font-weight: 700; }
+      .sx-dim { font-size: 13px; color: var(--secondary-text); line-height: 1.45; }
+      .sx-ok-t { font-size: 13px; color: var(--success); font-weight: 600; }
+      .sx-warn-t { font-size: 13px; color: var(--warning-color, #c26a00); font-weight: 600; line-height: 1.45; }
+      .sx-lbl { font-size: 12px; font-weight: 700; color: var(--secondary-text); text-transform: uppercase; letter-spacing: .06em; }
+      .sx-grow { flex: 1; }
+      .sx-plans { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+      .sx-plan {
+        text-align: left; background: var(--card-bg); color: var(--primary-text); border: 1px solid var(--divider);
+        border-radius: 14px; padding: 13px 15px; display: flex; flex-direction: column; gap: 9px; cursor: pointer; font: inherit;
+      }
+      .sx-plan-on { border: 2px solid var(--primary-text); padding: 12px 14px; }
+      .sx-plan-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 15px; }
+      .sx-run { font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; background: var(--success); color: #fff; padding: 3px 8px; border-radius: 99px; }
+      .sx-check { font-size: 12px; font-weight: 700; color: var(--warning-color, #c26a00); }
+      .sx-mini { position: relative; display: block; height: 10px; border-radius: 5px; overflow: hidden; background: var(--bg); }
+      .sx-mini i { position: absolute; top: 0; bottom: 0; }
+      .sx-plan-sum { font-size: 13px; color: var(--secondary-text); }
+      .sx-tools { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+      .sx-main { display: flex; flex-wrap: wrap; gap: 18px; align-items: flex-start; }
+      .sx-card { background: var(--card-bg); border: 1px solid var(--divider); border-radius: 16px; padding: 18px; display: flex; flex-direction: column; gap: 12px; box-sizing: border-box; }
+      .sx-detail { flex: 999 1 600px; min-width: 0; gap: 16px; }
+      .sx-side { flex: 1 1 340px; min-width: 0; display: flex; flex-direction: column; gap: 18px; }
+      .sx-dhead { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
+      .sx-title { font-size: 21px; font-weight: 800; letter-spacing: -0.01em; }
+      .sx-ctitle { font-size: 16px; font-weight: 800; }
+      .sx-held { font-size: 15px; margin-top: 6px; }
+      .sx-dbtns { display: flex; gap: 8px; flex-wrap: wrap; }
+      .sx-dbtns .btn { min-height: 40px; }
+      .sx-days { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      .sx-segs { display: flex; flex-wrap: wrap; background: var(--bg); border: 1px solid var(--divider); border-radius: 10px; padding: 3px; gap: 2px; }
+      .sx-segbtn { min-height: 34px; padding: 0 13px; border-radius: 8px; border: 0; background: transparent; color: var(--secondary-text); font: inherit; font-size: 14px; font-weight: 600; cursor: pointer; }
+      .sx-segbtn[aria-pressed="true"] { background: var(--card-bg); color: var(--primary-text); font-weight: 700; box-shadow: 0 1px 2px rgba(0,0,0,.15); }
+      .sx-modenote { margin-top: -8px; }
+      .sx-shape { position: relative; height: 84px; border-radius: 12px; overflow: hidden; background: var(--bg); }
+      .sx-seg {
+        position: absolute; top: 0; bottom: 0; border: 0; border-right: 2px solid var(--card-bg); box-sizing: border-box;
+        display: flex; flex-direction: column; justify-content: center; align-items: flex-start; gap: 2px; padding: 0 14px;
+        color: #fff; font: inherit; cursor: pointer; overflow: hidden; text-shadow: 0 1px 2px rgba(0,0,0,.35);
+      }
+      .sx-seg-live { box-shadow: inset 0 -4px 0 rgba(255,255,255,.85); }
+      .sx-seg-n { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; white-space: nowrap; }
+      .sx-seg-t { font-size: 26px; font-weight: 800; white-space: nowrap; }
+      .sx-nowline { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--primary-text); pointer-events: none; }
+      .sx-nowline b { position: absolute; bottom: 5px; left: 6px; font-size: 10px; font-weight: 800; letter-spacing: .06em; color: var(--primary-text); background: var(--card-bg); padding: 1px 4px; border-radius: 4px; }
+      .sx-axis { display: grid; grid-template-columns: repeat(8, minmax(0, 1fr)) 0; font-size: 12px; color: var(--secondary-text); font-weight: 600; margin-top: -8px; }
+      .sx-axis span:last-child { display: none; }
+      .sx-gap, .sx-chk { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; line-height: 1.45; }
+      .sx-gap { background: rgba(255,152,0,.10); border-radius: 10px; padding: 10px 12px; }
+      .sx-chk { padding: 10px 0; border-top: 1px solid var(--divider); }
+      .sx-ico { flex: none; width: 18px; height: 18px; margin-top: 1px; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+      .sx-warn-c { stroke: var(--warning-color, #c26a00); }
+      .sx-ok-c { stroke: var(--success); }
+      .sx-link { background: none; border: 0; padding: 0; font: inherit; color: var(--primary); cursor: pointer; text-decoration: underline; }
+      .sx-rows { display: flex; flex-direction: column; gap: 8px; }
+      .sx-row { display: grid; grid-template-columns: 150px minmax(0, 1fr) 140px 80px; gap: 14px; align-items: center; padding: 13px 14px; border: 1px solid var(--divider); border-radius: 12px; }
+      .sx-row-h { border: 0; padding: 0 14px; font-size: 12px; font-weight: 700; color: var(--secondary-text); text-transform: uppercase; letter-spacing: .06em; }
+      .sx-row-live { border: 2px solid var(--primary); padding: 12px 13px; }
+      .sx-row-n { font-weight: 800; font-size: 15px; }
+      .sx-row-ask { font-size: 15px; }
+      .sx-row-ask b { font-size: 19px; }
+      .sx-row-z { font-weight: 700; }
+      .sx-now { font-size: 10px; font-weight: 800; color: #fff; background: var(--primary); padding: 2px 6px; border-radius: 99px; vertical-align: 2px; letter-spacing: .06em; text-transform: uppercase; }
+      .sx-edit { min-height: 40px; }
+      .sx-tbl { display: grid; border: 1px solid var(--divider); border-radius: 10px; overflow: hidden; font-size: 13px; }
+      .sx-th { padding: 8px 10px; background: var(--bg); font-weight: 700; color: var(--secondary-text); font-size: 12px; }
+      .sx-td { padding: 10px; border-top: 1px solid var(--divider); }
+      .sx-td-h { font-weight: 700; color: var(--secondary-text); }
+      .sx-td-on { background: rgba(3,169,244,.10); font-weight: 700; color: var(--primary-text); }
+      .sx-foot { margin-top: -4px; }
+      @media (max-width: 720px) {
+        .sx-row { grid-template-columns: minmax(0, 1fr) auto; }
+        .sx-row-h { display: none; }
+        .sx-row > :nth-child(2), .sx-row > :nth-child(3) { grid-column: 1; }
+        .sx-row > .sx-edit { grid-row: 1; grid-column: 2; }
+      }
+      /* Block editor drawer */
+      .sx-scrim { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 1000; }
+      .sx-drawer {
+        position: fixed; top: 0; right: 0; bottom: 0; width: min(540px, 100vw); z-index: 1001;
+        background: var(--card-bg); color: var(--primary-text); box-shadow: -12px 0 40px rgba(0,0,0,.3);
+        display: flex; flex-direction: column;
+      }
+      .sx-drh { padding: 20px 24px 14px; border-bottom: 1px solid var(--divider); display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+      .sx-x { width: 40px; height: 40px; padding: 0; }
+      .sx-drb { flex: 1; overflow-y: auto; padding: 18px 24px; display: flex; flex-direction: column; gap: 14px; }
+      .sx-drf { padding: 14px 24px; border-top: 1px solid var(--divider); display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+      .sx-big-btn { min-height: 44px; padding: 0 20px; font-size: 15px; font-weight: 600; }
+      .sx-pair { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+      .sx-f { display: flex; flex-direction: column; gap: 6px; font-size: 13px; font-weight: 700; color: var(--secondary-text); min-width: 0; }
+      .sx-f input { box-sizing: border-box; width: 100%; height: 44px; border: 1px solid var(--divider); border-radius: 10px; padding: 0 12px; font: inherit; font-size: 16px; background: var(--card-bg); color: var(--primary-text); }
+      .sx-zones { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: -6px; }
+      .sx-zone { text-align: left; display: flex; flex-direction: column; gap: 3px; padding: 11px 13px; border-radius: 12px; border: 1px solid var(--divider); background: var(--card-bg); color: var(--primary-text); font: inherit; cursor: pointer; }
+      .sx-zone[aria-pressed="true"] { border: 2px solid var(--primary-text); padding: 10px 12px; background: var(--bg); }
+      .sx-zone-top { display: flex; justify-content: space-between; gap: 8px; font-size: 15px; }
+      .sx-temph { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; }
+      .sx-chkbox { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--secondary-text); cursor: pointer; }
+      .sx-chkbox input { width: 18px; height: 18px; }
+      .sx-big { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+      .sx-big b { font-size: 52px; font-weight: 800; letter-spacing: -0.03em; min-width: 100px; text-align: center; }
+      .sx-big .sx-dim { flex: 1 1 160px; }
+      .sx-step { width: 40px; height: 40px; border-radius: 10px; border: 1px solid var(--divider); background: var(--card-bg); color: var(--primary-text); font: inherit; font-size: 22px; font-weight: 600; cursor: pointer; }
+      .sx-step-l { width: 52px; height: 52px; border-radius: 14px; font-size: 26px; }
+      .sx-pc { border-radius: 12px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; border: 1px solid var(--divider); }
+      .sx-pc > span { font-size: 13px; font-weight: 700; }
+      .sx-pc-heat > span { color: #d9622b; }
+      .sx-pc-cool > span { color: #2f6fd6; }
+      .sx-stepper { display: flex; align-items: center; gap: 10px; }
+      .sx-stepper b { font-size: 30px; font-weight: 800; min-width: 64px; text-align: center; }
+      .sx-pv { border: 1px solid var(--divider); border-radius: 12px; overflow: hidden; }
+      .sx-pvtabs { display: flex; gap: 4px; padding: 5px; background: var(--bg); }
+      .sx-pvtabs .sx-segbtn { flex: 1; }
+      .sx-pvb { padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; }
+      .sx-pvmain { font-size: 17px; font-weight: 700; line-height: 1.35; }
 
       /* Toast */
       .toast {
