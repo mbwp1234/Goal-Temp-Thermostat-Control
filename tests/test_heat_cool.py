@@ -454,16 +454,16 @@ def test_a_band_hold_round_trips():
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_cool_air_outside_runs_the_fan_before_the_compressor():
-    """9/29 20:30: upstairs 74°, outside 67° — Cool mode was fan-only."""
+async def test_cool_air_outside_no_longer_delays_the_compressor():
+    """10/20 21:59: upstairs 72.7°, 1st floor 74.1°, outside 56° — fan pre-cool
+    held the AC off for ten minutes while the fan stirred indoor air."""
     coord = _coord(ScheduleEntry(time_start="20:00", time_end="23:59", target_temp=69.0, cooling_temp=70.0),
                    indoor=74.0, outdoor=67.0)
     await coord._update_heat_cool(None)
     written = _calls(coord, "set_temperature")[-1]
-    assert written["target_temp_high"] > 70.0          # compressor held off
-    assert coord.target_high == 70.0                   # the band still means 70
-    assert coord._last_action_reason == "fan_precool"
-    assert {"entity_id": "climate.test", "fan_mode": "Low"} in _calls(coord, "set_fan_mode")
+    assert written["target_temp_high"] == 70.0         # the cool end is the goal
+    assert coord._last_action_reason != "fan_precool"
+    assert _calls(coord, "set_fan_mode") == []         # the fan is left alone
 
 
 @pytest.mark.asyncio

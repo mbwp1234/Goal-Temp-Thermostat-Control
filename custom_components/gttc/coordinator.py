@@ -65,6 +65,7 @@ from .const import (
     DEFAULT_TEMP_MIN,
     DOMAIN,
     FAN_PRECOOL_CHECK_WINDOW,
+    FAN_PRECOOL_ENABLED,
     FAN_PRECOOL_COMFORT_MARGIN,
     FAN_PRECOOL_MARGIN,
     FAN_PRECOOL_MAX_OUTDOOR,
@@ -86,6 +87,7 @@ from .const import (
     RUNTIME_HISTORY_MAX_DAYS,
     SEASON_COOLING,
     SEASON_DEMAND_MARGIN,
+    HEAT_COOL_ENTRY_HOURS,
     SEASON_HEAT_COOL,
     SEASON_HEATING,
     SEASONS,
@@ -728,6 +730,18 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     pass
             if "auto_season_switch" in data:
                 self.auto_season_switch = bool(data["auto_season_switch"])
+            # Switch flags: config entry data is only the install-time default;
+            # without these a restart turned learning back on
+            for key in ("learning_enabled", "occupancy_enabled", "tou_enabled", "precondition_enabled"):
+                if key in data:
+                    setattr(self, key, bool(data[key]))
+            for key in ("_cooling_conditions_since", "_heating_conditions_since"):
+                raw = data.get(key.lstrip("_"))
+                if raw:
+                    try:
+                        setattr(self, key, datetime.fromisoformat(raw))
+                    except (ValueError, TypeError):
+                        pass
             if "heat_cool_ladder" in data:
                 self.heat_cool_ladder = bool(data["heat_cool_ladder"])
             for key in ("cool_lockout_temp", "heat_cool_settle_days", "heat_cool_min_gap"):
@@ -793,6 +807,18 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 "cooling_away_temp": self.cooling_away_temp,
                 "seasonal_recommend_hours": self.seasonal_recommend_hours,
                 "auto_season_switch": self.auto_season_switch,
+                "learning_enabled": self.learning_enabled,
+                "occupancy_enabled": self.occupancy_enabled,
+                "tou_enabled": self.tou_enabled,
+                "precondition_enabled": self.precondition_enabled,
+                "cooling_conditions_since": (
+                    self._cooling_conditions_since.isoformat()
+                    if self._cooling_conditions_since else None
+                ),
+                "heating_conditions_since": (
+                    self._heating_conditions_since.isoformat()
+                    if self._heating_conditions_since else None
+                ),
                 "heat_cool_ladder": self.heat_cool_ladder,
                 "cool_lockout_temp": self.cool_lockout_temp,
                 "cool_lockout_rev": COOL_LOCKOUT_REV,
@@ -2434,6 +2460,8 @@ class GTTCCoordinator(DataUpdateCoordinator):
         """How long the current season's switch condition must hold."""
         if self.season == SEASON_HEAT_COOL:
             return round(self.heat_cool_settle_days * 24, 1)
+        if self.season == SEASON_HEATING:
+            return self._heat_exit_hours
         return self.seasonal_recommend_hours
 
     @property
@@ -2462,7 +2490,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
             return (now - since).total_seconds() / 3600 >= self.season_threshold_hours
         if self.season == SEASON_HEATING and self._cooling_conditions_since is not None:
             elapsed = (now - self._cooling_conditions_since).total_seconds() / 3600
-            return elapsed >= self.seasonal_recommend_hours
+            return elapsed >= self.season_threshold_hours
         if self.season == SEASON_COOLING and self._heating_conditions_since is not None:
             elapsed = (now - self._heating_conditions_since).total_seconds() / 3600
             return elapsed >= self.seasonal_recommend_hours
@@ -2485,6 +2513,14 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 (now - self._heating_conditions_since).total_seconds() / 3600, 1
             )
         return 0.0
+
+    @property
+    def _heat_exit_hours(self) -> float:
+        """Heat → Heat/Cool loses nothing (heat/cool still heats), so it only
+        has to outlast a blip; straight to Cool keeps the full threshold."""
+        if self.heat_cool_ladder:
+            return min(self.seasonal_recommend_hours, HEAT_COOL_ENTRY_HOURS)
+        return self.seasonal_recommend_hours
 
     def _season_goal(self, season: str) -> float:
         """The temperature the given season would aim for right now."""
@@ -2970,6 +3006,14 @@ class GTTCCoordinator(DataUpdateCoordinator):
            - Dropped ≥ FAN_PRECOOL_MIN_DROP → reset window, keep going.
            - Dropped < FAN_PRECOOL_MIN_DROP → disengage: restore fan, pass through.
         """
+        # Retired in 2.6.1: the T6 has no damper, so "fan-only" moves the
+        # house's own air, never the outside air the rule was named for. It
+        # only ever held the AC off while a warm floor stayed warm.
+        if not FAN_PRECOOL_ENABLED:
+            await self._fan_release()
+            self._reset_fan_precool_state()
+            return desired_temp
+
         now = datetime.now(timezone.utc)
 
         # ── Precondition checks ──────────────────────────────────────────────

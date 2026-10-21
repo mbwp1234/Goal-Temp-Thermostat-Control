@@ -160,6 +160,8 @@ SEASONAL_SWITCH_MARGIN = 3.0
 # goal - margin (AC idle) → heating. Heat and cool goals sit 0.7–3° apart, so
 # without it an AC overshoot or an afternoon's drift counts as a new season.
 SEASON_DEMAND_MARGIN = 1.0
+# Heat → Heat/Cool after this long above the cool goal (heat/cool still heats)
+HEAT_COOL_ENTRY_HOURS = 0.5
 
 # How many hours of sustained opposite-season conditions before the
 # SeasonSwitchRecommended binary sensor fires.  12 hours = "it's been warm
@@ -217,6 +219,9 @@ RAMP_DEFAULT_MINUTES = 30      # fallback when no history exists
 
 # Fan pre-cooling: run fan-only to pull in cool outdoor air before AC engages
 # Engage fan-only mode when outdoor temp is at least this many °F below indoor
+# Off: the fan stirs indoor air only (no outside-air damper), so it cannot
+# pre-cool anything — it just delayed the AC.
+FAN_PRECOOL_ENABLED = False
 FAN_PRECOOL_MARGIN = 3.0
 # Only attempt fan pre-cooling when outdoor temp is below this threshold (°F)
 FAN_PRECOOL_MAX_OUTDOOR = 75.0
