@@ -31,12 +31,33 @@ const DAY_LABELS_FULL = {
 const HOURS = Array.from({ length: 25 }, (_, i) => i);
 
 // ── Temp-to-color mapping ───────────────────────────────────────────────────
-function tempColor(temp, min = 50, max = 90) {
-  const ratio = Math.max(0, Math.min(1, (temp - min) / (max - min)));
-  if (ratio < 0.25) return `hsl(${200 + ratio * 4 * 20}, 70%, 50%)`;
-  if (ratio < 0.5)  return `hsl(${160 - (ratio - 0.25) * 4 * 40}, 65%, 45%)`;
-  if (ratio < 0.75) return `hsl(${40 - (ratio - 0.5) * 4 * 10}, 80%, 50%)`;
-  return `hsl(${10 - (ratio - 0.75) * 4 * 10}, 85%, 48%)`;
+// Schedule blocks are shaded by what they ask for, on a fixed comfort scale:
+// cold setpoints read blue, the high 60s cream, the 70s amber to orange. The
+// old min..max hue wheel spent its whole range on 50-90°F, so 68° and 70°
+// came out the same green.
+const TEMP_STOPS = [
+  [58, [47, 111, 219]], [62, [120, 166, 232]], [65, [196, 218, 244]], [67, [232, 236, 240]],
+  [68, [251, 232, 204]], [69, [247, 215, 169]], [70, [242, 182, 120]], [72, [236, 147, 70]],
+  [75, [222, 104, 40]], [80, [190, 60, 20]],
+];
+function _toF(temp, max) { return max != null && max < 45 ? temp * 9 / 5 + 32 : temp; }
+function tempColor(temp, min, max) {
+  const f = _toF(temp, max);
+  if (f <= TEMP_STOPS[0][0]) return `rgb(${TEMP_STOPS[0][1].join(",")})`;
+  for (let i = 1; i < TEMP_STOPS.length; i++) {
+    const [t1, c1] = TEMP_STOPS[i];
+    if (f <= t1) {
+      const [t0, c0] = TEMP_STOPS[i - 1];
+      const k = (f - t0) / (t1 - t0);
+      return `rgb(${c0.map((v, j) => Math.round(v + (c1[j] - v) * k)).join(",")})`;
+    }
+  }
+  return `rgb(${TEMP_STOPS[TEMP_STOPS.length - 1][1].join(",")})`;
+}
+// Ink that reads on tempColor(temp): dark on the pale middle, white at the ends
+function tempInk(temp, min, max) {
+  const f = _toF(temp, max);
+  return f < 63 || f > 72.5 ? "#ffffff" : "#2a1606";
 }
 
 function timeToMinutes(timeStr) {
@@ -118,6 +139,7 @@ class GttcPanel extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    this.toggleAttribute("dark", !!hass?.themes?.darkMode);
     if (!this._schedule) {
       if (!this._loading) this._loadData();
       return;
@@ -279,8 +301,8 @@ class GttcPanel extends HTMLElement {
       <div class="panel">
         <header class="header">
           <div class="header-left">
-            <ha-icon icon="mdi:calendar-clock" class="header-icon"></ha-icon>
-            <h1>GTTC</h1>
+            <div class="hd-eyebrow">${this._headerEyebrow()}</div>
+            <h1>Climate</h1>
           </div>
           <div class="header-right">
             ${this._renderStatus()}
@@ -288,7 +310,6 @@ class GttcPanel extends HTMLElement {
         </header>
 
         ${this._renderMainTabBar()}
-        ${this._renderSeasonStrip()}
 
         <div class="content">
           ${tab === "now" ? this._renderNowTab()
@@ -308,6 +329,14 @@ class GttcPanel extends HTMLElement {
       </div>
     `;
     this._attachListeners();
+  }
+
+  _headerEyebrow() {
+    const s = this._schedule;
+    const plan = s.active_preset ? (s.preset_labels?.[s.active_preset] || s.active_preset) : "Base schedule";
+    const LABEL = { heating: "Heat", cooling: "Cool", heat_cool: "Heat · Cool" };
+    const season = this._diagData ? LABEL[this._season()] : null;
+    return season ? `${plan} · ${season}` : plan;
   }
 
   // ── Status bar ────────────────────────────────────────────────────────────
@@ -534,7 +563,8 @@ class GttcPanel extends HTMLElement {
       const color = band
         ? `linear-gradient(90deg, ${tempColor(band.low, s.temp_min, s.temp_max)}, ${tempColor(band.high, s.temp_min, s.temp_max)})`
         : temp != null ? tempColor(temp, s.temp_min, s.temp_max) : "var(--divider)";
-      const textColor = "rgba(255,255,255,0.95)";
+      const textColor = band ? tempInk((band.low + band.high) / 2, s.temp_min, s.temp_max)
+        : temp != null ? tempInk(temp, s.temp_min, s.temp_max) : "var(--primary-text)";
       const zoneLabel = entry.zone_id ? ` [${this._getZoneName(entry.zone_id)}]` : "";
       const extraBadges = [
         clamp ? `<span class="block-badge clamp-badge" title="${clamp.text}">⚠</span>` : "",
@@ -2511,6 +2541,7 @@ class GttcPanel extends HTMLElement {
     const cur = sections.find(x => x.id === this._settingsSection) || sections[0];
     const n = Object.keys(this._draft).length;
     return `
+      ${this._diagData ? `<div class="set-top">${this._renderSeasonStrip()}${this._renderAutomations(this._diagData)}</div>` : ""}
       <div class="settings-layout">
         <nav class="set-nav">
           ${sections.map(x => {
@@ -2763,8 +2794,9 @@ class GttcPanel extends HTMLElement {
     return `
       <div class="now-grid">
         ${this._renderNowHero(d)}
-        ${this._renderNowActions(d)}
+        ${this._renderNowRooms(d)}
         ${this._renderTodayStrip()}
+        ${this._renderNowActions(d)}
       </div>
     `;
   }
@@ -2775,7 +2807,7 @@ class GttcPanel extends HTMLElement {
       // The lockout has its own note under the hero; the why names the block
       case "cool_lockout":
       case "schedule":
-        return e ? `Schedule · ${this._fmt12(e.time_start)}–${this._fmt12(e.time_end)} block` : "Schedule";
+        return e ? `On schedule until ${this._fmt12(e.time_end)}.` : "On schedule.";
       case "precondition": return "Pre-conditioning for the next block";
       case "occupancy_away": return "Nobody home — away setback";
       case "tou_adjustment": return "Peak-rate adjustment";
@@ -2844,44 +2876,65 @@ class GttcPanel extends HTMLElement {
 
   _renderNowHero(d) {
     const action = d.hvac_action;
-    const actionLabel = action ? action.charAt(0).toUpperCase() + action.slice(1) : "—";
-    const banners = this._renderNowBanners(d);
-    const zones = d.zones || [];
-    const outdoor = d.features?.outdoor_temp;
+    const banners = this._renderNowBanners(d) + this._renderSeasonSuggest(d);
+    const band = this._isHeatCool() && d.heat_cool?.low != null;
+    const goal = band ? `${d.heat_cool.low}–${d.heat_cool.high}°`
+      : d.target_temp != null ? `${+d.target_temp.toFixed(1)}°` : null;
+    const verb = action === "heating" ? "Heating to" : action === "cooling" ? "Cooling to"
+      : action === "fan" ? "Fan only · holding" : action === "off" ? "Off · goal" : "Holding";
+    const icon = action === "heating" ? "mdi:fire" : action === "cooling" ? "mdi:snowflake"
+      : action === "fan" ? "mdi:fan" : "mdi:thermostat";
+    const where = d.active_zone_name ? ` · ${d.active_zone_name}` : "";
     return `
-      <section class="now-card now-hero">
-        <div class="eyebrow">${d.active_zone_name || "Active zone"} · active zone</div>
-        <div class="hero-row">
-          <div class="hero-temp">${d.current_temp != null ? d.current_temp.toFixed(1) : "—"}<small>°</small></div>
-          <div class="hero-goal">
-            <span class="hero-goal-num">→ ${this._isHeatCool() && d.heat_cool?.low != null
-              ? `${d.heat_cool.low}–${d.heat_cool.high}°`
-              : d.target_temp != null ? d.target_temp.toFixed(1) + "°" : "—"}</span>
-            ${banners ? "" : `<span class="hero-why">${this._goalWhy(d)}</span>`}
-            <span class="hero-action ${action === "heating" ? "is-heat" : action === "cooling" ? "is-cool" : ""}">${actionLabel}</span>
-          </div>
+      <section class="now-hero">
+        <div class="hero-temp" aria-label="${d.active_zone_name || "Active zone"} temperature">${d.current_temp != null
+          ? d.current_temp.toFixed(1) : "—"}<small>°</small></div>
+        <div class="hero-line ${action === "heating" ? "is-heat" : action === "cooling" ? "is-cool" : ""}">
+          <ha-icon icon="${icon}"></ha-icon>
+          <span>${goal != null ? `${verb} ${goal}` : "No goal yet"}${where}</span>
         </div>
+        ${banners ? "" : `<p class="hero-why">${this._goalWhy(d)}</p>`}
         ${banners}
         ${this._heatCoolNotes(d)}
-        <div class="rooms">
-          ${zones.map(z => `
-            <button class="room ${z.is_active ? "room-active" : ""}" data-now-zone="${z.id}" ${z.is_active ? "disabled" : ""}
-                    title="${z.is_active ? "Active zone" : "Make this the active zone"}">
-              <span class="room-name">${z.name}</span>
-              <span class="room-temp">${z.current_temp != null ? z.current_temp.toFixed(1) + "°" : "—"}</span>
-            </button>`).join("")}
-          <div class="room room-outside">
-            <span class="room-name">Outside</span>
-            <span class="room-temp">${outdoor != null ? outdoor.toFixed(1) + "°" : "—"}</span>
-          </div>
+      </section>
+    `;
+  }
+
+  // A season change the house is asking for is the one setting worth
+  // interrupting Now for; everything else about seasons lives in Settings.
+  _renderSeasonSuggest(d) {
+    if (!d.suggest_season_switch) return "";
+    const LABEL = { heating: "Heat", cooling: "Cool", heat_cool: "Heat · Cool" };
+    const other = d.recommended_season || (this._isCooling() ? "heating" : "cooling");
+    return `
+      <div class="now-banner banner-season">
+        <ha-icon icon="mdi:sun-snowflake-variant"></ha-icon>
+        <span><b>${LABEL[other] || other} weather</b> · switch recommended</span>
+        <button class="btn btn-sm" data-season-switch="${other}">Switch to ${LABEL[other] || other}</button>
+      </div>`;
+  }
+
+  _renderNowRooms(d) {
+    const zones = d.zones || [];
+    const outdoor = d.features?.outdoor_temp;
+    const t = v => v != null ? `${v.toFixed(1)}°` : `<span class="dim">no reading</span>`;
+    return `
+      <section class="now-card now-rooms" aria-label="Rooms">
+        ${zones.map(z => `
+          <button class="room-row" data-now-zone="${z.id}" ${z.is_active ? "disabled" : ""}
+                  title="${z.is_active ? "The schedule follows this room" : "Follow this room instead"}">
+            <span class="room-name">${z.name}${z.is_active ? ` <i>· leading</i>` : ""}</span>
+            <span class="room-temp">${t(z.current_temp)}</span>
+          </button>`).join("")}
+        <div class="room-row room-outside">
+          <span class="room-name">Outside</span>
+          <span class="room-temp">${t(outdoor)}</span>
         </div>
       </section>
     `;
   }
 
   _renderNowActions(d) {
-    const f = d.features || {};
-    const w = d.windows || {};
     const boosts = this._isHeatCool()
       ? [
           { id: "warm_up", big: "+3°", sub: "Warmer band · 60 min", cls: "tile-heat" },
@@ -2896,6 +2949,27 @@ class GttcPanel extends HTMLElement {
           { id: "boost", big: "+4°", sub: "Boost · 90 min", cls: "tile-heat" },
           { id: "warm_up", big: "+3°", sub: "Warm up · 60 min", cls: "tile-heat" },
         ];
+    return `
+      <section class="now-card now-actions" aria-label="Quick actions">
+        <div class="action-tiles">
+          ${boosts.map(b => `
+            <button class="action-tile ${b.cls} boost-btn" data-boost-type="${b.id}">
+              <b>${b.big}</b><span>${b.sub}</span>
+            </button>`).join("")}
+          ${d.vacation_mode ? "" : `
+            <button class="action-tile" id="setVacationBtn">
+              <b><ha-icon icon="mdi:airplane"></ha-icon></b><span>Away for a while</span>
+            </button>`}
+        </div>
+      </section>
+    `;
+  }
+
+  // Set-and-forget switches: they used to sit on Now, above nothing you
+  // would change twice a year. They live at the top of Settings instead.
+  _renderAutomations(d) {
+    const f = d.features || {};
+    const w = d.windows || {};
     const chips = [
       { id: "schedule", label: "Schedule", on: !!d.schedule_enabled },
       { id: "learning", label: d.learning?.patterns_learned ? `Learning · ${d.learning.patterns_learned} patterns` : "Learning", on: !!d.learning?.enabled },
@@ -2905,26 +2979,14 @@ class GttcPanel extends HTMLElement {
       { id: "windows", label: "Pause HVAC", on: !!w.manual_override },
     ];
     return `
-      <section class="now-card now-actions">
-        <div class="eyebrow">Quick actions</div>
-        <div class="action-tiles">
-          ${boosts.map(b => `
-            <button class="action-tile ${b.cls} boost-btn" data-boost-type="${b.id}">
-              <b>${b.big}</b><span>${b.sub}</span>
-            </button>`).join("")}
-          ${d.vacation_mode ? "" : `
-            <button class="action-tile" id="setVacationBtn">
-              <b><ha-icon icon="mdi:airplane"></ha-icon></b><span>Vacation…</span>
-            </button>`}
-        </div>
-        <div class="eyebrow">Automations · tap to switch</div>
+      <section class="now-card set-autos">
+        <h2 class="card-h">Automations</h2>
         <div class="auto-chips">
           ${chips.map(c => `
             <button class="auto-chip ${c.on ? "chip-on" : "chip-off"}" data-auto-toggle="${c.id}" data-on="${c.on ? 1 : 0}"
                     aria-pressed="${c.on}">${c.label}</button>`).join("")}
         </div>
-      </section>
-    `;
+      </section>`;
   }
 
   _renderTodayStrip() {
@@ -2935,8 +2997,8 @@ class GttcPanel extends HTMLElement {
     return `
       <section class="now-card now-today">
         <div class="today-head">
-          <div class="eyebrow">Today · ${DAY_LABELS_FULL[today]} · ${label} · ${this._isHeatCool() ? "heat·cool bands" : this._isCooling() ? "cooling targets" : "heating targets"}</div>
-          <button class="btn btn-outline btn-sm" id="goScheduleBtn">Edit schedule</button>
+          <h2 class="card-h" title="${label}">Today</h2>
+          <button class="link-btn" id="goScheduleBtn">Edit</button>
         </div>
         <div class="week-row-timeline today-timeline">
           ${this._renderOnPeakOverlay(today)}
@@ -3228,7 +3290,7 @@ class GttcPanel extends HTMLElement {
         ? [[ax(b.a), 100 - ax(b.a)], [0, b.len / 14.4 - (100 - ax(b.a))]] : [[ax(b.a), b.len / 14.4]];
       return pieces.map(([l, w], i) => `
         <button class="sx-seg ${live(b) ? "sx-seg-live" : ""}" data-block="${blocks.indexOf(b)}"
-             style="left:${l}%;width:${w}%;background:${t != null ? tempColor(t, s.temp_min, s.temp_max) : "var(--divider)"}"
+             style="left:${l}%;width:${w}%;background:${t != null ? tempColor(t, s.temp_min, s.temp_max) : "var(--divider)"};color:${t != null ? tempInk(t, s.temp_min, s.temp_max) : "var(--primary-text)"}"
              title="${b.name} · ${this._blockRange(b)}">
           ${i === 0 && w > 7 ? `<span class="sx-seg-n">${b.name}</span><span class="sx-seg-t">${this._blockTemp(b.e)}</span>` : ""}
         </button>`).join("");
@@ -4194,15 +4256,25 @@ class GttcPanel extends HTMLElement {
     return `
       :host {
         display: block;
-        --primary: var(--primary-color, #03a9f4);
-        --primary-text: var(--primary-text-color, #212121);
-        --secondary-text: var(--secondary-text-color, #727272);
-        --card-bg: var(--ha-card-background, var(--card-background-color, #fff));
-        --divider: var(--divider-color, #e0e0e0);
-        --bg: var(--primary-background-color, #fafafa);
-        --error: var(--error-color, #db4437);
-        --success: var(--success-color, #43a047);
-        font-family: var(--paper-font-body1_-_font-family, Roboto, sans-serif);
+        --gt-ground: #f4f5f7; --gt-surface: #ffffff; --gt-ink: #15181d; --gt-ink2: #5a6170;
+        --gt-line: #e8eaee; --gt-accent: #2f6fdb; --gt-heat: #c2410c; --gt-cool: #1d5fd1;
+        --primary: var(--gt-accent);
+        --primary-text: var(--gt-ink);
+        --secondary-text: var(--gt-ink2);
+        --card-bg: var(--gt-surface);
+        --divider: var(--gt-line);
+        --bg: var(--gt-ground);
+        --error: #b42318;
+        --success: #16a34a;
+        background: var(--gt-ground);
+        min-height: 100%;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      :host([dark]) {
+        --gt-ground: #0f1115; --gt-surface: #1a1d23; --gt-ink: #eceef2; --gt-ink2: #9aa1ae;
+        --gt-line: #2a2e36; --gt-accent: #7fa8ff; --gt-heat: #ff8a50; --gt-cool: #7fb0ff;
+        --primary: #3d6fe0;
       }
       .panel { max-width: 1200px; margin: 0 auto; padding: 16px; color: var(--primary-text); }
 
@@ -5247,6 +5319,118 @@ class GttcPanel extends HTMLElement {
         .action-tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .log-row { grid-template-columns: 80px 1fr auto; }
         .log-dur { display: none; }
+      }
+
+      /* ── v2.7 kit: one shell shared with First Words and Kitchen ───────── */
+      .panel { max-width: 1080px; padding: 0 20px 32px; }
+      .header { border-bottom: 0; margin-bottom: 8px; padding: 28px 0 8px; align-items: flex-end; flex-wrap: nowrap; }
+      .header-left { flex-direction: column; align-items: flex-start; gap: 2px; }
+      .hd-eyebrow { font-size: 13px; font-weight: 600; color: var(--secondary-text); }
+      .header h1 { font-size: 34px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.1; }
+      .status-item { border: 0; background: var(--card-bg); border-radius: 999px; padding: 6px 12px; }
+      .eyebrow { font-size: 13px; letter-spacing: 0; text-transform: none; font-weight: 600; }
+      .card-h { margin: 0; font-size: 17px; font-weight: 700; }
+      .link-btn { border: 0; background: none; padding: 6px 2px; font: inherit; font-size: 15px; font-weight: 600; color: var(--gt-accent); cursor: pointer; }
+      .dim { color: var(--secondary-text); font-weight: 500; }
+
+      /* surfaces: fill, no outline; cards never nest */
+:host { min-height: 100vh; }
+      .now-card, .week-overview, .day-detail, .season-strip, .status-error-box, .sx-card, .stat-card, .chart-card,
+      .status-card, .debug-card, .settings-card, .automation-panel, .quick-panel, .schedule-section, .settings-layout {
+        border: 0; border-radius: 20px; }
+      .sx-pv { border: 0; background: var(--bg); border-radius: 16px; }
+      .sx-plan { border-color: transparent; border-radius: 20px; }
+      .sx-plan-on { border-color: var(--primary-text); }
+      .sx-lbl, .sx-row-h, .stat-label { text-transform: none; letter-spacing: 0; font-size: 13px; }
+      .season-seg { border: 0; }
+      .season-seg-btn.seg-heat[aria-pressed="true"] { background: var(--gt-heat); }
+      .season-seg-btn.seg-cool[aria-pressed="true"] { background: var(--gt-cool); }
+      .season-seg-btn.seg-both[aria-pressed="true"] { background: linear-gradient(90deg, var(--gt-heat), var(--gt-cool)); }
+      .entry-card, .room, .action-tile, .sx-zone, .sx-pc { border-color: transparent; border-radius: 16px; background: var(--bg); }
+      .btn { border-radius: 999px; }
+      .btn-primary, .btn-add { background: var(--gt-ink); color: var(--gt-surface); border-color: var(--gt-ink); }
+      .btn-outline { color: var(--primary-text); border-color: var(--divider); }
+      .btn-outline:hover { background: var(--bg); color: var(--primary-text); }
+      .preset-select, .mode-select, .strip-preset select { border-radius: 12px; }
+
+      /* tabs: underline on a wide screen, a bottom bar on a phone */
+      .main-tab-bar { border-bottom: 0; gap: 6px; margin-bottom: 20px; }
+      .main-tab { border-radius: 999px; border-bottom: 0; margin-bottom: 0; padding: 8px 16px; font-weight: 600; }
+      .main-tab:hover { background: var(--card-bg); color: var(--primary-text); }
+      .main-tab.active { background: var(--gt-ink); color: var(--gt-surface); }
+      @media (max-width: 700px) {
+        .panel { padding-bottom: calc(100px + env(safe-area-inset-bottom)); }
+        .header { padding-top: 20px; flex-direction: row; align-items: flex-end; justify-content: space-between; }
+        .status-item { font-size: 12px; padding: 5px 10px; }
+        .main-tab-bar {
+          position: fixed; left: 0; right: 0; bottom: 0; z-index: 50; margin: 0; gap: 0;
+          display: grid; grid-template-columns: repeat(4, minmax(0, 1fr));
+          padding: 8px 0 calc(10px + env(safe-area-inset-bottom));
+          background: color-mix(in srgb, var(--card-bg) 94%, transparent);
+          border-top: 1px solid var(--divider);
+          -webkit-backdrop-filter: blur(16px); backdrop-filter: blur(16px);
+        }
+        .main-tab { flex-direction: column; gap: 3px; padding: 4px 0; font-size: 11px; border-radius: 0; background: none; }
+        .main-tab ha-icon { display: inline-block; --mdc-icon-size: 24px; }
+        .main-tab.active, .main-tab:hover { background: none; color: var(--primary-text); font-weight: 700; }
+        .main-tab:not(.active) { color: var(--secondary-text); }
+        .save-bar { bottom: calc(96px + env(safe-area-inset-bottom)); }
+      }
+
+      /* Now: the number first */
+      .now-grid { grid-template-columns: minmax(0, 1.3fr) minmax(0, 1fr); gap: 12px; align-items: start; }
+      .now-hero { padding: 4px 4px 12px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+      .now-hero .hero-temp { font-size: 96px; font-weight: 800; letter-spacing: -0.05em; line-height: .9; }
+      .now-hero .hero-temp small { font-size: 40px; font-weight: 700; vertical-align: top; margin-left: 2px; }
+      .hero-line { display: flex; align-items: center; gap: 8px; font-size: 17px; font-weight: 700; margin-top: 6px; }
+      .hero-line ha-icon { --mdc-icon-size: 20px; color: var(--secondary-text); }
+      .hero-line.is-heat ha-icon { color: var(--gt-heat); }
+      .hero-line.is-cool ha-icon { color: var(--gt-cool); }
+      .now-hero .hero-why { margin: 0; font-size: 15px; color: var(--secondary-text); }
+      .now-rooms { padding: 4px 16px; gap: 0; }
+      .room-row { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 13px 0;
+        border: 0; border-top: 1px solid var(--divider); background: none; color: var(--primary-text);
+        font: inherit; font-size: 16px; text-align: left; cursor: pointer; width: 100%; }
+      .room-row:first-child { border-top: 0; }
+      .room-row:disabled { cursor: default; opacity: 1; }
+      .room-row .room-name { font-size: 16px; font-weight: 600; color: var(--primary-text); }
+      .room-row .room-name i { font-style: normal; font-size: 13px; font-weight: 500; color: var(--secondary-text); }
+      .room-row .room-temp { font-size: 16px; font-weight: 700; }
+      .now-today, .now-actions { grid-column: 1 / -1; }
+      .today-head { display: flex; justify-content: space-between; align-items: baseline; }
+      .today-timeline { height: 40px; border-radius: 12px; }
+      .today-timeline .timeline-block { top: 0; bottom: 0; border-radius: 0; box-shadow: none; border-right: 2px solid var(--card-bg); box-sizing: border-box; }
+      .timeline-block .block-temp, .timeline-block .block-time { text-shadow: none; }
+      .now-line { background: var(--primary-text); width: 3px; border-radius: 2px; opacity: 1; }
+      .now-actions { background: none; padding: 0; }
+      .action-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+      .action-tile { background: var(--card-bg); padding: 14px; min-height: 76px; justify-content: center; }
+      .action-tile b { font-size: 20px; font-weight: 800; }
+      .action-tile.tile-heat b { color: var(--gt-heat); }
+      .action-tile.tile-cool b { color: var(--gt-cool); }
+      .action-tile span { font-size: 13px; font-weight: 600; color: var(--primary-text); }
+      .now-banner { border-radius: 14px; }
+      .banner-season { background: color-mix(in srgb, var(--gt-cool) 12%, var(--card-bg)); }
+      @media (max-width: 820px) { .now-grid { grid-template-columns: minmax(0, 1fr); } }
+      @media (max-width: 560px) { .action-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); } .action-tile { padding: 12px; } }
+
+      /* Settings: season and automations first */
+      .set-top { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+      .set-top .season-strip { margin: 0; }
+      .set-autos { gap: 12px; }
+      .auto-chip { border-radius: 999px; }
+
+      /* Schedule segments carry their own ink now */
+      .sx-seg { text-shadow: none; }
+      .sx-seg-n { text-transform: none; letter-spacing: 0; font-size: 13px; }
+
+      /* The block editor is a bottom sheet on a phone */
+      @media (max-width: 700px) {
+        .sx-drawer { top: auto; left: 0; width: 100vw; height: min(92vh, 100%); border-radius: 28px 28px 0 0;
+          box-shadow: 0 -12px 40px rgba(0,0,0,.3); }
+        .sx-drawer::before { content: ""; display: block; width: 40px; height: 5px; border-radius: 999px;
+          background: var(--divider); margin: 8px auto 0; flex: none; }
+        .sx-drf { padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
       }
     `;
   }
