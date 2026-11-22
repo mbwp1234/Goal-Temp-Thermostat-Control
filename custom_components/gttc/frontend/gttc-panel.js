@@ -229,7 +229,7 @@ class GttcPanel extends HTMLElement {
         this._hass.callWS({ type: "gttc/get_status" }),
         this._hass.callWS({ type: "gttc/get_diagnostics" }).catch(() => null),
         this._hass.callWS({ type: "gttc/get_config" }).catch(() => null),
-        this._hass.callWS({ type: "gttc/get_runtime_history", days: 90 }).catch(() => null),
+        this._hass.callWS({ type: "gttc/get_runtime_history", days: 400 }).catch(() => null),
       ]);
       this._schedule = schedule;
       this._status = status;
@@ -270,7 +270,7 @@ class GttcPanel extends HTMLElement {
       console.error("GTTC: Failed to load data", err);
       this.shadowRoot.innerHTML = `
         <div style="padding:24px;color:var(--primary-text-color,#333)">
-          <h2>GTTC</h2>
+          <h2>Climate</h2>
           <p style="color:var(--error-color,#c00)">Failed to load data. Make sure GTTC is configured.</p>
           <pre>${err.message || err}</pre>
         </div>`;
@@ -305,7 +305,7 @@ class GttcPanel extends HTMLElement {
             <h1>Climate</h1>
           </div>
           <div class="header-right">
-            ${this._renderStatus()}
+            ${this._liveChip()}
           </div>
         </header>
 
@@ -1064,6 +1064,7 @@ class GttcPanel extends HTMLElement {
         const tab = btn.dataset.mainTab;
         if (tab === this._activeMainTab) return;
         this._activeMainTab = tab;
+        this._setSheet = null;
         if (tab !== "settings") {
           this._editingZoneId = null;
           this._zoneFormData = null;
@@ -1105,6 +1106,7 @@ class GttcPanel extends HTMLElement {
     // "Manage in Settings" link
     root.querySelectorAll(".js-window-settings").forEach(btn => btn.addEventListener("click", () => {
       this._activeMainTab = "settings";
+      this._setSheet = "windows";
       this._loadSettingsData();
     }));
 
@@ -1137,7 +1139,14 @@ class GttcPanel extends HTMLElement {
     });
 
     this._attachSettingsListeners();
+    this._attachNowListeners();
+    if (this._activeMainTab === "settings") this._attachSettingsSheetListeners();
     if (this._activeMainTab === "schedule") this._attachScheduleTabListeners();
+    root.querySelectorAll("[data-hview]").forEach(b => b.addEventListener("click", () => {
+      this._histView = b.dataset.hview;
+      this._render();
+      if (this._histView === "week" && !this._actionLog) this._loadActionLog();
+    }));
 
     // Day tabs
     root.querySelectorAll(".day-tab").forEach(btn => {
@@ -2122,24 +2131,6 @@ class GttcPanel extends HTMLElement {
 
   // ── Main tab bar ──────────────────────────────────────────────────────────
 
-  _renderMainTabBar() {
-    const dirty = Object.keys(this._draft || {}).length > 0;
-    const tabs = [
-      { id: "now", icon: "mdi:home-thermometer", label: "Now" },
-      { id: "schedule", icon: "mdi:calendar-clock", label: "Schedule" },
-      { id: "history", icon: "mdi:chart-line", label: "History" },
-      { id: "settings", icon: "mdi:cog", label: dirty ? "Settings •" : "Settings" },
-    ];
-    return `
-      <nav class="main-tab-bar">
-        ${tabs.map(t => `
-          <button class="main-tab ${this._activeMainTab === t.id ? "active" : ""}" data-main-tab="${t.id}">
-            <ha-icon icon="${t.icon}"></ha-icon> ${t.label}
-          </button>
-        `).join("")}
-      </nav>
-    `;
-  }
 
   // ── Status tab ────────────────────────────────────────────────────────────
 
@@ -2523,49 +2514,6 @@ class GttcPanel extends HTMLElement {
     return `<div class="toast toast-${type}">${message}</div>`;
   }
 
-  _renderSettingsTab() {
-    if (this._settingsLoading && !this._settingsData) {
-      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading…</div>`;
-    }
-    if (!this._settingsData) {
-      return `
-        <div class="status-error-box">
-          <div class="status-error-msg">
-            <ha-icon icon="mdi:alert-circle-outline"></ha-icon>
-            ${this._settingsError ? `Failed to load: <code>${this._settingsError}</code>` : "No config data available."}
-          </div>
-          <button class="btn btn-outline" id="settingsRetryBtn">Retry</button>
-        </div>`;
-    }
-    const sections = this._settingsSections();
-    const cur = sections.find(x => x.id === this._settingsSection) || sections[0];
-    const n = Object.keys(this._draft).length;
-    return `
-      ${this._diagData ? `<div class="set-top">${this._renderSeasonStrip()}${this._renderAutomations(this._diagData)}</div>` : ""}
-      <div class="settings-layout">
-        <nav class="set-nav">
-          ${sections.map(x => {
-            const dirty = x.keys.some(k => this._isDirty(k));
-            return `<button class="set-nav-item ${x.id === cur.id ? "active" : ""}" data-set-section="${x.id}">
-              <ha-icon icon="${x.icon}"></ha-icon><span>${x.label}</span>
-              <span class="set-nav-dot" data-dirty-for="${x.id}" ${dirty ? "" : "hidden"}></span>
-            </button>`;
-          }).join("")}
-        </nav>
-        <div class="set-pane">
-          <h2 class="set-title">${cur.label}</h2>
-          ${this[`_renderSettings_${cur.id}`]()}
-        </div>
-      </div>
-      ${this._renderEntityDatalists()}
-      <div class="save-bar" id="saveBar" ${n ? "" : "hidden"}>
-        <span id="saveBarText">${this._saveBarText()}</span>
-        <span class="save-bar-sp"></span>
-        <button class="btn btn-outline" id="discardAllBtn">Discard</button>
-        <button class="btn btn-primary" id="saveAllBtn">Save</button>
-      </div>
-    `;
-  }
 
   _renderSettingsZonesCard(d) {
     const zones = d.zones || [];
@@ -2786,20 +2734,6 @@ class GttcPanel extends HTMLElement {
 
   // ── Styles ────────────────────────────────────────────────────────────────
 
-  _renderNowTab() {
-    const d = this._diagData;
-    if (!d) {
-      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading…</div>`;
-    }
-    return `
-      <div class="now-grid">
-        ${this._renderNowHero(d)}
-        ${this._renderNowRooms(d)}
-        ${this._renderTodayStrip()}
-        ${this._renderNowActions(d)}
-      </div>
-    `;
-  }
 
   _goalWhy(d) {
     const e = d.current_entry;
@@ -2934,36 +2868,6 @@ class GttcPanel extends HTMLElement {
     `;
   }
 
-  _renderNowActions(d) {
-    const boosts = this._isHeatCool()
-      ? [
-          { id: "warm_up", big: "+3°", sub: "Warmer band · 60 min", cls: "tile-heat" },
-          { id: "cool_down", big: "−3°", sub: "Cooler band · 60 min", cls: "tile-cool" },
-        ]
-      : this._isCooling()
-      ? [
-          { id: "max_cool", big: "−4°", sub: "Max cool · 90 min", cls: "tile-cool" },
-          { id: "cool_down", big: "−3°", sub: "Cool down · 60 min", cls: "tile-cool" },
-        ]
-      : [
-          { id: "boost", big: "+4°", sub: "Boost · 90 min", cls: "tile-heat" },
-          { id: "warm_up", big: "+3°", sub: "Warm up · 60 min", cls: "tile-heat" },
-        ];
-    return `
-      <section class="now-card now-actions" aria-label="Quick actions">
-        <div class="action-tiles">
-          ${boosts.map(b => `
-            <button class="action-tile ${b.cls} boost-btn" data-boost-type="${b.id}">
-              <b>${b.big}</b><span>${b.sub}</span>
-            </button>`).join("")}
-          ${d.vacation_mode ? "" : `
-            <button class="action-tile" id="setVacationBtn">
-              <b><ha-icon icon="mdi:airplane"></ha-icon></b><span>Away for a while</span>
-            </button>`}
-        </div>
-      </section>
-    `;
-  }
 
   // Set-and-forget switches: they used to sit on Now, above nothing you
   // would change twice a year. They live at the top of Settings instead.
@@ -2989,29 +2893,6 @@ class GttcPanel extends HTMLElement {
       </section>`;
   }
 
-  _renderTodayStrip() {
-    const today = DAYS_ORDERED[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1];
-    const entries = this._getEntriesForDay(today);
-    const s = this._schedule;
-    const label = s.active_preset ? (s.preset_labels?.[s.active_preset] || s.active_preset) : "Base fallback";
-    return `
-      <section class="now-card now-today">
-        <div class="today-head">
-          <h2 class="card-h" title="${label}">Today</h2>
-          <button class="link-btn" id="goScheduleBtn">Edit</button>
-        </div>
-        <div class="week-row-timeline today-timeline">
-          ${this._renderOnPeakOverlay(today)}
-          ${this._renderTimelineBlocks(entries, today, true)}
-          <div class="now-line" style="left:${this._nowPercent()}%"></div>
-        </div>
-        <div class="today-axis">
-          <span style="left:0">12a</span><span style="left:25%">6a</span><span style="left:50%">12p</span>
-          <span style="left:75%">6p</span><span style="left:100%">12a</span>
-        </div>
-      </section>
-    `;
-  }
 
   // ── Schedule tab ──────────────────────────────────────────────────────────
   // Plans as cards; the viewed plan's day drawn from 6 AM, so a night is one
@@ -3248,190 +3129,6 @@ class GttcPanel extends HTMLElement {
     return out;
   }
 
-  _renderScheduleTab() {
-    const s = this._schedule;
-    const d = this._diagData || {};
-    const plan = this._viewPlan();
-    const running = s.active_preset || "";
-    const isRunning = plan === running;
-    const mode = this._planMode(plan);
-    const tgt = this._planTarget(plan);
-    const list = this._planDayList(plan, tgt.rep);
-    const blocks = this._blocksOf(list);
-    const cur = d.current_entry || this._status?.current_entry;
-    const live = b => isRunning && tgt.days.includes(this._todayKey()) && cur
-      && b.parts.some(p => p.time_start === cur.time_start && p.time_end === cur.time_end);
-    const differ = tgt.days.some(x => this._planSig(plan, x) !== this._planSig(plan, tgt.rep));
-    const canEach = !!plan || s.mode === "per_day";
-    const custom = plan && s.presets?.[plan] && !s.presets[plan].is_builtin;
-
-    const cards = this._planKeys().map(k => {
-      const kb = this._blocksOf(this._planDayList(k, this._todayKey()));
-      const n = this._planIssues(k).length;
-      const zones = [...new Set(kb.map(b => b.e.zone_id ? this._getZoneName(b.e.zone_id) : "no room set"))];
-      const sum = kb.length > 3 ? `${kb.length} blocks` : kb.map(b => `${this._blockTemp(b.e)} ${b.name.toLowerCase()}`).join(" · ");
-      return `
-        <button class="sx-plan ${k === plan ? "sx-plan-on" : ""}" data-plan="${k}" aria-pressed="${k === plan}">
-          <span class="sx-plan-top"><b>${this._planLabel(k)}</b>${k === running
-            ? `<span class="sx-run">Running</span>`
-            : n ? `<span class="sx-check">${n} to check</span>` : ""}</span>
-          <span class="sx-mini">${this._miniBar(kb)}</span>
-          <span class="sx-plan-sum">${sum || "Nothing scheduled"}${zones.length ? ` · ${zones.join(", ")}` : ""}</span>
-        </button>`;
-    }).join("");
-
-    const now = new Date();
-    const nowM = now.getHours() * 60 + now.getMinutes();
-    const showNow = tgt.days.includes(this._todayKey());
-    const ax = m => ((m - 360 + 1440) % 1440) / 1440 * 100;
-    const segs = blocks.map(b => {
-      const t = this._seasonTemp(b.e);
-      const pieces = ax(b.a) + b.len / 14.4 > 100.01
-        ? [[ax(b.a), 100 - ax(b.a)], [0, b.len / 14.4 - (100 - ax(b.a))]] : [[ax(b.a), b.len / 14.4]];
-      return pieces.map(([l, w], i) => `
-        <button class="sx-seg ${live(b) ? "sx-seg-live" : ""}" data-block="${blocks.indexOf(b)}"
-             style="left:${l}%;width:${w}%;background:${t != null ? tempColor(t, s.temp_min, s.temp_max) : "var(--divider)"};color:${t != null ? tempInk(t, s.temp_min, s.temp_max) : "var(--primary-text)"}"
-             title="${b.name} · ${this._blockRange(b)}">
-          ${i === 0 && w > 7 ? `<span class="sx-seg-n">${b.name}</span><span class="sx-seg-t">${this._blockTemp(b.e)}</span>` : ""}
-        </button>`).join("");
-    }).join("");
-    const gapsHere = this._gapsOf(list);
-
-    const heldLine = isRunning && cur && d.hvac_action_reason !== undefined ? (() => {
-      const lb = blocks.find(live);
-      const next = lb ? blocks[(blocks.indexOf(lb) + 1) % blocks.length] : null;
-      const zone = d.active_zone_name ? ` on the ${d.active_zone_name}` : "";
-      return lb ? `Holding <b>${this._blockTemp(lb.e)}</b>${zone} until <b>${this._clock(lb.a + lb.len)}</b>${next && next !== lb ? `, then ${this._blockTemp(next.e)}` : ""}.` : "";
-    })() : "";
-
-    const rows = blocks.map((b, i) => {
-      const zn = b.e.zone_id ? this._getZoneName(b.e.zone_id) : null;
-      const zt = b.e.zone_id ? this._zoneNow(b.e.zone_id) : null;
-      return `
-        <div class="sx-row ${live(b) ? "sx-row-live" : ""}">
-          <div><div class="sx-row-n">${b.name}${live(b) ? ` <span class="sx-now">Now</span>` : ""}</div>
-            <div class="sx-dim">${this._blockRange(b)}</div></div>
-          <div class="sx-row-ask">${this._asksFor(b.e)}</div>
-          <div>${zn ? `<div class="sx-row-z">${zn}</div><div class="sx-dim">${zt != null ? zt.toFixed(1) + "° now" : "no reading"}</div>`
-            : `<div class="sx-row-z sx-warn-t">No room set</div><div class="sx-dim">whichever ran last</div>`}</div>
-          <button class="btn btn-cancel sx-edit" data-block="${i}">Edit</button>
-        </div>`;
-    }).join("");
-
-    const tabs = [["all", "Same every day"], ["split", "Weekdays / Weekends"], ...(canEach ? [["each", "Each day"]] : [])]
-      .map(([k, l]) => `<button class="sx-segbtn" data-pmode="${k}" aria-pressed="${mode === k}">${l}</button>`).join("");
-    const sub = mode === "split"
-      ? [["weekdays", "Mon–Fri"], ["weekend", "Sat–Sun"]].map(([k, l]) =>
-          `<button class="sx-segbtn" data-ppart="${k}" aria-pressed="${tgt.part === k}">${l}</button>`).join("")
-      : mode === "each"
-        ? DAYS_ORDERED.map(x => `<button class="sx-segbtn" data-pday="${x}" aria-pressed="${tgt.rep === x}">${DAY_LABELS[x]}</button>`).join("")
-        : "";
-    const modeNote = differ
-      ? `These days aren't the same right now. Showing ${DAY_LABELS_FULL[tgt.rep]}; saving a block makes ${tgt.days.length === 7 ? "all seven" : "them all"} match it.`
-      : mode === "all" ? "All seven days are the same, so you edit them once."
-      : mode === "split" ? `Editing ${tgt.part === "weekend" ? "Saturday and Sunday" : "Monday to Friday"} together.`
-      : `Editing ${DAY_LABELS_FULL[tgt.rep]} on its own.`;
-
-    // Season table: what each block does in each season. The current season's
-    // row is the one in force.
-    const season = this._season();
-    const cols = blocks.slice(0, 4);
-    const gap = this._minGap();
-    const cell = (k, e) => {
-      if (k === "heating") return `heats to ${e.target_temp}°`;
-      if (k === "cooling") { const c = this._coolOf(e); return c == null ? "cools to the default" : `cools to ${c}°${e.cooling_temp == null ? " (default)" : ""}`; }
-      const band = this._seasonBand(e);
-      return band ? `holds ${this._fmtBand(band)}${band.moved != null ? "*" : ""}` : "—";
-    };
-    const anyMoved = cols.some(b => this._seasonBand(b.e)?.moved != null);
-    const table = cols.length ? `
-      <div class="sx-tbl" style="grid-template-columns: 92px repeat(${cols.length}, minmax(0, 1fr))">
-        <span class="sx-th">Season</span>${cols.map(b => `<span class="sx-th">${b.name}</span>`).join("")}
-        ${[["heating", "Heat"], ["cooling", "Cool"], ["heat_cool", "Heat·Cool"]].map(([k, l]) => `
-          <span class="sx-td sx-td-h ${season === k ? "sx-td-on" : ""}">${l}${season === k ? " · now" : ""}</span>
-          ${cols.map(b => `<span class="sx-td ${season === k ? "sx-td-on" : ""}">${cell(k, b.e)}</span>`).join("")}`).join("")}
-      </div>
-      ${anyMoved ? `<div class="sx-dim sx-foot">* The thermostat keeps heat and cool at least ${gap}° apart, so in Heat·Cool heating waits until ${gap}° under the cool number.</div>` : ""}
-      ${blocks.length > 4 ? `<div class="sx-dim sx-foot">The first four blocks from 6 AM are shown.</div>` : ""}` : `<div class="sx-dim">No blocks yet.</div>`;
-
-    const issues = this._planKeys().flatMap(k => this._planIssues(k));
-    const okLines = [];
-    if (blocks.length && !gapsHere.length) okLines.push(`${this._planLabel(plan)} covers all 24 hours${tgt.days.length < 7 ? ` on ${this._groupLabel(tgt.days)}` : ""} with no gaps.`);
-    if (d.learning) okLines.push(d.learning.enabled
-      ? "Learning is on: overriding the same block three times can change it for you."
-      : "Learning is off. The schedule only changes when you change it.");
-    const warnIco = `<svg viewBox="0 0 20 20" class="sx-ico sx-warn-c"><path d="M10 3 18 17H2z"/><path d="M10 8v4M10 14.5v.01"/></svg>`;
-    const okIco = `<svg viewBox="0 0 20 20" class="sx-ico sx-ok-c"><path d="m4 10.5 4 4 8-9"/></svg>`;
-
-    return `
-      <div class="sx">
-        <div class="sx-head">
-          <h2>Plans</h2>
-          <span class="sx-dim">${running ? `${this._planLabel(running)} is running. A plan changes only when someone picks one.` : "No plan is picked, so the base schedule runs."} Pick a card to see or edit it.</span>
-        </div>
-        <div class="sx-plans">${cards}</div>
-        <div class="sx-tools">
-          <button class="btn btn-cancel btn-sm" id="createPresetBtn">+ New plan</button>
-          ${custom ? `<button class="btn btn-cancel btn-sm" id="renamePresetBtn">Rename</button>
-            <button class="btn btn-cancel btn-sm btn-danger" id="deletePresetBtn">Delete plan</button>` : ""}
-          <span class="sx-grow"></span>
-          <button class="btn btn-cancel btn-sm" id="exportBtn">Export</button>
-          <button class="btn btn-cancel btn-sm" id="importBtn">Import</button>
-        </div>
-
-        <div class="sx-main">
-          <section class="sx-card sx-detail">
-            <div class="sx-dhead">
-              <div>
-                <div class="sx-title">${this._planLabel(plan)}</div>
-                <div class="${isRunning ? "sx-ok-t" : "sx-dim"}">${isRunning
-                  ? "This plan is running now. Changes take effect straight away."
-                  : "Not running now. Changes save to this plan and take effect the next time it is picked."}</div>
-                ${heldLine ? `<div class="sx-held">${heldLine}</div>` : ""}
-              </div>
-              <div class="sx-dbtns">
-                ${isRunning ? "" : `<button class="btn btn-cancel" data-run-plan="${plan}">Run this plan</button>`}
-                <button class="btn btn-cancel" id="undoBtn" ${s.can_undo ? "" : "disabled"}>Undo</button>
-                <button class="btn btn-cancel" id="redoBtn" ${s.can_redo ? "" : "disabled"}>Redo</button>
-                <button class="btn btn-add" id="sxAddBtn">Add a block</button>
-              </div>
-            </div>
-            ${plan ? "" : this._renderScheduleMode()}
-            <div class="sx-days">
-              <span class="sx-lbl">Days</span>
-              <div class="sx-segs">${tabs}</div>
-              ${sub ? `<div class="sx-segs">${sub}</div>` : ""}
-            </div>
-            <div class="${differ ? "sx-warn-t" : "sx-dim"} sx-modenote">${modeNote}</div>
-            <div class="sx-shape">
-              ${segs}
-              ${showNow && blocks.length ? `<i class="sx-nowline" style="left:${ax(nowM)}%"><b>NOW</b></i>` : ""}
-            </div>
-            <div class="sx-axis"><span>6a</span><span>9a</span><span>12p</span><span>3p</span><span>6p</span><span>9p</span><span>12a</span><span>3a</span><span>6a</span></div>
-            ${gapsHere.map(([a, b]) => `<div class="sx-gap">${warnIco}<span><b>Nothing scheduled ${this._clock(a)}–${this._clock(b)}.</b> GTTC keeps the last goal then. Stretch a block over it, or add one.</span></div>`).join("")}
-            <div class="sx-rows">
-              ${blocks.length ? `<div class="sx-row sx-row-h"><span>Block</span><span>What it asks for</span><span>Measured at</span><span></span></div>${rows}`
-                : `<div class="sx-dim">Nothing scheduled. Add a block to start.</div>`}
-            </div>
-          </section>
-
-          <div class="sx-side">
-            <section class="sx-card">
-              <div class="sx-ctitle">What the thermostat will do</div>
-              <div class="sx-dim">${this._planLabel(plan)}${tgt.days.length < 7 ? `, ${this._groupLabel(tgt.days)}` : ""}, in each season.</div>
-              ${table}
-            </section>
-            <section class="sx-card">
-              <div class="sx-ctitle">Things to check</div>
-              ${issues.map(x => `<div class="sx-chk">${warnIco}<span>${x.text}${x.plan !== plan ? ` <button class="sx-link" data-plan="${x.plan}">Open plan</button>` : ""}</span></div>`).join("")}
-              ${okLines.map(t => `<div class="sx-chk">${okIco}<span>${t}</span></div>`).join("")}
-            </section>
-          </div>
-        </div>
-      </div>
-      ${this._blk ? this._renderBlockDrawer() : ""}
-    `;
-  }
 
   _miniBar(blocks) {
     const s = this._schedule;
@@ -3488,113 +3185,6 @@ class GttcPanel extends HTMLElement {
     return { target_temp: d.temp, cooling_temp: d.split ? d.cool : d.temp, away_temp: d.away, zone_id: d.zone || null };
   }
 
-  _renderBlockDrawer() {
-    const B = this._blk;
-    const d = B.draft;
-    const s = this._schedule;
-    const zones = s.zones || [];
-    const dz = this._diagData?.zones || [];
-    const { a, len } = this._blkSpan();
-    const hrs = len / 60;
-    const durTxt = len >= 1440 ? "All 24 hours." : `${Number.isInteger(hrs) ? hrs : hrs.toFixed(1)} hours${a + len > 1440 ? ", ending the next morning" : ""}.`;
-    const list = this._planDayList(B.plan, B.rep);
-    const after = this._paintDay(list, B.parts, { a, len, e: this._blkEntry() });
-    const others = this._blocksOf(list).filter(b => !b.parts.some(p => B.parts.includes(p)));
-    const trimmed = others.filter(b => {
-      for (let k = 0; k < b.len; k++) { const m = (b.a + k) % 1440; if (((m - a + 1440) % 1440) < len) return true; }
-      return false;
-    });
-    const newGaps = this._gapsOf(after);
-    const zoneName = d.zone ? this._getZoneName(d.zone) : "the room the last block picked";
-    const zt = d.zone ? this._zoneNow(d.zone) : null;
-    const cool = d.split ? d.cool : d.temp;
-    const low = Math.min(d.temp, Math.round((cool - this._minGap()) * 10) / 10);
-    const season = this._season();
-    let pvHead, pvMain, pvNote;
-    if (B.pv === "heating") {
-      pvHead = "In Heat"; pvMain = `Heats when the ${zoneName} drops below ${d.temp}°.`;
-      pvNote = zt != null ? `It is ${zt.toFixed(1)}° there now, so heat would ${zt < d.temp ? "run" : "stay off"}.` : "";
-    } else if (B.pv === "cooling") {
-      pvHead = "In Cool"; pvMain = `Cools when the ${zoneName} rises above ${cool}°.`;
-      pvNote = zt != null ? `It is ${zt.toFixed(1)}° there now, so it would ${zt > cool ? "cool" : "stay off"}.` : "";
-    } else {
-      pvHead = "In Heat · Cool"; pvMain = `Holds the ${zoneName} between ${low}° and ${cool}°.`;
-      pvNote = low < d.temp
-        ? `The thermostat needs heat and cool ${this._minGap()}° apart, so heating waits until ${low}°, not ${d.temp}°.${d.split ? "" : " Tick \u201cSeparate heat and cool numbers\u201d to set both ends yourself."}`
-        : `Both ends are at least ${this._minGap()}° apart, so nothing is moved.`;
-    }
-    if (B.pv === season) pvHead += ", the season it is in now";
-    const zt2 = id => { const z = dz.find(x => x.id === id); return z && z.current_temp != null ? z.current_temp.toFixed(1) + "°" : "—"; };
-    const where = B.days.length === 7 ? "every day" : this._groupLabel(B.days);
-    return `
-      <div class="sx-scrim" id="sxScrim"></div>
-      <aside class="sx-drawer" role="dialog" aria-label="Edit block">
-        <div class="sx-drh">
-          <div>
-            <div class="sx-ok-t">${this._planLabel(B.plan)}${B.plan === (s.active_preset || "") ? " · the plan running now" : ""}</div>
-            <div class="sx-title">${B.isNew ? "Add a block" : `Edit ${d.name}`}</div>
-          </div>
-          <button class="btn btn-cancel sx-x" id="sxClose" aria-label="Close">✕</button>
-        </div>
-        <div class="sx-drb">
-          <div class="sx-pair">
-            <label class="sx-f">Starts<input type="time" id="sxStart" value="${d.start}"></label>
-            <label class="sx-f">Ends<input type="time" id="sxEnd" value="${d.end}"></label>
-          </div>
-          <div class="sx-dim">${durTxt}${trimmed.length ? ` Overlaps ${trimmed.map(b => b.name).join(" and ")}, which ${trimmed.length > 1 ? "are" : "is"} trimmed to make room.` : ""}</div>
-          ${newGaps.length ? `<div class="sx-warn-t">Leaves nothing scheduled ${newGaps.map(([x, y]) => `${this._clock(x)}–${this._clock(y)}`).join(", ")}.</div>` : ""}
-
-          <div class="sx-lbl">Which room decides</div>
-          <div class="sx-zones">
-            ${zones.map(z => `
-              <button class="sx-zone" data-szone="${z.id}" aria-pressed="${d.zone === z.id}">
-                <span class="sx-zone-top"><b>${z.name}</b><span>${zt2(z.id)}</span></span>
-                <span class="sx-dim">${(z.sensor_entities || []).length} sensor${(z.sensor_entities || []).length === 1 ? "" : "s"}</span>
-              </button>`).join("")}
-          </div>
-
-          <div class="sx-temph">
-            <span class="sx-lbl">Temperature</span>
-            <label class="sx-chkbox"><input type="checkbox" id="sxSplit" ${d.split ? "checked" : ""}> Separate heat and cool numbers</label>
-          </div>
-          ${d.split ? `
-            <div class="sx-pair">
-              <div class="sx-pc sx-pc-heat"><span>Heat to</span><div class="sx-stepper">
-                <button class="sx-step" data-sstep="temp:-1" aria-label="Lower heat">−</button><b>${d.temp}°</b>
-                <button class="sx-step" data-sstep="temp:1" aria-label="Raise heat">+</button></div></div>
-              <div class="sx-pc sx-pc-cool"><span>Cool to</span><div class="sx-stepper">
-                <button class="sx-step" data-sstep="cool:-1" aria-label="Lower cool">−</button><b>${d.cool}°</b>
-                <button class="sx-step" data-sstep="cool:1" aria-label="Raise cool">+</button></div></div>
-            </div>` : `
-            <div class="sx-big">
-              <button class="sx-step sx-step-l" data-sstep="temp:-1" aria-label="Lower">−</button>
-              <b>${d.temp}°</b>
-              <button class="sx-step sx-step-l" data-sstep="temp:1" aria-label="Raise">+</button>
-              <span class="sx-dim">One number. GTTC heats up to it or cools down to it, whichever the season needs.</span>
-            </div>`}
-          ${d.coolWasDefault && !d.split ? `<div class="sx-dim">This block used the cool default until now; saving sets cool to ${d.temp}° too.</div>` : ""}
-
-          <div class="sx-pv">
-            <div class="sx-pvtabs">
-              ${[["heating", "Heat"], ["cooling", "Cool"], ["heat_cool", "Heat · Cool"]].map(([k, l]) =>
-                `<button class="sx-segbtn" data-spv="${k}" aria-pressed="${B.pv === k}">${l}${season === k ? " · now" : ""}</button>`).join("")}
-            </div>
-            <div class="sx-pvb">
-              <div class="sx-lbl">${pvHead}</div>
-              <div class="sx-pvmain">${pvMain}</div>
-              ${pvNote ? `<div class="sx-dim">${pvNote}</div>` : ""}
-            </div>
-          </div>
-          <div class="sx-dim">Saves to ${where} in ${this._planLabel(B.plan)}.</div>
-        </div>
-        <div class="sx-drf">
-          <button class="btn btn-add sx-big-btn" id="sxSave">Save to ${this._planLabel(B.plan)}</button>
-          <button class="btn btn-cancel sx-big-btn" id="sxCancel">Cancel</button>
-          <span class="sx-grow"></span>
-          ${B.isNew ? "" : `<button class="btn btn-cancel btn-danger sx-big-btn" id="sxDelete">${B.armDelete ? "Tap again to delete" : "Delete block"}</button>`}
-        </div>
-      </aside>`;
-  }
 
   async _saveBlock(remove) {
     const B = this._blk;
@@ -3614,71 +3204,7 @@ class GttcPanel extends HTMLElement {
     }
   }
 
-  _attachScheduleTabListeners() {
-    const root = this.shadowRoot;
-    const rerender = () => this._render();
-    root.querySelectorAll("[data-plan]").forEach(b => b.addEventListener("click", () => {
-      this._planView = b.dataset.plan; this._planModeSel = null; this._planPart = null; this._planDay = null; rerender();
-    }));
-    root.querySelectorAll("[data-run-plan]").forEach(b => b.addEventListener("click", () => this._setPreset(b.dataset.runPlan)));
-    root.querySelectorAll("[data-pmode]").forEach(b => b.addEventListener("click", () => { this._planModeSel = b.dataset.pmode; rerender(); }));
-    root.querySelectorAll("[data-ppart]").forEach(b => b.addEventListener("click", () => { this._planPart = b.dataset.ppart; rerender(); }));
-    root.querySelectorAll("[data-pday]").forEach(b => b.addEventListener("click", () => { this._planDay = b.dataset.pday; rerender(); }));
-    root.querySelectorAll(".sx-edit, .sx-seg").forEach(b => b.addEventListener("click", () => this._openBlock(parseInt(b.dataset.block))));
-    this._addClick("sxAddBtn", () => this._openBlock(null));
-    if (!this._blk) return;
-    const d = this._blk.draft;
-    const close = () => { this._blk = null; rerender(); };
-    this._addClick("sxClose", close);
-    this._addClick("sxCancel", close);
-    this._addClick("sxScrim", close);
-    this._addClick("sxSave", () => this._saveBlock(false));
-    this._addClick("sxDelete", () => {
-      if (!this._blk.armDelete) {
-        this._blk.armDelete = true; rerender();
-        clearTimeout(this._armTimer);
-        this._armTimer = setTimeout(() => { if (this._blk) { this._blk.armDelete = false; this._render(); } }, 5000);
-        return;
-      }
-      this._saveBlock(true);
-    });
-    const time = (id, key) => {
-      const el = root.getElementById(id);
-      if (el) el.addEventListener("change", () => { if (/^\d\d:\d\d$/.test(el.value)) { d[key] = el.value; rerender(); } });
-    };
-    time("sxStart", "start");
-    time("sxEnd", "end");
-    root.querySelectorAll("[data-szone]").forEach(b => b.addEventListener("click", () => { d.zone = b.dataset.szone; rerender(); }));
-    root.querySelectorAll("[data-spv]").forEach(b => b.addEventListener("click", () => { this._blk.pv = b.dataset.spv; rerender(); }));
-    const split = root.getElementById("sxSplit");
-    if (split) split.addEventListener("change", () => {
-      d.split = split.checked;
-      if (d.split && d.cool <= d.temp) d.cool = d.temp + this._minGap();
-      rerender();
-    });
-    const s = this._schedule;
-    root.querySelectorAll("[data-sstep]").forEach(b => b.addEventListener("click", () => {
-      const [k, n] = b.dataset.sstep.split(":");
-      d[k] = Math.max(s.temp_min, Math.min(s.temp_max, d[k] + Number(n)));
-      if (!d.split) d.cool = d.temp;
-      rerender();
-    }));
-  }
 
-  _renderHistoryTab() {
-    const d = this._diagData;
-    return `
-      <div class="history-tab">
-        ${this._renderTempChart()}
-        ${this._renderRuntimeChart()}
-        <div class="history-row">
-          ${this._renderActionLog()}
-          ${d ? this._renderLearningCard(d) : ""}
-        </div>
-        ${d ? this._renderDebugCard(d) : ""}
-      </div>
-    `;
-  }
 
   async _loadActionLog() {
     try {
@@ -3762,22 +3288,6 @@ class GttcPanel extends HTMLElement {
     `;
   }
 
-  _settingsSections() {
-    return [
-      { id: "season", label: "Season rules", icon: "mdi:weather-partly-cloudy",
-        keys: ["auto_season_switch", "seasonal_recommend_hours", "cooling_comfort", "cooling_away_temp"] },
-      { id: "temps", label: "Temperatures", icon: "mdi:thermometer-lines",
-        keys: ["temp_min", "temp_max", "away_temp", "manual_override_minutes"] },
-      { id: "presence", label: "Presence", icon: "mdi:account-check",
-        keys: ["occupancy_enabled", "presence_detection", "tracked_persons"] },
-      { id: "energy", label: "Energy", icon: "mdi:lightning-bolt-circle",
-        keys: ["precondition_enabled", "tou_enabled", "tou_provider", "outdoor_temp_sensor"] },
-      { id: "learning", label: "Learning", icon: "mdi:brain",
-        keys: ["learning_enabled", "learning_threshold"] },
-      { id: "windows", label: "Windows", icon: "mdi:window-open-variant", keys: [] },
-      { id: "zones", label: "Zones", icon: "mdi:map-marker-radius", keys: [] },
-    ];
-  }
 
   _cfg(key) {
     return Object.prototype.hasOwnProperty.call(this._draft, key) ? this._draft[key] : this._settingsData?.[key];
@@ -4091,6 +3601,7 @@ class GttcPanel extends HTMLElement {
       await this._hass.callWS({ type: "gttc/set_config", ...draft });
       this._settingsData = { ...this._settingsData, ...draft };
       this._draft = {};
+      this._setSheet = null;
       await this._loadData();
       this._showToast(`Saved ${Object.keys(draft).length} setting${Object.keys(draft).length !== 1 ? "s" : ""}.`);
     } catch (err) {
@@ -4251,6 +3762,1131 @@ class GttcPanel extends HTMLElement {
       } catch (err) { this._showToast(err.message || "Failed to save zone.", "error"); }
     });
   }
+
+  // ══ v2.8.0 — phone first ═════════════════════════════════════════════════
+  // One graphic and one number per card. Words are kept to a phrase; colour
+  // only ever means temperature (tempColor) or heat/cool.
+
+  _ic(name, cls = "") { return `<ha-icon class="${cls}" icon="mdi:${name}"></ha-icon>`; }
+
+  _liveChip() {
+    const t = this._lastFetchAt ? new Date(this._lastFetchAt) : null;
+    const txt = t ? t.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).replace(/\s?[AP]M$/i, "") : "—";
+    return `<span class="live-chip" title="Updated ${txt}"><i></i>${txt}</span>`;
+  }
+
+  _renderMainTabBar() {
+    const dirty = Object.keys(this._draft || {}).length > 0;
+    const tabs = [["now", "thermometer", "Now"], ["schedule", "calendar-blank-outline", "Schedule"],
+      ["history", "history", "History"], ["settings", "cog-outline", "Settings"]];
+    return `
+      <nav class="main-tab-bar" aria-label="Tabs">
+        ${tabs.map(([id, ic, l]) => `
+          <button class="main-tab ${this._activeMainTab === id ? "active" : ""}" data-main-tab="${id}"
+                  aria-current="${this._activeMainTab === id ? "page" : "false"}">${this._ic(ic)}<span>${l}${id === "settings" && dirty ? " •" : ""}</span></button>`).join("")}
+      </nav>`;
+  }
+
+  // "17:59" ends at 6 PM — short clock for pills and labels: 6p, 6:30a
+  _short12(m) {
+    m = ((m % 1440) + 1440) % 1440;
+    const h = Math.floor(m / 60), mm = m % 60;
+    return `${h % 12 || 12}${mm ? ":" + String(mm).padStart(2, "0") : ""}${h < 12 ? "a" : "p"}`;
+  }
+
+  // ── The dial ──────────────────────────────────────────────────────────────
+  // A 270° horseshoe painted with the whole comfort scale. The stretch the
+  // system is working across (room → goal, or the Heat·Cool band) is full
+  // strength; the rest is a quiet wash. Cold and hot circles cap the ends
+  // with the range's numbers; the goal is a handle carrying its number.
+  _dialSVG(o) {
+    const { lo, hi, cur, mode, act, room } = o;
+    const MIN = o.min, MAX = o.max, SPAN = Math.max(1, MAX - MIN);
+    const dark = this.hasAttribute("dark");
+    const T = dark
+      ? { ink: "#eceef2", ink2: "#9aa1ae", track: [42, 46, 54], surf: "#1a1d23", heat: "#ff8a50", cool: "#7fb0ff" }
+      : { ink: "#15181d", ink2: "#5a6170", track: [236, 238, 241], surf: "#ffffff", heat: "#c2410c", cool: "#1d5fd1" };
+    const tca = t => tempColor(t, MIN, MAX).match(/\d+/g).map(Number);
+    const rgb = c => `rgb(${c.join(",")})`;
+    const ink = t => tempInk(t, MIN, MAX);
+    const off = mode === "off";
+    const R = 116, W = 16;
+    const clamp = t => Math.max(MIN, Math.min(MAX, t));
+    const ang = t => (135 + (clamp(t) - MIN) / SPAN * 270) * Math.PI / 180;
+    const pt = (r, t) => ({ x: +(150 + r * Math.cos(ang(t))).toFixed(2), y: +(150 + r * Math.sin(ang(t))).toFixed(2) });
+    const arc = (t1, t2) => {
+      const a = pt(R, t1), b = pt(R, t2), large = (t2 - t1) / SPAN * 270 > 180 ? 1 : 0;
+      return `M${a.x} ${a.y} A${R} ${R} 0 ${large} 1 ${b.x} ${b.y}`;
+    };
+    const handleTs = off || lo == null ? [] : mode === "band" ? [lo, hi] : [lo];
+    const live = off || lo == null ? null
+      : mode === "band" ? [clamp(lo), clamp(hi)]
+      : (act === "heating" || act === "cooling") && cur != null ? [clamp(Math.min(cur, lo)), clamp(Math.max(cur, lo))] : null;
+    const wash = off ? 0 : dark ? 0.5 : 0.38;
+    const mix = (c, k) => c.map((v, j) => Math.round(T.track[j] + (v - T.track[j]) * k));
+    // A goal parked on an end becomes that end: the scale stops at the handle
+    const nearEnd = e => handleTs.find(h => Math.abs(clamp(h) - e) < SPAN * 0.14);
+    const A = nearEnd(MIN) !== undefined ? clamp(nearEnd(MIN)) : MIN;
+    const B = nearEnd(MAX) !== undefined ? clamp(nearEnd(MAX)) : MAX;
+    const STEP = SPAN / 120;
+    let segs = "";
+    for (let t = A; t < B - 1e-6; t += STEP) {
+      const mid = t + STEP / 2, on = live && mid >= live[0] && mid <= live[1];
+      const t2 = Math.min(B, t + STEP * 1.35), edge = t === A || t2 >= B;
+      segs += `<path d="${arc(t, t2)}" style="fill:none;stroke:${rgb(on ? tca(mid) : mix(tca(mid), wash))};stroke-width:${W}px;stroke-linecap:${edge ? "round" : "butt"}"/>`;
+    }
+    const txt = (x, y, s, size, weight, col, extra = "") =>
+      `<text x="${x}" y="${y}" text-anchor="middle" dominant-baseline="central" style="font:${weight} ${size}px Inter,system-ui,sans-serif;fill:${col};${extra}">${s}</text>`;
+    let ends = "";
+    for (const e of [MIN, MAX]) {
+      if (nearEnd(e) !== undefined) continue;
+      const c = pt(R, e);
+      ends += `<circle cx="${c.x}" cy="${c.y}" r="15" style="fill:${off ? rgb(T.track) : rgb(tca(e))};stroke:${T.surf};stroke-width:3px"/>`
+        + txt(c.x, c.y, Math.round(e), 11, 800, off ? T.ink2 : ink(e));
+    }
+    const curDot = !off && cur != null && !handleTs.some(h => Math.abs(h - cur) < 0.9)
+      ? (() => { const c = pt(R, cur); return `<circle cx="${c.x}" cy="${c.y}" r="6.5" style="fill:${T.ink};stroke:${T.surf};stroke-width:3px"/>`; })() : "";
+    const handles = handleTs.map((t, i) => {
+      const which = i ? "hi" : "lo", c = pt(R, t), selected = mode === "band" && (o.sel || "lo") === which;
+      return `<g class="dial-h" ${mode === "band" ? `data-dial-sel="${which}" role="button" aria-label="${which === "lo" ? "Heat end" : "Cool end"} ${t}°"` : ""}>
+        <circle cx="${c.x}" cy="${c.y}" r="27" style="fill:transparent;stroke:${selected ? T.ink : "transparent"};stroke-width:2.5px"/>
+        <circle cx="${c.x}" cy="${c.y}" r="21" style="fill:${rgb(tca(t))};stroke:${T.surf};stroke-width:4px"/>
+        ${txt(c.x, c.y, Math.round(t * 2) / 2, 16, 800, ink(t))}</g>`;
+    }).join("");
+    const goalCol = off ? T.ink2 : act === "heating" ? T.heat : act === "cooling" ? T.cool : T.ink2;
+    const goalText = off ? "Off" : lo == null ? "—" : mode === "band" ? `${Math.round(lo)}–${Math.round(hi)}°` : `${Math.round(lo * 2) / 2}°`;
+    const ICON = {
+      heating: "M12 3c1 3 4.5 4.6 4.5 9a4.5 4.5 0 0 1-9 0c0-1.7.7-2.9 1.7-3.9.3 1.7 1.3 2.6 2.2 2.7-.6-2.7-.5-5 .6-7.8z",
+      cooling: "M12 2v20M3.3 7l17.4 10M20.7 7L3.3 17M9 4l3 2 3-2M9 20l3-2 3 2",
+      fan: "M12 12c0-3 1-6 4-6s3 3 0 5zM12 12c3 0 6 1 6 4s-3 3-5 0zM12 12c0 3-1 6-4 6s-3-3 0-5zM12 12c-3 0-6-1-6-4s3-3 5 0z",
+    };
+    const showAct = !off && ICON[act];
+    const gw = String(goalText).length * 12.5, rowW = showAct ? 28 + gw : gw;
+    const goalX = showAct ? 150 - rowW / 2 + 28 + gw / 2 : 150;
+    const label = `${room || "Room"} ${cur != null ? cur.toFixed(1) : "unknown"} degrees, ${act || "idle"}, goal ${goalText}`;
+    return `
+      <svg class="dial" viewBox="0 0 300 300" role="img" aria-label="${label}">
+        ${segs}${ends}${curDot}${handles}
+        ${txt(150, 113, room || "", 14, 600, T.ink2)}
+        ${txt(150, 156, cur != null ? cur.toFixed(1) + "°" : "—", 60, 800, T.ink, "letter-spacing:-2.5px")}
+        ${showAct ? `<g transform="translate(${(150 - rowW / 2).toFixed(1)} 197) scale(0.92)"><path d="${ICON[act]}" style="fill:none;stroke:${goalCol};stroke-width:2.4px;stroke-linecap:round;stroke-linejoin:round"/></g>` : ""}
+        ${txt(goalX, 208, goalText, 21, 800, goalCol)}
+      </svg>`;
+  }
+
+  // ── Now ───────────────────────────────────────────────────────────────────
+
+  _nowGoal(d) {
+    const off = d.hvac_mode === "off";
+    const band = !off && this._isHeatCool() && d.heat_cool?.low != null;
+    let lo = d.target_temp, hi = null;
+    if (band) {
+      lo = d.override_active && d.override_target_low != null ? d.override_target_low : d.heat_cool.low;
+      hi = d.override_active && d.override_target_high != null ? d.override_target_high : d.heat_cool.high;
+    }
+    const p = this._goalPending;
+    if (p && Date.now() - p.at < 30000) { lo = p.lo; if (band && p.hi != null) hi = p.hi; }
+    return { off, band, lo, hi, mode: off ? "off" : band ? "band" : this._isCooling() ? "cool" : "heat" };
+  }
+
+  _stepGoal(n) {
+    const d = this._diagData;
+    if (!d) return;
+    const g = this._nowGoal(d);
+    if (g.off || g.lo == null) return;
+    const s = this._schedule;
+    const clamp = v => Math.max(s.temp_min, Math.min(s.temp_max, v));
+    const step = v => n > 0 ? Math.floor(v) + 1 : Math.ceil(v) - 1;
+    let lo = g.lo, hi = g.hi;
+    if (g.band) {
+      const gap = this._minGap();
+      if (this._dialSel === "hi") { hi = clamp(step(hi)); if (hi - lo < gap) lo = clamp(hi - gap); }
+      else { lo = clamp(step(lo)); if (hi - lo < gap) hi = clamp(lo + gap); }
+    } else lo = clamp(step(lo));
+    this._goalPending = { lo, hi: g.band ? hi : null, at: Date.now() };
+    this._render();
+    clearTimeout(this._goalTimer);
+    this._goalTimer = setTimeout(() => this._sendGoal(), 700);
+  }
+
+  async _sendGoal() {
+    const p = this._goalPending;
+    if (!p) return;
+    const id = this._diagData?.entity_ids?.climate || "climate.gttc";
+    try {
+      await this._hass.callService("climate", "set_temperature", p.hi != null
+        ? { entity_id: id, target_temp_low: p.lo, target_temp_high: p.hi }
+        : { entity_id: id, temperature: p.lo });
+      setTimeout(async () => {
+        await this._refreshLive();
+        if (this._goalPending === p) { this._goalPending = null; this._repaint(); }
+      }, 1500);
+    } catch (err) {
+      this._goalPending = null;
+      this._showToast(`Not changed: ${err.message || err}`, "error");
+      this._render();
+    }
+  }
+
+  async _setHvacMode(m) {
+    const d = this._diagData || {};
+    const id = d.entity_ids?.climate || "climate.gttc";
+    const wasOff = d.hvac_mode === "off";
+    const season = { heat: "heating", cool: "cooling", heat_cool: "heat_cool" }[m];
+    try {
+      if (m === "off") {
+        await this._hass.callService("climate", "set_hvac_mode", { entity_id: id, hvac_mode: "off" });
+      } else {
+        if (season !== this._season()) await this._hass.callWS({ type: "gttc/set_season", season });
+        // From Off, the season change alone leaves the thermostat off
+        if (wasOff) await this._hass.callService("climate", "set_hvac_mode", { entity_id: id, hvac_mode: m === "heat_cool" ? "heat_cool" : m });
+      }
+      await this._loadData();
+    } catch (err) {
+      this._showToast(`Mode not changed: ${err.message || err}`, "error");
+    }
+  }
+
+  _nowAlerts(d) {
+    const out = [];
+    const chip = (ic, txt, btn = "") => `<div class="nw-alert">${this._ic(ic)}<b>${txt}</b>${btn}</div>`;
+    if (d.vacation_mode) {
+      const until = new Date(d.vacation_mode.end_dt).toLocaleDateString([], { month: "short", day: "numeric" });
+      out.push(chip("airplane", `Away · ${until}`, `<button class="nw-abtn" id="clearVacationBtn">End</button>`));
+    }
+    const w = d.windows || {};
+    if (w.open) out.push(chip("window-open-variant", `${w.open_sensors.length} open`, `<button class="nw-abtn js-window-settings">Windows</button>`));
+    else if (w.manual_override) out.push(chip("pause-circle-outline", "Paused", `<button class="nw-abtn" data-auto-toggle="windows" data-on="1">Resume</button>`));
+    if (d.suggest_season_switch) {
+      const LABEL = { heating: "Heat", cooling: "Cool", heat_cool: "Both" };
+      const other = d.recommended_season || (this._isCooling() ? "heating" : "cooling");
+      out.push(chip("sun-snowflake-variant", `${LABEL[other] || other} weather`, `<button class="nw-abtn" data-season-switch="${other}">Switch</button>`));
+    }
+    if (this._isHeatCool()) {
+      const hc = d.heat_cool || {};
+      if (hc.cool_locked_out) out.push(chip("snowflake-off", `AC off · under ${hc.cool_lockout_temp}°`));
+      if (hc.gap_adjusted_from != null && hc.low != null) out.push(chip("arrow-expand-horizontal", `Heat ${hc.gap_adjusted_from}° → ${hc.low}°`));
+    }
+    return out.length ? `<div class="nw-alerts">${out.join("")}</div>` : "";
+  }
+
+  _nowPill(d) {
+    if (d.override_active) {
+      const m = Math.max(0, Math.round(d.override_remaining_minutes || 0));
+      const t = `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}`;
+      return `<div class="nw-pill nw-pill-hold" title="${d.override_source === "physical" ? "Held at the thermostat" : "Your change"} · back to the plan in ${t}">
+        ${this._ic(d.override_source === "physical" ? "hand-back-right-outline" : "timer-outline")}<b>${t}</b>
+        <button class="nw-pill-x js-cancel-override" aria-label="Back to the plan">${this._ic("close")}</button></div>`;
+    }
+    const WHY = {
+      schedule: "calendar-blank-outline", cool_lockout: "calendar-blank-outline", occupancy_away: "home-export-outline",
+      vacation: "airplane", precondition: "weather-sunset-up", tou_adjustment: "lightning-bolt", heat_pump_step: "heat-pump-outline",
+      fan_precool: "fan", window_open: "window-open-variant", overheat: "snowflake-alert", warm_zone: "thermometer-high",
+    };
+    const r = d.hvac_action_reason;
+    const e = d.current_entry;
+    const onPlan = r === "schedule" || r === "cool_lockout" || !r;
+    const txt = onPlan ? (e ? this._short12(this._endMin(e.time_end)) : "Plan") : this._reasonLabel(r);
+    return `<button class="nw-pill" data-goto="schedule" title="${this._goalWhy(d)}">${this._ic(WHY[r] || "calendar-blank-outline")}<b>${txt}</b></button>`;
+  }
+
+  _renderNowTab() {
+    const d = this._diagData;
+    if (!d) return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading…</div>`;
+    const s = this._schedule;
+    const g = this._nowGoal(d);
+    const act = g.off ? "off" : d.hvac_action;
+    const dial = this._dialSVG({ lo: g.lo, hi: g.hi, cur: d.current_temp, min: s.temp_min, max: s.temp_max,
+      mode: g.mode, act, room: d.active_zone_name, sel: this._dialSel || "lo" });
+    const mode = d.hvac_mode === "off" ? "off" : this._isHeatCool() ? "heat_cool" : this._isCooling() ? "cool" : "heat";
+    const M = [["heat", "fire", "Heat"], ["heat_cool", "sun-snowflake-variant", "Both"], ["cool", "snowflake", "Cool"], ["off", "power", "Off"]];
+    const zones = d.zones || [];
+    const w = d.windows || {};
+    const plan = s.active_preset ? this._planLabel(s.active_preset) : "Base";
+    const dot = t => t != null ? `<i class="nw-dot" style="background:${tempColor(t, s.temp_min, s.temp_max)}"></i>` : "";
+    const t1 = v => v != null ? `${v.toFixed(1)}°` : `<span class="dim">—</span>`;
+    const outdoor = d.features?.outdoor_temp;
+    return `
+      <div class="nw">
+        ${this._nowAlerts(d)}
+        <div class="nw-cols">
+          <section class="card nw-dialcard">
+            ${dial}
+            <div class="nw-ctl">
+              <button class="nw-step" data-goal-step="-1" aria-label="Cooler" ${g.off ? "disabled" : ""}>${this._ic("minus")}</button>
+              ${this._nowPill(d)}
+              <button class="nw-step" data-goal-step="1" aria-label="Warmer" ${g.off ? "disabled" : ""}>${this._ic("plus")}</button>
+            </div>
+          </section>
+          <div class="nw-side">
+            <div class="card nw-modes" role="group" aria-label="Mode">
+              ${M.map(([k, ic, l]) => `<button class="nw-mode nw-mode-${k} ${k === mode ? "on" : ""}" data-hvac-mode="${k}" aria-pressed="${k === mode}">${this._ic(ic)}<span>${l}</span></button>`).join("")}
+            </div>
+            <div class="nw-tiles">
+              <button class="card nw-tile" data-goto="schedule">${this._ic("calendar-blank-outline")}<b>${plan}</b><span>Plan</span></button>
+              <button class="card nw-tile" id="nwRoomBtn" ${zones.length < 2 ? "disabled" : ""}>${this._ic("map-marker-outline")}<b>${d.active_zone_name || "—"}</b><span>Room</span></button>
+              <button class="card nw-tile" data-auto-toggle="windows" data-on="${w.manual_override ? 1 : 0}">${this._ic(w.manual_override ? "play-circle-outline" : "pause-circle-outline")}<b>${w.manual_override ? "Paused" : "Running"}</b><span>${w.manual_override ? "Resume" : "Pause"}</span></button>
+            </div>
+            <div class="nw-rooms">
+              ${zones.map(z => `
+                <button class="card nw-room ${z.is_active ? "on" : ""}" data-now-zone="${z.id}" ${z.is_active ? "disabled" : ""}
+                        title="${z.is_active ? "The plan follows this room" : "Follow this room"}">
+                  <span>${z.name}</span><b>${dot(z.current_temp)}${t1(z.current_temp)}</b></button>`).join("")}
+              <div class="card nw-room nw-out"><span>Outside</span><b>${dot(outdoor)}${t1(outdoor)}</b></div>
+            </div>
+            ${this._renderTodayStrip()}
+            ${this._renderNowActions(d)}
+          </div>
+        </div>
+      </div>`;
+  }
+
+  _renderNowActions(d) {
+    const boosts = this._isHeatCool()
+      ? [{ id: "warm_up", big: "+3°", sub: "1h", cls: "tile-heat" }, { id: "cool_down", big: "−3°", sub: "1h", cls: "tile-cool" }]
+      : this._isCooling()
+      ? [{ id: "max_cool", big: "−4°", sub: "1½h", cls: "tile-cool" }, { id: "cool_down", big: "−3°", sub: "1h", cls: "tile-cool" }]
+      : [{ id: "boost", big: "+4°", sub: "1½h", cls: "tile-heat" }, { id: "warm_up", big: "+3°", sub: "1h", cls: "tile-heat" }];
+    return `
+      <div class="nw-acts">
+        ${boosts.map(b => `<button class="card nw-act ${b.cls} boost-btn" data-boost-type="${b.id}"><b>${b.big}</b><span>${b.sub}</span></button>`).join("")}
+        ${d.vacation_mode ? "" : `<button class="card nw-act" id="setVacationBtn">${this._ic("airplane")}<span>Away</span></button>`}
+      </div>`;
+  }
+
+  _renderTodayStrip() {
+    const today = this._todayKey();
+    const entries = this._getEntriesForDay(today);
+    return `
+      <section class="card now-today" aria-label="Today">
+        <div class="week-row-timeline today-timeline">
+          ${this._renderOnPeakOverlay(today)}
+          ${this._renderTimelineBlocks(entries, today, true)}
+          <div class="now-line" style="left:${this._nowPercent()}%"></div>
+        </div>
+        <div class="today-axis">
+          <span style="left:0">12a</span><span style="left:25%">6a</span><span style="left:50%">12p</span>
+          <span style="left:75%">6p</span><span style="left:100%">12a</span>
+        </div>
+      </section>`;
+  }
+
+  _attachNowListeners() {
+    const root = this.shadowRoot;
+    root.querySelectorAll("[data-goal-step]").forEach(b => b.addEventListener("click", () => this._stepGoal(Number(b.dataset.goalStep))));
+    root.querySelectorAll("[data-dial-sel]").forEach(g => g.addEventListener("click", () => { this._dialSel = g.dataset.dialSel; this._render(); }));
+    root.querySelectorAll("[data-hvac-mode]").forEach(b => b.addEventListener("click", () => {
+      if (b.classList.contains("on")) return;
+      b.disabled = true;
+      this._setHvacMode(b.dataset.hvacMode);
+    }));
+    root.querySelectorAll("[data-goto]").forEach(b => b.addEventListener("click", () => { this._activeMainTab = b.dataset.goto; this._render(); }));
+    this._addClick("nwRoomBtn", async () => {
+      const zones = this._diagData?.zones || [];
+      const i = zones.findIndex(z => z.is_active);
+      const next = zones[(i + 1) % zones.length];
+      if (!next || next.is_active) return;
+      try {
+        await this._hass.callWS({ type: "gttc/set_active_zone", zone_id: next.id });
+        await this._loadData();
+      } catch (err) { this._showToast(`Room not changed: ${err.message || err}`, "error"); }
+    });
+  }
+
+  // ── Schedule ──────────────────────────────────────────────────────────────
+  // Plans as buttons with a colour bar; the whole week as seven colour bars on
+  // a 6 AM → 6 AM axis; tap a block to edit it in a sheet. Which days an edit
+  // writes to is the plan's day grouping (Same / Weekdays·Weekends / Each).
+
+  _sxViewSeason() {
+    if (this._sxView) return this._sxView;
+    return this._isCooling() ? "cooling" : "heating";
+  }
+
+  _sxTemp(e) {
+    return this._sxViewSeason() === "cooling" ? this._coolOf(e) : e.target_temp;
+  }
+
+  _renderScheduleTab() {
+    const s = this._schedule;
+    const d = this._diagData || {};
+    const plan = this._viewPlan();
+    const running = s.active_preset || "";
+    const isRunning = plan === running;
+    const mode = this._planMode(plan);
+    const tgt = this._planTarget(plan);
+    const cur = d.current_entry || this._status?.current_entry;
+    const canEach = !!plan || s.mode === "per_day";
+    const custom = plan && s.presets?.[plan] && !s.presets[plan].is_builtin;
+    const view = this._sxViewSeason();
+    const today = this._todayKey();
+    const ax = m => ((m - 360 + 1440) % 1440) / 1440 * 100;
+
+    const cards = this._planKeys().map(k => {
+      const kb = this._blocksOf(this._planDayList(k, today));
+      const n = this._planIssues(k).length;
+      return `
+        <button class="sx-plan ${k === plan ? "sx-plan-on" : ""}" data-plan="${k}" aria-pressed="${k === plan}">
+          <span class="sx-plan-top"><b>${this._planLabel(k)}</b>${k === running ? `<i class="sx-rundot" title="Running"></i>`
+            : n ? `<i class="sx-chkdot" title="${n} to check"></i>` : ""}</span>
+          <span class="sx-mini">${this._miniBar(kb)}</span>
+        </button>`;
+    }).join("");
+
+    const now = new Date();
+    const nowM = now.getHours() * 60 + now.getMinutes();
+    const rows = DAYS_ORDERED.map(day => {
+      const blocks = this._blocksOf(this._planDayList(plan, day));
+      const inTgt = tgt.days.includes(day);
+      const segs = blocks.map((b, bi) => {
+        const t = this._sxTemp(b.e);
+        const bg = t != null ? tempColor(t, s.temp_min, s.temp_max) : "var(--divider)";
+        const fg = t != null ? tempInk(t, s.temp_min, s.temp_max) : "var(--primary-text)";
+        const isLive = isRunning && day === today && cur && b.parts.some(p => p.time_start === cur.time_start && p.time_end === cur.time_end);
+        const l = ax(b.a), w = b.len / 14.4;
+        const pieces = l + w > 100.01 ? [[l, 100 - l], [0, w - (100 - l)]] : [[l, w]];
+        return pieces.map(([pl, pw], i) => `
+          <button class="sx-seg ${isLive ? "sx-seg-live" : ""}" data-day="${day}" data-block="${bi}"
+                  style="left:${pl}%;width:${pw}%;background:${bg};color:${fg}"
+                  aria-label="${DAY_LABELS[day]} ${b.name} ${this._blockRange(b)} ${t != null ? t + "°" : ""}">
+            ${i === 0 && pw > 9 ? `<b>${t != null ? t + "°" : "—"}</b>${pw > 22 ? `<span>${this._short12(b.a)}</span>` : ""}` : ""}
+          </button>`).join("");
+      }).join("");
+      const gaps = this._gapsOf(this._planDayList(plan, day));
+      return `
+        <span class="sx-dl ${day === today ? "on" : ""}">${DAY_LABELS[day].slice(0, 2)}</span>
+        <div class="sx-track ${inTgt ? "sx-track-tgt" : ""} ${gaps.length ? "sx-track-gap" : ""}">
+          ${segs || `<span class="sx-empty">—</span>`}
+          ${day === today && blocks.length ? `<i class="sx-nowline" style="left:${ax(nowM)}%"></i>` : ""}
+        </div>`;
+    }).join("");
+
+    const tabs = [["all", "Same"], ["split", "Wkdy · Wknd"], ...(canEach ? [["each", "Each"]] : [])]
+      .map(([k, l]) => `<button class="sx-segbtn" data-pmode="${k}" aria-pressed="${mode === k}">${l}</button>`).join("");
+    const issues = this._planIssues(plan);
+
+    return `
+      <div class="sx sx2">
+        <div class="sx-plans" role="group" aria-label="Plans">
+          ${cards}
+          <button class="sx-plan sx-plan-add" id="createPresetBtn" aria-label="New plan">${this._ic("plus")}</button>
+        </div>
+        <section class="card sx-week">
+          <div class="sx-bar">
+            <div class="sx-segs sx-view" role="group" aria-label="Show">
+              <button class="sx-segbtn sx-v-heat" data-sview="heating" aria-pressed="${view === "heating"}">${this._ic("fire")}Heat</button>
+              <button class="sx-segbtn sx-v-cool" data-sview="cooling" aria-pressed="${view === "cooling"}">${this._ic("snowflake")}Cool</button>
+            </div>
+            <span class="sx-grow"></span>
+            <button class="sx-round" id="undoBtn" aria-label="Undo" ${s.can_undo ? "" : "disabled"}>${this._ic("undo")}</button>
+            <button class="sx-round sx-round-ink" id="sxAddBtn" aria-label="Add a block">${this._ic("plus")}</button>
+          </div>
+          <div class="sx-grid">
+            ${rows}
+            <span></span>
+            <div class="sx-axis2"><span>6a</span><span>12p</span><span>6p</span><span>12a</span><span>6a</span></div>
+          </div>
+          <div class="sx-days">
+            ${this._ic("calendar-sync-outline")}<div class="sx-segs" role="group" aria-label="Days edit together">${tabs}</div>
+          </div>
+          ${issues.length ? `<div class="sx-issues">${issues.map(x => `<div class="sx-issue">${this._ic("alert-outline")}<span>${x.text}</span></div>`).join("")}</div>` : ""}
+        </section>
+        <div class="sx-tools">
+          ${isRunning ? "" : `<button class="sx-pill sx-pill-ink" data-run-plan="${plan}">${this._ic("play")}Run ${this._planLabel(plan)}</button>`}
+          ${custom ? `<button class="sx-pill" id="renamePresetBtn">${this._ic("pencil-outline")}Rename</button>
+            <button class="sx-pill" id="deletePresetBtn">${this._ic("delete-outline")}Delete</button>` : ""}
+          <button class="sx-pill" id="redoBtn" ${s.can_redo ? "" : "disabled"}>${this._ic("redo")}Redo</button>
+          <button class="sx-pill" id="exportBtn">${this._ic("export-variant")}Export</button>
+          <button class="sx-pill" id="importBtn">${this._ic("import")}Import</button>
+        </div>
+        ${plan ? "" : `<div class="sx-basemode">${this._renderScheduleMode()}</div>`}
+      </div>
+      ${this._blk ? this._renderBlockDrawer() : ""}`;
+  }
+
+  // Tapping a block on a day that does not match the group being edited
+  // switches to that day on its own, so the editor always opens on what was tapped.
+  _openDayBlock(day, bi) {
+    const plan = this._viewPlan();
+    const mode = this._planMode(plan);
+    const tgt = this._planTarget(plan);
+    const canEach = !!plan || this._schedule.mode === "per_day";
+    if (mode === "split") this._planPart = ["saturday", "sunday"].includes(day) ? "weekend" : "weekdays";
+    else if (mode === "each") this._planDay = day;
+    const t2 = this._planTarget(plan);
+    if (this._planSig(plan, day) !== this._planSig(plan, t2.rep)) {
+      if (canEach) { this._planModeSel = "each"; this._planDay = day; }
+      else this._planPart = ["saturday", "sunday"].includes(day) ? "weekend" : "weekdays";
+    }
+    void tgt;
+    const rep = this._planTarget(plan).rep;
+    const want = this._blocksOf(this._planDayList(plan, day))[bi];
+    const blocks = this._blocksOf(this._planDayList(plan, rep));
+    const idx = want ? blocks.findIndex(b => b.a === want.a && b.len === want.len) : -1;
+    this._openBlock(idx >= 0 ? idx : bi);
+  }
+
+  _renderBlockDrawer() {
+    const B = this._blk;
+    const d = B.draft;
+    const s = this._schedule;
+    const zones = s.zones || [];
+    const { a, len } = this._blkSpan();
+    const list = this._planDayList(B.plan, B.rep);
+    const after = this._paintDay(list, B.parts, { a, len, e: this._blkEntry() });
+    const others = this._blocksOf(list).filter(b => !b.parts.some(p => B.parts.includes(p)));
+    const trimmed = others.filter(b => {
+      for (let k = 0; k < b.len; k++) { const m = (b.a + k) % 1440; if (((m - a + 1440) % 1440) < len) return true; }
+      return false;
+    });
+    const newGaps = this._gapsOf(after);
+    const chip = (t, k) => `<span class="sx-chip" style="background:${tempColor(t, s.temp_min, s.temp_max)};color:${tempInk(t, s.temp_min, s.temp_max)}">${t}°</span>`;
+    const stepper = (key, ic, cls, label) => `
+      <div class="sx-stp ${cls}">
+        ${this._ic(ic)}
+        <button class="sx-step" data-sstep="${key}:-1" aria-label="${label} lower">−</button>
+        ${chip(d[key], key)}
+        <button class="sx-step" data-sstep="${key}:1" aria-label="${label} higher">+</button>
+      </div>`;
+    const dayChips = DAYS_ORDERED.map(x => `<span class="sx-dchip ${B.days.includes(x) ? "on" : ""}">${DAY_LABELS[x][0]}</span>`).join("");
+    const hrs = len / 60;
+    return `
+      <div class="sx-scrim" id="sxScrim"></div>
+      <aside class="sx-drawer" role="dialog" aria-label="${B.isNew ? "Add a block" : "Edit " + d.name}">
+        <i class="sx-grab"></i>
+        <div class="sx-drh">
+          <b class="sx-title">${B.isNew ? "New block" : d.name}</b>
+          ${B.isNew ? "" : `<button class="sx-round" id="sxDelete" aria-label="Delete block">${B.armDelete ? `<span class="sx-arm">Tap again to delete</span>` : this._ic("delete-outline")}</button>`}
+          <button class="sx-round" id="sxClose" aria-label="Close">${this._ic("close")}</button>
+        </div>
+        <div class="sx-drb">
+          <div class="sx-times">
+            <label class="sx-time"><input type="time" id="sxStart" value="${d.start}" aria-label="Starts"></label>
+            ${this._ic("arrow-right")}
+            <label class="sx-time"><input type="time" id="sxEnd" value="${d.end}" aria-label="Ends"></label>
+            <span class="sx-dur">${len >= 1440 ? "24h" : `${Number.isInteger(hrs) ? hrs : hrs.toFixed(1)}h`}</span>
+          </div>
+          ${trimmed.length ? `<div class="sx-note">${this._ic("content-cut")}Trims ${trimmed.map(b => b.name).join(" · ")} to make room</div>` : ""}
+          ${newGaps.length ? `<div class="sx-note sx-note-warn">${this._ic("alert-outline")}Gap ${newGaps.map(([x, y]) => `${this._short12(x)}–${this._short12(y)}`).join(", ")}</div>` : ""}
+          ${d.split ? stepper("temp", "fire", "sx-stp-heat", "Heat") + stepper("cool", "snowflake", "sx-stp-cool", "Cool")
+            : stepper("temp", "thermometer", "", "Goal")}
+          <label class="sx-split"><input type="checkbox" id="sxSplit" ${d.split ? "checked" : ""}>${this._ic("fire")}${this._ic("snowflake")}<span>Separate heat and cool</span></label>
+          <div class="sx-zones" role="group" aria-label="Room">
+            ${zones.map(z => `<button class="sx-zone" data-szone="${z.id}" aria-pressed="${d.zone === z.id}">${z.name}</button>`).join("")}
+          </div>
+          <div class="sx-dchips" aria-label="Days this saves to">${dayChips}</div>
+        </div>
+        <div class="sx-drf">
+          <button class="btn btn-add sx-big-btn" id="sxSave">Save</button>
+          <button class="btn btn-cancel sx-big-btn" id="sxCancel">Cancel</button>
+        </div>
+      </aside>`;
+  }
+
+  _attachScheduleTabListeners() {
+    const root = this.shadowRoot;
+    const rerender = () => this._render();
+    root.querySelectorAll("[data-plan]").forEach(b => b.addEventListener("click", () => {
+      this._planView = b.dataset.plan; this._planModeSel = null; this._planPart = null; this._planDay = null; rerender();
+    }));
+    root.querySelectorAll("[data-run-plan]").forEach(b => b.addEventListener("click", () => this._setPreset(b.dataset.runPlan)));
+    root.querySelectorAll("[data-pmode]").forEach(b => b.addEventListener("click", () => { this._planModeSel = b.dataset.pmode; rerender(); }));
+    root.querySelectorAll("[data-sview]").forEach(b => b.addEventListener("click", () => { this._sxView = b.dataset.sview; rerender(); }));
+    root.querySelectorAll(".sx-seg").forEach(b => b.addEventListener("click", () => this._openDayBlock(b.dataset.day, parseInt(b.dataset.block))));
+    this._addClick("sxAddBtn", () => this._openBlock(null));
+    if (!this._blk) return;
+    const d = this._blk.draft;
+    const close = () => { this._blk = null; rerender(); };
+    this._addClick("sxClose", close);
+    this._addClick("sxCancel", close);
+    this._addClick("sxScrim", close);
+    this._addClick("sxSave", () => this._saveBlock(false));
+    this._addClick("sxDelete", () => {
+      if (!this._blk.armDelete) {
+        this._blk.armDelete = true; rerender();
+        clearTimeout(this._armTimer);
+        this._armTimer = setTimeout(() => { if (this._blk) { this._blk.armDelete = false; this._render(); } }, 5000);
+        return;
+      }
+      this._saveBlock(true);
+    });
+    const time = (id, key) => {
+      const el = root.getElementById(id);
+      if (el) el.addEventListener("change", () => { if (/^\d\d:\d\d$/.test(el.value)) { d[key] = el.value; rerender(); } });
+    };
+    time("sxStart", "start");
+    time("sxEnd", "end");
+    root.querySelectorAll("[data-szone]").forEach(b => b.addEventListener("click", () => { d.zone = b.dataset.szone; rerender(); }));
+    const split = root.getElementById("sxSplit");
+    if (split) split.addEventListener("change", () => {
+      d.split = split.checked;
+      if (d.split && d.cool <= d.temp) d.cool = d.temp + this._minGap();
+      rerender();
+    });
+    const s = this._schedule;
+    root.querySelectorAll("[data-sstep]").forEach(b => b.addEventListener("click", () => {
+      const [k, n] = b.dataset.sstep.split(":");
+      d[k] = Math.max(s.temp_min, Math.min(s.temp_max, d[k] + Number(n)));
+      if (!d.split) d.cool = d.temp;
+      rerender();
+    }));
+  }
+
+  // ── History ───────────────────────────────────────────────────────────────
+  // Week: tiles, the last 24 hours (room, goal, why it changed, runs) and the
+  // last seven days. Year: every day as a square, outside by month, hours by
+  // month, and one dot per day against the outside temperature.
+
+  _svgT(x, y, s, size, weight, col, anchor = "middle") {
+    return `<text x="${x}" y="${y}" text-anchor="${anchor}" dominant-baseline="central" style="font:${weight} ${size}px Inter,system-ui,sans-serif;fill:${col}">${s}</text>`;
+  }
+
+  _histTile(ic, v, l, span = 2, col = "") {
+    return `<div class="card hs-tile" style="grid-column:span ${span}">${this._ic(ic, col)}<b>${v}</b><span>${l}</span></div>`;
+  }
+
+  // Charts are drawn at the width they are shown at, so 12px text is 12px
+  _chartW() {
+    const w = (this.shadowRoot?.querySelector(".content")?.clientWidth || this.clientWidth || 390) - 32;
+    return Math.max(300, Math.min(1000, w));
+  }
+
+  _fmtH(min) {
+    if (min == null || isNaN(min)) return "—";
+    return min >= 60 ? `${(min / 60).toFixed(1)}h` : `${Math.round(min)}m`;
+  }
+
+  // Runtime days as a map, one row per date (an old history can hold a date twice)
+  _runtimeDays() {
+    const rd = this._runtimeData;
+    const out = {};
+    for (const r of [...(rd?.history || []), ...(rd?.today ? [rd.today] : [])]) {
+      if (!r?.date) continue;
+      const a = out[r.date];
+      out[r.date] = a
+        ? { h: a.h + (r.heating_min || 0), c: a.c + (r.cooling_min || 0), o: a.o != null && r.avg_outdoor != null ? (a.o + r.avg_outdoor) / 2 : (a.o ?? r.avg_outdoor) }
+        : { h: r.heating_min || 0, c: r.cooling_min || 0, o: r.avg_outdoor ?? null };
+    }
+    return out;
+  }
+
+  _renderHistoryTab() {
+    const v = this._histView || "week";
+    return `
+      <div class="hs">
+        <div class="hs-seg" role="group" aria-label="Range">
+          <button data-hview="week" aria-pressed="${v === "week"}">Week</button>
+          <button data-hview="year" aria-pressed="${v === "year"}">Year</button>
+        </div>
+        ${v === "year" ? this._renderHistoryYear() : this._renderHistoryWeek()}
+      </div>`;
+  }
+
+  _renderHistoryWeek() {
+    const d = this._diagData || {};
+    const rd = this._runtimeData;
+    const days = this._runtimeDays();
+    const keys = Object.keys(days).sort();
+    const last7 = keys.slice(-7);
+    const cool = this._isCooling();
+    const todayM = rd?.today ? (cool ? rd.today.cooling_min : rd.today.heating_min + (this._isHeatCool() ? rd.today.cooling_min : 0)) : null;
+    const weekM = last7.length ? last7.reduce((a, k) => a + days[k].h + days[k].c, 0) : null;
+    const outdoor = d.features?.outdoor_temp;
+    const lead = rd?.learned_ramp_minutes;
+    return `
+      <div class="hs-tiles">
+        ${this._histTile(cool ? "snowflake" : "fire", this._fmtH(todayM), "Today", 2, cool ? "c-cool" : "c-heat")}
+        ${this._histTile("calendar-week", this._fmtH(weekM), "7 days")}
+        ${this._histTile("thermometer", outdoor != null ? `${Math.round(outdoor)}°` : "—", "Outside")}
+        ${this._histTile("timer-outline", lead ? `${Math.round(lead)}m` : "—", "Lead time", 3)}
+        ${this._histTile("lightbulb-outline", d.learning?.enabled ? (d.learning.patterns_learned ?? "On") : "Off", d.learning?.enabled ? "Learned" : "Learning", 3)}
+      </div>
+      <section class="card hs-card"><b class="hs-h">24h</b>${this._hist24()}</section>
+      <section class="card hs-card"><b class="hs-h">7 days</b>${this._hist7(days, keys)}</section>`;
+  }
+
+  _hist24() {
+    const s = this._schedule;
+    const pts = (this._historyData || []).map(p => ({ t: new Date(p.last_changed || p.lu * 1000).getTime(), v: parseFloat(p.state ?? p.s) }))
+      .filter(p => !isNaN(p.v) && !isNaN(p.t));
+    const now = Date.now(), t0 = now - 24 * 3600 * 1000;
+    const log = (this._actionLog?.log || []).filter(e => e && !isNaN(new Date(e.ts).getTime()))
+      .map(e => ({ ...e, t: new Date(e.ts).getTime() })).sort((a, b) => a.t - b.t);
+    // Goal steps over the window: the decision in force at the start, then each change
+    const inWin = log.filter(e => e.t >= t0);
+    const before = log.filter(e => e.t < t0).pop();
+    const steps = [];
+    for (const e of [...(before ? [{ ...before, t: t0 }] : []), ...inWin]) {
+      const last = steps[steps.length - 1];
+      if (last && last.reason === e.reason && last.target_temp === e.target_temp && last.target_high === e.target_high) continue;
+      steps.push(e);
+    }
+    // A window pause parks the thermostat at an extreme: draw a gap, never "32°"
+    const parked = e => e.reason === "window_open" || e.target_temp == null || e.target_temp < s.temp_min - 5 || e.target_temp > s.temp_max + 5;
+    const temps = [...pts.map(p => p.v), ...steps.filter(e => !parked(e)).flatMap(e => [e.target_temp, e.target_high].filter(x => x != null))];
+    if (!pts.length && !steps.length) return `<div class="hs-empty">${this._ic("chart-line")}<span>No readings yet</span></div>`;
+    let TMIN = Math.floor(Math.min(...temps) - 1), TMAX = Math.ceil(Math.max(...temps) + 1);
+    if (TMAX - TMIN < 4) { TMIN -= 1; TMAX += 1; }
+    const W = this._chartW(), H = 230, X0 = 30, X1 = W - 6, Y0 = 186, Y1 = 46;
+    const hx = t => +(X0 + (t - t0) / (now - t0) * (X1 - X0)).toFixed(1);
+    const ty = v => +(Y0 - (v - TMIN) / (TMAX - TMIN) * (Y0 - Y1)).toFixed(1);
+    const step = (TMAX - TMIN) > 8 ? 4 : 2;
+    let grid = "";
+    for (let v = Math.ceil(TMIN / step) * step; v <= TMAX; v += step) {
+      grid += `<line x1="${X0}" y1="${ty(v)}" x2="${X1}" y2="${ty(v)}" class="hs-grid"/>${this._svgT(X0 - 6, ty(v), v + "°", 11, 600, "var(--secondary-text)", "end")}`;
+    }
+    const goal = steps.map((e, i) => {
+      if (parked(e)) return "";
+      const x1 = hx(Math.max(t0, e.t)), x2 = hx(i < steps.length - 1 ? steps[i + 1].t : now);
+      const one = v => `<line x1="${x1}" y1="${ty(v)}" x2="${Math.max(x1 + 1, x2)}" y2="${ty(v)}" style="stroke:${tempColor(v + 0.5, s.temp_min, s.temp_max)};stroke-width:6px;stroke-linecap:round;opacity:.9"/>`;
+      return one(e.target_temp) + (e.target_high != null ? one(e.target_high) : "");
+    }).join("");
+    let curve = "";
+    pts.filter(p => p.t >= t0).forEach((p, i) => { curve += `${i ? "L" : "M"}${hx(p.t)} ${ty(p.v)} `; });
+    // Runs from the climate entity's hvac_action
+    const runs = [];
+    let open = null;
+    for (const h of this._hvacHistory || []) {
+      const a = h.attributes?.hvac_action, t = new Date(h.last_changed || h.last_updated).getTime();
+      if (isNaN(t)) continue;
+      if (open && a !== open.a) { runs.push({ ...open, e: t }); open = null; }
+      if (!open && (a === "heating" || a === "cooling")) open = { a, s: t };
+    }
+    if (open) runs.push({ ...open, e: now });
+    const runBars = runs.filter(r => r.e > t0).map(r => `<rect x="${hx(Math.max(t0, r.s))}" y="${Y0 + 8}" width="${Math.max(2, hx(r.e) - hx(Math.max(t0, r.s))).toFixed(1)}" height="6" rx="3" class="${r.a === "cooling" ? "f-cool" : "f-heat"}"/>`).join("");
+    const ICON = {
+      window_open: "M6 3h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM12 3v18M4 12h16",
+      schedule: "M5 5h14a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2zM3 10h18M8 3v4M16 3v4",
+      physical_override: "M8 13V5.5a1.5 1.5 0 0 1 3 0V11M11 10V4.5a1.5 1.5 0 0 1 3 0V11M14 10.5V6a1.5 1.5 0 0 1 3 0v7a7 7 0 0 1-7 7h-.5a6 6 0 0 1-5-2.7L3 15.5a1.5 1.5 0 0 1 2.4-1.8L8 16",
+      manual_override: "M12 5a8 8 0 1 1 0 16 8 8 0 0 1 0-16zM12 9v4l2.5 2M9 2h6",
+      heat_pump_step: "M13 2L4 14h7l-1 8 9-12h-7z", tou_adjustment: "M13 2L4 14h7l-1 8 9-12h-7z",
+      precondition: "M12 3v5M5 10l2 2M19 10l-2 2M3 17h18M7 17a5 5 0 0 1 10 0",
+      occupancy_away: "M3 11l9-7 9 7M5 10v10h14V10", vacation: "M2 16l20-7-4-3-6 3-5-3-2 1 4 4-4 2-2-1z",
+    };
+    const warm = r => /override|window/.test(r);
+    let lastX = -99;
+    const events = steps.filter(e => e.t >= t0).map(e => {
+      const lx = hx(e.t);
+      let x = lx; if (x - lastX < 28 && lastX + 28 <= X1 - 6) x = +(lastX + 28).toFixed(1); lastX = x;
+      const path = ICON[e.reason] || ICON.schedule;
+      return `<g><title>${this._reasonLabel(e.reason)} · ${new Date(e.t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</title>
+        <line x1="${lx}" y1="30" x2="${lx}" y2="${Y0}" class="hs-evline"/>
+        <circle cx="${x}" cy="15" r="13" class="${warm(e.reason) ? "hs-ev-warm" : "hs-ev"}"/>
+        <g transform="translate(${(x - 8).toFixed(1)} 7) scale(0.67)"><path d="${path}" class="${warm(e.reason) ? "hs-evi-warm" : "hs-evi"}"/></g></g>`;
+    }).join("");
+    let axis = "";
+    const d0 = new Date(t0); d0.setMinutes(0, 0, 0);
+    for (let t = d0.getTime() + 3600e3; t < now; t += 3600e3) {
+      const h = new Date(t).getHours();
+      if (h % 6 === 0) axis += this._svgT(hx(t), H - 8, this._short12(h * 60), 11, 600, "var(--secondary-text)");
+    }
+    return `<svg class="hs-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Last 24 hours: room temperature, goal and why it changed">
+      ${grid}${runBars}${goal}<path d="${curve}" class="hs-curve"/>${events}${axis}</svg>`;
+  }
+
+  _hist7(days, keys) {
+    const ks = keys.slice(-8);
+    if (!ks.length) return `<div class="hs-empty">${this._ic("chart-bar")}<span>No days recorded yet</span></div>`;
+    const s = this._schedule;
+    const W = this._chartW(), H = 244, BY = 198, BH = 104, step = W / ks.length, bw = Math.min(56, step * 0.62);
+    const maxM = Math.max(240, ...ks.map(k => days[k].h + days[k].c));
+    const os = ks.map(k => days[k].o).filter(o => o != null);
+    const oMin = os.length ? Math.min(...os) - 2 : 0, oMax = os.length ? Math.max(...os) + 2 : 1;
+    const oy = o => +(44 - (o - oMin) / Math.max(1, oMax - oMin) * 28).toFixed(1);
+    let out = "", line = "";
+    ks.forEach((k, i) => {
+      const r = days[k], cx = +(step * i + step / 2).toFixed(1), isToday = i === ks.length - 1;
+      const hh = r.h / maxM * BH, ch = r.c / maxM * BH;
+      if (r.c > 0) out += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${(BY - ch).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(3, ch).toFixed(1)}" rx="8" class="f-cool" style="opacity:${isToday ? .5 : .9}"/>`;
+      if (r.h > 0) out += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${(BY - ch - hh).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(3, hh).toFixed(1)}" rx="8" class="f-heat" style="opacity:${isToday ? .5 : .9}"/>`;
+      if (r.h + r.c === 0) out += `<rect x="${(cx - bw / 2).toFixed(1)}" y="${BY - 3}" width="${bw.toFixed(1)}" height="3" rx="1.5" class="hs-zero"/>`;
+      out += this._svgT(cx, BY - ch - hh - 12, this._fmtH(r.h + r.c), 13, 800, "var(--primary-text)");
+      const dn = isToday ? "Now" : new Date(k + "T12:00").toLocaleDateString([], { weekday: "narrow" });
+      out += this._svgT(cx, BY + 22, dn, 12, isToday ? 800 : 600, isToday ? "var(--primary-text)" : "var(--secondary-text)");
+      if (r.o != null) {
+        line += `${line ? "L" : "M"}${cx} ${oy(r.o)} `;
+        out += `<circle cx="${cx}" cy="${oy(r.o)}" r="13" style="fill:${tempColor(r.o, s.temp_min, s.temp_max)};stroke:var(--card-bg);stroke-width:3px"/>`
+          + this._svgT(cx, oy(r.o), Math.round(r.o), 11, 800, tempInk(r.o, s.temp_min, s.temp_max));
+      }
+    });
+    return `<svg class="hs-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Running time per day, last week, with the outside temperature">
+      <path d="${line}" class="hs-outline"/>${out}</svg>`;
+  }
+
+  async _loadYearStats() {
+    if (this._yearStats || this._yearStatsLoading) return;
+    const ids = this._diagData?.entity_ids || {};
+    const stat = [ids.outdoor_temp, ...Object.values(ids.zone_temps || {})].filter(Boolean);
+    this._yearStatsLoading = true;
+    try {
+      const start = new Date(); start.setDate(1); start.setHours(0, 0, 0, 0); start.setMonth(start.getMonth() - 11);
+      const [stats, rt] = await Promise.all([
+        stat.length ? this._hass.callWS({ type: "recorder/statistics_during_period", start_time: start.toISOString(),
+          statistic_ids: stat, period: "month", types: ["mean", "min", "max"] }).catch(() => ({})) : {},
+        this._hass.callWS({ type: "gttc/get_runtime_history", days: 400 }).catch(() => null),
+      ]);
+      this._yearStats = stats || {};
+      if (rt) this._runtimeData = rt;
+    } finally {
+      this._yearStatsLoading = false;
+      if (this._activeMainTab === "history") this._repaint();
+    }
+  }
+
+  _renderHistoryYear() {
+    if (!this._yearStats) { this._loadYearStats(); return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading…</div>`; }
+    const s = this._schedule;
+    const days = this._runtimeDays();
+    const keys = Object.keys(days).sort();
+    const first = keys[0];
+    const now = new Date();
+    const todayK = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+    const months = [];
+    for (let i = 11; i >= 0; i--) { const m = new Date(now.getFullYear(), now.getMonth() - i, 1); months.push([m.getFullYear(), m.getMonth() + 1]); }
+    const MN = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const pad = n => String(n).padStart(2, "0");
+    const mix = (hex, k) => {
+      const c = hex === "heat" ? [194, 65, 12] : [29, 95, 209];
+      const t = this.hasAttribute("dark") ? [26, 29, 35] : [244, 245, 247];
+      return `rgb(${c.map((v, j) => Math.round(t[j] + (v - t[j]) * k)).join(",")})`;
+    };
+    // Every day: a square per day; no record and off are drawn differently
+    const cal = months.map(([y, m]) => {
+      const len = new Date(y, m, 0).getDate();
+      let cells = "";
+      for (let dd = 1; dd <= 31; dd++) {
+        const k = `${y}-${pad(m)}-${pad(dd)}`;
+        if (dd > len || k > todayK) { cells += `<i class="hs-c hs-c-none"></i>`; continue; }
+        const r = days[k];
+        if (!r) { cells += `<i class="hs-c hs-c-nr" title="${k} · no record"></i>`; continue; }
+        const tot = r.h + r.c;
+        if (tot < 1) { cells += `<i class="hs-c hs-c-off" title="${k} · off"></i>`; continue; }
+        const heat = r.h >= r.c, k2 = Math.min(1, 0.25 + Math.max(r.h, r.c) / 600 * 0.75);
+        cells += `<i class="hs-c ${k === todayK ? "hs-c-today" : ""}" style="background:${mix(heat ? "heat" : "cool", k2)}" title="${k} · ${this._fmtH(tot)} ${heat ? "heat" : "cool"}"></i>`;
+      }
+      const cur = y === now.getFullYear() && m === now.getMonth() + 1;
+      return `<span class="hs-ml ${cur ? "on" : ""}">${MN[m - 1]}</span><div class="hs-crow">${cells}</div>`;
+    }).join("");
+    // Monthly outside (low · average · high) and the average inside
+    const ids = this._diagData?.entity_ids || {};
+    const st = this._yearStats;
+    const byMonth = (id) => {
+      const o = {};
+      for (const r of st[id] || []) { const d0 = new Date(r.start); o[`${d0.getFullYear()}-${d0.getMonth() + 1}`] = r; }
+      return o;
+    };
+    const OUT = byMonth(ids.outdoor_temp);
+    const activeZoneId = (this._diagData?.zones || []).find(z => z.is_active)?.id;
+    const IN = byMonth((ids.zone_temps || {})[activeZoneId] || Object.values(ids.zone_temps || {})[0]);
+    const W = this._chartW(), cw = (W - 40) / 12, cx = i => +(40 + cw * i + cw / 2).toFixed(1);
+    const all = Object.values(OUT).flatMap(r => [r.min, r.max]).filter(x => x != null);
+    const TMIN = all.length ? Math.floor(Math.min(...all) / 10) * 10 : 30, TMAX = all.length ? Math.ceil(Math.max(...all) / 10) * 10 : 100;
+    const ty = t => +(190 - (t - TMIN) / Math.max(1, TMAX - TMIN) * 170).toFixed(1);
+    let tsvg = "";
+    for (let t = TMIN; t <= TMAX; t += 20) tsvg += `<line x1="40" y1="${ty(t)}" x2="${W}" y2="${ty(t)}" class="hs-grid"/>${this._svgT(32, ty(t), t + "°", 11, 600, "var(--secondary-text)", "end")}`;
+    let msvg = "";
+    const MAXH = Math.max(50, ...months.map(([y, m]) => {
+      const p = `${y}-${pad(m)}-`;
+      return keys.filter(k => k.startsWith(p)).reduce((a, k) => a + days[k].h + days[k].c, 0) / 60;
+    }));
+    months.forEach(([y, m], i) => {
+      const x = cx(i), o = OUT[`${y}-${m}`], inn = IN[`${y}-${m}`];
+      const cur = y === now.getFullYear() && m === now.getMonth() + 1;
+      const lab = (yy) => this._svgT(x, yy, MN[m - 1][0], 12, cur ? 800 : 600, cur ? "var(--primary-text)" : "var(--secondary-text)");
+      tsvg += lab(212);
+      if (o && o.mean != null) {
+        tsvg += `<line x1="${x}" y1="${ty(o.max ?? o.mean)}" x2="${x}" y2="${ty(o.min ?? o.mean)}" class="hs-range"/>`;
+        if (inn && inn.mean != null) tsvg += `<line x1="${x - 11}" y1="${ty(inn.mean)}" x2="${x + 11}" y2="${ty(inn.mean)}" class="hs-inside"/>`;
+        tsvg += `<circle cx="${x}" cy="${ty(o.mean)}" r="14" style="fill:${tempColor(o.mean, s.temp_min, s.temp_max)};stroke:var(--card-bg);stroke-width:3px"/>`
+          + this._svgT(x, ty(o.mean), Math.round(o.mean), 11, 800, tempInk(o.mean, s.temp_min, s.temp_max));
+      } else tsvg += `<line x1="${x}" y1="${ty((TMIN + TMAX) / 2) - 5}" x2="${x}" y2="${ty((TMIN + TMAX) / 2) + 5}" class="hs-nr"/>`;
+      // Hours by month
+      const p = `${y}-${pad(m)}-`, mk = keys.filter(k => k.startsWith(p));
+      msvg += this._svgT(x, 192, MN[m - 1][0], 12, cur ? 800 : 600, cur ? "var(--primary-text)" : "var(--secondary-text)");
+      if (!mk.length) { msvg += `<rect x="${x - 13}" y="132" width="26" height="36" rx="6" class="hs-nrbar"/>`; return; }
+      const h = mk.reduce((a, k) => a + days[k].h, 0) / 60, c = mk.reduce((a, k) => a + days[k].c, 0) / 60;
+      const hh = h / MAXH * 130, ch = c / MAXH * 130;
+      if (c > 0) msvg += `<rect x="${x - 13}" y="${(168 - ch).toFixed(1)}" width="26" height="${Math.max(3, ch).toFixed(1)}" rx="6" class="f-cool"/>`;
+      if (h > 0) msvg += `<rect x="${x - 13}" y="${(168 - ch - hh).toFixed(1)}" width="26" height="${Math.max(3, hh).toFixed(1)}" rx="6" class="f-heat"/>`;
+      msvg += this._svgT(x, 168 - ch - hh - 11, Math.round(h + c), 12, 800, "var(--primary-text)");
+    });
+    // Outside vs running: one dot per day
+    const sx = o => +(36 + (o - 30) / 65 * (W - 46)).toFixed(1), sy = m => +(186 - Math.min(m, 900) / 900 * 170).toFixed(1);
+    let ssvg = "";
+    for (const m of [0, 450, 900]) ssvg += `<line x1="36" y1="${sy(m)}" x2="${W}" y2="${sy(m)}" class="hs-grid"/>${this._svgT(28, sy(m), m / 60 + "h", 11, 600, "var(--secondary-text)", "end")}`;
+    for (let o = 40; o <= 90; o += 10) ssvg += this._svgT(sx(o), 206, o + "°", 11, 600, "var(--secondary-text)");
+    for (const k of keys) {
+      const r = days[k];
+      if (r.o == null) continue;
+      const cls = r.h + r.c < 1 ? "hs-dot-off" : r.h >= r.c ? "f-heat" : "f-cool";
+      ssvg += `<circle cx="${sx(r.o)}" cy="${sy(Math.max(r.h, r.c))}" r="4.5" class="${cls}" style="opacity:.75"/>`;
+    }
+    const td = days[todayK];
+    if (td?.o != null) ssvg += `<circle cx="${sx(td.o)}" cy="${sy(Math.max(td.h, td.c))}" r="10" class="hs-today"/>`;
+    const H = keys.reduce((a, k) => a + days[k].h, 0), C = keys.reduce((a, k) => a + days[k].c, 0);
+    const outs = Object.values(OUT);
+    const hot = outs.reduce((a, r) => r.max != null && (!a || r.max > a.max) ? r : a, null);
+    const cold = outs.reduce((a, r) => r.min != null && (!a || r.min < a.min) ? r : a, null);
+    const mon = r => r ? MN[new Date(r.start).getMonth()] : "";
+    const since = first ? new Date(first + "T12:00").toLocaleDateString([], { month: "short", day: "numeric" }) : "";
+    return `
+      <div class="hs-tiles hs-tiles-2">
+        ${this._histTile("fire", `${Math.round(H / 60)}h`, `Heat · since ${since}`, 1, "c-heat")}
+        ${this._histTile("snowflake", `${Math.round(C / 60)}h`, `Cool · since ${since}`, 1, "c-cool")}
+        ${this._histTile("thermometer-high", hot ? `${Math.round(hot.max)}°` : "—", `Hottest${hot ? " · " + mon(hot) : ""}`, 1)}
+        ${this._histTile("thermometer-low", cold ? `${Math.round(cold.min)}°` : "—", `Coldest${cold ? " · " + mon(cold) : ""}`, 1)}
+      </div>
+      <section class="card hs-card">
+        <div class="hs-hrow"><b class="hs-h">Every day</b>
+          <span class="hs-key"><i class="f-heatbg"></i>Heat<i class="f-coolbg"></i>Cool<i class="hs-c-off"></i>Off<i class="hs-c-nr"></i>No record</span></div>
+        <div class="hs-cal">${cal}</div>
+      </section>
+      <section class="card hs-card">
+        <div class="hs-hrow"><b class="hs-h">Outside by month</b><span class="hs-key"><i class="hs-key-in"></i>Inside</span></div>
+        <svg class="hs-svg" viewBox="0 0 ${W} 222" role="img" aria-label="Monthly outside low, average and high, with the average inside">${tsvg}</svg>
+      </section>
+      <section class="card hs-card">
+        <b class="hs-h">Hours running</b>
+        <svg class="hs-svg" viewBox="0 0 ${W} 200" role="img" aria-label="Heating and cooling hours per month">${msvg}</svg>
+      </section>
+      <section class="card hs-card">
+        <b class="hs-h">Outside vs running</b>
+        <svg class="hs-svg" viewBox="0 0 ${W} 216" role="img" aria-label="One dot per day: hours running against the outside average">${ssvg}</svg>
+      </section>`;
+  }
+
+  // ── Settings ──────────────────────────────────────────────────────────────
+  // Cards grouped by what each setting decides. A card shows its value as a
+  // picture; tapping it opens a sheet with the controls. Switches flip at once.
+
+  _settingsSections() {
+    return [
+      { id: "goals", label: "Goals", keys: ["away_temp", "cooling_comfort", "cooling_away_temp"] },
+      { id: "range", label: "Range", keys: ["temp_min", "temp_max"] },
+      { id: "hold", label: "Changes", keys: ["manual_override_minutes"] },
+      { id: "season", label: "Season switch", keys: ["auto_season_switch", "seasonal_recommend_hours", "heat_cool_ladder", "cool_lockout_temp", "heat_cool_min_gap", "heat_cool_settle_days"] },
+      { id: "presence", label: "Away when empty", keys: ["occupancy_enabled", "presence_detection", "tracked_persons"] },
+      { id: "early", label: "Start early", keys: ["precondition_enabled"] },
+      { id: "learning", label: "Learn my changes", keys: ["learning_enabled", "learning_threshold"] },
+      { id: "peak", label: "Peak rates", keys: ["tou_enabled", "tou_provider"] },
+      { id: "outside", label: "Outside", keys: ["outdoor_temp_sensor"] },
+      { id: "zones", label: "Rooms", keys: [] },
+      { id: "windows", label: "Windows", keys: [] },
+    ];
+  }
+
+  _toggle(on, attrs) {
+    return `<button class="st-sw ${on ? "on" : ""}" role="switch" aria-checked="${on}" ${attrs}><i></i></button>`;
+  }
+
+  _renderSettingsTab() {
+    if (this._settingsLoading && !this._settingsData) {
+      return `<div class="status-loading"><ha-icon icon="mdi:loading"></ha-icon> Loading…</div>`;
+    }
+    if (!this._settingsData) {
+      return `
+        <div class="status-error-box">
+          <div class="status-error-msg">${this._ic("alert-circle-outline")}
+            ${this._settingsError ? `Failed to load: <code>${this._settingsError}</code>` : "No config data available."}</div>
+          <button class="btn btn-outline" id="settingsRetryBtn">Retry</button>
+        </div>`;
+    }
+    const c = k => this._settingsData[k];
+    const s = this._schedule;
+    const d = this._diagData || {};
+    const col = t => `background:${tempColor(t, s.temp_min, s.temp_max)};color:${tempInk(t, s.temp_min, s.temp_max)}`;
+    const off = d.zone_offset;
+    const capped = k => off != null && c(k) != null && (c(k) + off > c("temp_max") + 0.25 || c(k) + off < c("temp_min") - 0.25);
+    const goalCell = (k, t) => `<button class="st-goal" data-set-open="goals" style="${col(t)}">${t}°${capped(k) ? `<i class="st-flag" title="The wall cannot reach this"></i>` : ""}</button>`;
+    const hold = c("manual_override_minutes");
+    const holdTxt = hold >= 60 ? `${+(hold / 60).toFixed(1)}h` : `${hold}m`;
+    const ladder = !!c("heat_cool_ladder");
+    const row = (id, ic, t, sub, on, toggleAttrs) => `
+      <div class="st-row">
+        <button class="st-rowb" data-set-open="${id}"><span class="st-ri">${this._ic(ic)}</span>
+          <span class="st-rt"><b>${t}</b><span>${sub}</span></span></button>
+        ${this._toggle(on, toggleAttrs)}
+      </div>`;
+    const zones = c("zones") || [];
+    const lead = this._runtimeData?.learned_ramp_minutes;
+    const outdoor = d.features?.outdoor_temp;
+    const persons = c("tracked_persons")?.length || (c("all_persons") || []).length;
+    return `
+      <div class="st">
+        <section class="card st-card" aria-label="Goals">
+          <div class="st-h">${this._ic("thermometer")}<b>Goals</b></div>
+          <div class="st-goals">
+            <span></span><span class="st-colh">${this._ic("home-outline")}Home</span><span class="st-colh">${this._ic("bag-suitcase-outline")}Away</span>
+            <span class="st-rowh c-heat">${this._ic("fire")}Heat</span>
+            <button class="st-goal st-goal-plan" data-goto="schedule">${this._ic("calendar-blank-outline")}Plan</button>
+            ${goalCell("away_temp", c("away_temp"))}
+            <span class="st-rowh c-cool">${this._ic("snowflake")}Cool</span>
+            ${goalCell("cooling_comfort", c("cooling_comfort"))}
+            ${goalCell("cooling_away_temp", c("cooling_away_temp"))}
+          </div>
+        </section>
+        <div class="st-two">
+          <button class="card st-card st-mini" data-set-open="range">
+            <div class="st-h">${this._ic("thermometer-lines")}<b>Range</b></div>
+            <div class="st-pic"><span class="st-end" style="${col(c("temp_min"))}">${c("temp_min")}</span>
+              <i class="st-grad"></i><span class="st-end" style="${col(c("temp_max"))}">${c("temp_max")}</span></div>
+            <span class="st-sub">Wall never goes past</span>
+          </button>
+          <button class="card st-card st-mini" data-set-open="hold">
+            <div class="st-h">${this._ic("timer-outline")}<b>Changes</b></div>
+            <div class="st-pic"><span class="st-end st-end-warm">${this._ic("hand-back-right-outline")}</span>
+              <i class="st-dash"></i><b class="st-mid">${holdTxt}</b><i class="st-dash"></i>
+              <span class="st-end st-end-plain">${this._ic("calendar-blank-outline")}</span></div>
+            <span class="st-sub">Then back to plan</span>
+          </button>
+        </div>
+        <section class="card st-card" aria-label="Season switch">
+          <div class="st-h">${this._ic("swap-horizontal")}<b>Season switch</b><span class="st-grow"></span>
+            <span class="st-sub">Auto</span>${this._toggle(!!c("auto_season_switch"), `data-cfg-now="auto_season_switch"`)}</div>
+          <button class="st-path" data-set-open="season">
+            <span class="st-pp st-pp-heat">${this._ic("fire")}Heat</span>
+            ${ladder ? `<span class="st-arrow"><b>${c("seasonal_recommend_hours")}h</b><i></i></span><span class="st-pp st-pp-both">${this._ic("sun-snowflake-variant")}Both</span>` : ""}
+            <span class="st-arrow">${ladder ? "" : this._ic("timer-outline")}<b>${c("seasonal_recommend_hours")}h</b><i></i></span>
+            <span class="st-pp st-pp-cool">${this._ic("snowflake")}Cool</span>
+          </button>
+          <div class="st-inrow">${this._ic("sun-snowflake-variant")}<b>Stop at Both between</b>${this._toggle(ladder, `data-cfg-now="heat_cool_ladder"`)}</div>
+          <span class="st-label">While in Both</span>
+          <div class="st-three">
+            <button class="st-mt" data-set-open="season">${this._ic("snowflake-off")}<b>${c("cool_lockout_temp")}°</b><span>AC off below</span></button>
+            <button class="st-mt" data-set-open="season">${this._ic("arrow-expand-horizontal")}<b>${c("heat_cool_min_gap")}°</b><span>Kept apart</span></button>
+            <button class="st-mt" data-set-open="season">${this._ic("calendar-check-outline")}<b>${c("heat_cool_settle_days")}d</b><span>Then one mode</span></button>
+          </div>
+        </section>
+        <section class="card st-card st-rows" aria-label="Automatic">
+          <div class="st-h">${this._ic("lightbulb-outline")}<b>Automatic</b></div>
+          ${row("plan", "calendar-blank-outline", "Follow the plan", "Goals change on schedule", !!d.schedule_enabled, `data-auto-toggle="schedule" data-on="${d.schedule_enabled ? 1 : 0}"`)}
+          ${row("presence", "account-outline", "Away when empty", "Uses Away goals", !!c("occupancy_enabled"), `data-cfg-now="occupancy_enabled"`)}
+          ${row("early", "weather-sunset-up", "Start early", lead ? `${Math.round(lead)}m before each block` : "Before each block", !!c("precondition_enabled"), `data-cfg-now="precondition_enabled"`)}
+          ${row("learning", "lightbulb-outline", "Learn my changes", `Plan adapts after ${c("learning_threshold") || 3} repeats`, !!c("learning_enabled"), `data-cfg-now="learning_enabled"`)}
+          ${row("peak", "lightning-bolt-outline", "Peak rates", "Ease off when power costs more", !!c("tou_enabled"), `data-cfg-now="tou_enabled"`)}
+        </section>
+        <section class="card st-card" aria-label="House">
+          <div class="st-h">${this._ic("home-outline")}<b>House</b></div>
+          <div class="st-four">
+            <button class="st-mt" data-set-open="zones">${this._ic("map-marker-outline")}<b>${zones.length}</b><span>Rooms</span></button>
+            <button class="st-mt" data-set-open="windows">${this._ic("window-closed-variant")}<b>${(c("window_sensors") || []).length}</b><span>Windows</span></button>
+            <button class="st-mt" data-set-open="presence">${this._ic("account-multiple-outline")}<b>${persons}</b><span>People</span></button>
+            <button class="st-mt" data-set-open="outside">${this._ic("thermometer")}<b>${outdoor != null ? Math.round(outdoor) + "°" : "—"}</b><span>Outside</span></button>
+          </div>
+        </section>
+      </div>
+      ${this._renderEntityDatalists()}
+      ${this._setSheet ? this._renderSettingsSheet() : ""}
+      ${this._setSheet ? "" : this._saveBarMarkup()}`;
+  }
+
+  _saveBarMarkup() {
+    const n = Object.keys(this._draft).length;
+    return `
+      <div class="save-bar" id="saveBar" ${n ? "" : "hidden"}>
+        <span id="saveBarText">${this._saveBarText()}</span>
+        <span class="save-bar-sp"></span>
+        <button class="btn btn-outline" id="discardAllBtn">Discard</button>
+        <button class="btn btn-primary" id="saveAllBtn">Save</button>
+      </div>`;
+  }
+
+  _renderSettingsSheet() {
+    const id = this._setSheet;
+    const sec = this._settingsSections().find(x => x.id === id);
+    let body = "", title = sec?.label || "", icon = "cog-outline";
+    switch (id) {
+      case "goals":
+        icon = "thermometer"; title = "Goals";
+        body = this._numField("away_temp", "Heat · Away", "", { min: 32, max: 100 })
+          + this._numField("cooling_comfort", "Cool · Home", "Blocks with no cool number", { min: 60, max: 85 })
+          + this._settingsClampWarning("cooling_comfort", "Cool · Home")
+          + this._numField("cooling_away_temp", "Cool · Away", "", { min: 60, max: 90 })
+          + this._settingsClampWarning("cooling_away_temp", "Cool · Away");
+        break;
+      case "range":
+        icon = "thermometer-lines";
+        body = this._numField("temp_min", "Never below", "", { min: 32, max: 99 }) + this._numField("temp_max", "Never above", "", { min: 33, max: 100 });
+        break;
+      case "hold":
+        icon = "timer-outline"; title = "Your changes last";
+        body = this._rangeField("manual_override_minutes", "Then back to plan", "", { min: 15, max: 480, step: 15, suffix: " min" });
+        break;
+      case "season":
+        icon = "swap-horizontal";
+        body = this._boolField("auto_season_switch", "Switch by itself", "")
+          + this._rangeField("seasonal_recommend_hours", "Wait before switching", "", { min: 1, max: 48, step: 1, suffix: "h" })
+          + this._boolField("heat_cool_ladder", "Stop at Both between", "")
+          + this._numField("cool_lockout_temp", "Both · AC off below", "Outside", { min: 30, max: 70, step: 1 })
+          + this._numField("heat_cool_min_gap", "Both · keep apart", "", { min: 0, max: 10, step: 0.5 })
+          + this._rangeField("heat_cool_settle_days", "Both · then one mode after", "", { min: 1, max: 30, step: 1, suffix: " d" });
+        break;
+      case "presence": icon = "account-outline"; body = this._renderSettings_presence(); break;
+      case "early":
+        icon = "weather-sunset-up";
+        body = this._boolField("precondition_enabled", "Start early", this._runtimeData?.learned_ramp_minutes ? `Learned lead ${Math.round(this._runtimeData.learned_ramp_minutes)} min` : "");
+        break;
+      case "learning": icon = "lightbulb-outline"; body = this._renderSettings_learning(); break;
+      case "peak":
+        icon = "lightning-bolt-outline";
+        body = this._boolField("tou_enabled", "Peak rates", "")
+          + this._selectField("tou_provider", "Rate plan", "", [["none", "None"], ["dominion_virginia", "Dominion Energy Virginia"]], { depends: "tou_enabled" });
+        break;
+      case "outside": {
+        icon = "thermometer"; title = "Outside sensor";
+        const sensor = this._cfg("outdoor_temp_sensor") || "";
+        body = this._row("outdoor_temp_sensor", "Sensor", "", `
+          <input type="text" class="set-entity" id="cfg-outdoor_temp_sensor" data-cfg="outdoor_temp_sensor" data-kind="entity"
+                 list="dl-temp-sensors" value="${sensor}" placeholder="sensor.outside_temperature" spellcheck="false" autocomplete="off">
+          <span class="set-reading" id="cfg-outdoor_temp_sensor-state">${this._entityReading(sensor)}</span>`);
+        break;
+      }
+      case "zones": icon = "map-marker-outline"; body = this._renderSettingsZonesCard(this._settingsData); break;
+      case "windows": icon = "window-closed-variant"; body = this._renderSettings_windows(); break;
+      default: body = "";
+    }
+    return `
+      <div class="sx-scrim" id="stScrim"></div>
+      <aside class="sx-drawer st-sheet" role="dialog" aria-label="${title}">
+        <i class="sx-grab"></i>
+        <div class="sx-drh">${this._ic(icon)}<b class="sx-title">${title}</b>
+          <button class="sx-round" id="stClose" aria-label="Close">${this._ic("close")}</button></div>
+        <div class="sx-drb st-body">${body}</div>
+        ${sec && sec.keys.length ? this._saveBarMarkup() : ""}
+      </aside>`;
+  }
+
+  async _cfgNow(key, value) {
+    try {
+      await this._hass.callWS({ type: "gttc/set_config", [key]: value });
+      this._settingsData = { ...this._settingsData, [key]: value };
+      delete this._draft[key];
+      await this._loadData();
+    } catch (err) {
+      this._showToast(`Not changed: ${err.message || err}`, "error");
+      this._render();
+    }
+  }
+
+  _attachSettingsSheetListeners() {
+    const root = this.shadowRoot;
+    root.querySelectorAll("[data-set-open]").forEach(b => b.addEventListener("click", () => {
+      const id = b.dataset.setOpen;
+      if (id === "plan") { this._activeMainTab = "schedule"; this._render(); return; }
+      this._setSheet = id;
+      this._editingZoneId = null;
+      this._zoneFormData = null;
+      this._render();
+    }));
+    root.querySelectorAll("[data-cfg-now]").forEach(b => b.addEventListener("click", () => {
+      b.disabled = true;
+      this._cfgNow(b.dataset.cfgNow, !this._settingsData?.[b.dataset.cfgNow]);
+    }));
+    const close = () => { this._setSheet = null; this._editingZoneId = null; this._zoneFormData = null; this._render(); };
+    this._addClick("stClose", close);
+    this._addClick("stScrim", close);
+  }
+
 
   _styles() {
     return `
@@ -5432,6 +6068,325 @@ class GttcPanel extends HTMLElement {
           background: var(--divider); margin: 8px auto 0; flex: none; }
         .sx-drf { padding-bottom: calc(14px + env(safe-area-inset-bottom)); }
       }
+      /* ══ v2.8.0 — phone first ══════════════════════════════════════════ */
+      .panel { max-width: 1100px; padding: 16px 16px 24px; }
+      .header { border-bottom: 0; padding: 4px 4px 0; margin-bottom: 12px; align-items: flex-end; flex-wrap: nowrap; }
+      .header h1 { font-size: 34px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.1; }
+      .header-left { flex-direction: column; align-items: flex-start; gap: 2px; }
+      .hd-eyebrow { font-size: 13px; font-weight: 600; color: var(--secondary-text); }
+      .live-chip { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px; border-radius: 999px;
+        background: var(--card-bg); font-size: 12px; font-weight: 600; color: var(--secondary-text); }
+      .live-chip i { width: 8px; height: 8px; border-radius: 999px; background: var(--success); }
+      .card { background: var(--card-bg); border-radius: 22px; border: 0; box-shadow: none; color: var(--primary-text); }
+      button.card { font: inherit; cursor: pointer; text-align: left; }
+      .c-heat { color: var(--gt-heat); } .c-cool { color: var(--gt-cool); }
+      .f-heat { fill: var(--gt-heat); } .f-cool { fill: var(--gt-cool); }
+      .dim { color: var(--secondary-text); }
+
+      /* Tabs: pills on a wide screen, a bottom bar on a phone */
+      .main-tab-bar { display: flex; gap: 6px; margin: 0 0 14px; border: 0; padding: 0; background: none; }
+      .main-tab { border: 0; border-radius: 999px; padding: 8px 16px; font: 600 14px Inter, system-ui, sans-serif; background: none;
+        color: var(--secondary-text); display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+      .main-tab ha-icon { --mdc-icon-size: 18px; }
+      .main-tab.active { background: var(--primary-text); color: var(--card-bg); }
+      @media (max-width: 760px) {
+        .panel { padding-bottom: 100px; }
+        .main-tab-bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; margin: 0; display: grid;
+          grid-template-columns: repeat(4, minmax(0, 1fr)); background: var(--card-bg); border-top: 1px solid var(--divider);
+          padding: 6px 0 calc(8px + env(safe-area-inset-bottom)); }
+        .main-tab { flex-direction: column; gap: 2px; font-size: 11px; padding: 6px 0; border-radius: 0; }
+        .main-tab ha-icon { --mdc-icon-size: 24px; }
+        .main-tab.active { background: none; color: var(--primary-text); font-weight: 800; }
+      }
+
+      /* Now */
+      .nw { display: flex; flex-direction: column; gap: 12px; }
+      .nw-alerts { display: flex; flex-direction: column; gap: 8px; }
+      .nw-alert { display: flex; align-items: center; gap: 10px; min-height: 48px; padding: 6px 8px 6px 14px; border-radius: 16px;
+        background: #fdf0e4; color: #9a3412; }
+      :host([dark]) .nw-alert { background: #3a2417; color: #ffb48a; }
+      .nw-alert ha-icon { --mdc-icon-size: 20px; flex: none; }
+      .nw-alert b { flex: 1; font-size: 15px; font-weight: 800; }
+      .nw-abtn { border: 0; border-radius: 999px; height: 36px; padding: 0 14px; font: 700 14px Inter, system-ui, sans-serif;
+        background: var(--card-bg); color: var(--primary-text); cursor: pointer; }
+      .nw-cols { display: grid; gap: 12px; }
+      @media (min-width: 900px) { .nw-cols { grid-template-columns: minmax(0, 420px) minmax(0, 1fr); align-items: start; } }
+      .nw-dialcard { padding: 14px 14px 18px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+      .dial { width: 100%; max-width: 340px; height: auto; display: block; }
+      .dial .dial-h { cursor: pointer; }
+      .nw-ctl { display: flex; align-items: center; justify-content: center; gap: 14px; width: 100%; }
+      .nw-step { width: 64px; height: 64px; flex: none; border-radius: 999px; border: 0; background: var(--bg); color: var(--primary-text);
+        display: flex; align-items: center; justify-content: center; cursor: pointer; }
+      .nw-step ha-icon { --mdc-icon-size: 28px; }
+      .nw-step:disabled { opacity: .35; cursor: default; }
+      .nw-pill { height: 48px; min-width: 96px; padding: 0 16px; border-radius: 999px; border: 0; background: var(--bg); color: var(--primary-text);
+        display: inline-flex; align-items: center; justify-content: center; gap: 8px; font: 800 18px Inter, system-ui, sans-serif; cursor: pointer; }
+      .nw-pill ha-icon { --mdc-icon-size: 20px; color: var(--secondary-text); }
+      .nw-pill-hold { background: #fdf0e4; color: #9a3412; padding-right: 6px; cursor: default; }
+      :host([dark]) .nw-pill-hold { background: #3a2417; color: #ffb48a; }
+      .nw-pill-hold ha-icon { color: inherit; }
+      .nw-pill-x { width: 36px; height: 36px; border-radius: 999px; border: 0; background: var(--card-bg); color: inherit;
+        display: flex; align-items: center; justify-content: center; cursor: pointer; }
+      .nw-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+      .nw-modes { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; padding: 6px; }
+      .nw-mode { border: 0; border-radius: 16px; height: 68px; background: none; color: var(--primary-text); cursor: pointer;
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; font: 700 14px Inter, system-ui, sans-serif; }
+      .nw-mode ha-icon { --mdc-icon-size: 22px; }
+      .nw-mode.on { background: var(--primary-text); color: var(--card-bg); }
+      .nw-mode-heat.on { background: var(--gt-heat); color: #fff; }
+      .nw-mode-cool.on { background: var(--gt-cool); color: #fff; }
+      :host([dark]) .nw-mode-heat.on, :host([dark]) .nw-mode-cool.on, :host([dark]) .sx2 .sx-v-heat[aria-pressed="true"],
+      :host([dark]) .sx2 .sx-v-cool[aria-pressed="true"], :host([dark]) .st-pp-heat, :host([dark]) .st-pp-cool { color: #0f1115; }
+      .nw-tiles { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+      .nw-tile { border: 0; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+      .nw-tile ha-icon { --mdc-icon-size: 20px; color: var(--secondary-text); }
+      .nw-tile b { font-size: 16px; font-weight: 800; line-height: 1.15; overflow-wrap: anywhere; }
+      .nw-tile span { font-size: 12px; font-weight: 600; color: var(--secondary-text); }
+      .nw-tile:disabled { cursor: default; }
+      .nw-rooms { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 8px; }
+      .nw-room { border: 0; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+      .nw-room span { font-size: 13px; font-weight: 600; color: var(--secondary-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .nw-room b { font-size: 22px; font-weight: 800; letter-spacing: -0.02em; display: flex; align-items: center; gap: 8px; }
+      .nw-room.on { box-shadow: inset 0 0 0 2.5px var(--primary-text); cursor: default; }
+      .nw-room:disabled { opacity: 1; }
+      .nw-dot { width: 10px; height: 10px; border-radius: 999px; flex: none; }
+      .now-today { padding: 14px; }
+      .nw-acts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+      .nw-act { border: 0; height: 72px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; }
+      .nw-act b { font-size: 22px; font-weight: 800; }
+      .nw-act span { font-size: 12px; font-weight: 600; color: var(--secondary-text); }
+      .nw-act ha-icon { --mdc-icon-size: 22px; }
+      .nw-act.tile-heat b { color: var(--gt-heat); } .nw-act.tile-cool b { color: var(--gt-cool); }
+
+      /* Schedule */
+      .sx2 { display: flex; flex-direction: column; gap: 12px; }
+      .sx2 .sx-plans { display: flex; gap: 8px; overflow-x: auto; margin: 0 -16px; padding: 2px 16px; scrollbar-width: none; grid-template-columns: none; }
+      .sx2 .sx-plans::-webkit-scrollbar { display: none; }
+      .sx2 .sx-plan { flex: none; width: auto; min-width: 104px; max-width: 190px; border: 0; border-radius: 18px; padding: 12px 14px; background: var(--card-bg);
+        display: flex; flex-direction: column; gap: 9px; align-items: stretch; text-align: left; cursor: pointer; box-shadow: none; }
+      .sx2 .sx-plan-on { box-shadow: inset 0 0 0 2.5px var(--primary-text); }
+      .sx2 .sx-plan-top { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+      .sx2 .sx-plan-top b { font-size: 15px; font-weight: 800; white-space: nowrap; }
+      .sx-rundot { width: 9px; height: 9px; border-radius: 999px; background: var(--success); flex: none; }
+      .sx-chkdot { width: 9px; height: 9px; border-radius: 999px; background: #ea580c; flex: none; }
+      .sx2 .sx-mini { position: relative; display: block; height: 8px; border-radius: 999px; overflow: hidden; background: var(--divider); }
+      .sx2 .sx-mini i { position: absolute; top: 0; bottom: 0; }
+      .sx2 .sx-plan-add { width: 52px; align-items: center; justify-content: center; }
+      .sx-week { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+      .sx-bar { display: flex; align-items: center; gap: 6px; }
+      .sx-grow { flex: 1; }
+      .sx2 .sx-segs { display: flex; background: var(--bg); border-radius: 999px; padding: 4px; gap: 4px; flex-wrap: nowrap; }
+      .sx2 .sx-segbtn { border: 0; border-radius: 999px; height: 36px; padding: 0 12px; display: inline-flex; align-items: center; gap: 6px;
+        font: 700 13px Inter, system-ui, sans-serif; background: none; color: var(--primary-text); cursor: pointer; white-space: nowrap; }
+      .sx2 .sx-segbtn ha-icon { --mdc-icon-size: 17px; }
+      .sx2 .sx-segbtn[aria-pressed="true"] { background: var(--primary-text); color: var(--card-bg); }
+      .sx2 .sx-v-heat[aria-pressed="true"] { background: var(--gt-heat); color: #fff; }
+      .sx2 .sx-v-cool[aria-pressed="true"] { background: var(--gt-cool); color: #fff; }
+      .sx-round { width: 40px; height: 40px; flex: none; border-radius: 999px; border: 0; background: var(--bg); color: var(--primary-text);
+        display: flex; align-items: center; justify-content: center; cursor: pointer; }
+      .sx-round:disabled { opacity: .35; cursor: default; }
+      .sx-round-ink { background: var(--primary-text); color: var(--card-bg); }
+      .sx-round:has(.sx-arm) { width: auto; padding: 0 12px; background: #fdecea; color: #b42318; font: 700 13px Inter, system-ui, sans-serif; }
+      .sx-grid { display: grid; grid-template-columns: 30px minmax(0, 1fr); row-gap: 8px; column-gap: 8px; align-items: center; }
+      .sx-dl { font-size: 13px; font-weight: 600; color: var(--secondary-text); }
+      .sx-dl.on { font-weight: 800; color: var(--primary-text); }
+      .sx-track { position: relative; height: 50px; border-radius: 12px; background: var(--bg); }
+      .sx-track-tgt { box-shadow: 0 0 0 2px var(--divider); }
+      .sx-track-gap { background: repeating-linear-gradient(135deg, var(--bg) 0 6px, var(--divider) 6px 8px); }
+      .sx2 .sx-seg { position: absolute; top: 0; bottom: 0; border: 0; border-radius: 12px; padding: 0 8px; display: flex; align-items: center;
+        gap: 6px; overflow: hidden; cursor: pointer; box-shadow: inset 0 0 0 1.5px var(--card-bg); font-family: inherit;
+        flex-direction: row; justify-content: flex-start; text-align: left; min-width: 0; }
+      .sx2 .sx-seg b { font-size: 17px; font-weight: 800; letter-spacing: -0.02em; }
+      .sx2 .sx-seg span { margin-left: auto; font-size: 11px; font-weight: 700; opacity: .7; }
+      .sx2 .sx-seg-live { box-shadow: inset 0 0 0 3px var(--primary-text); }
+      .sx2 .sx-nowline { position: absolute; top: -4px; bottom: -4px; width: 3px; margin-left: -1.5px; border-radius: 2px; background: var(--primary-text); pointer-events: none; }
+      .sx2 .sx-nowline b { display: none; }
+      .sx-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--secondary-text); }
+      .sx-axis2 { display: flex; justify-content: space-between; font-size: 11px; font-weight: 600; color: var(--secondary-text); }
+      .sx2 .sx-days { display: flex; align-items: center; gap: 8px; color: var(--secondary-text); }
+      .sx2 .sx-days ha-icon { --mdc-icon-size: 20px; }
+      .sx-issues { display: flex; flex-direction: column; gap: 6px; }
+      .sx-issue { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; font-weight: 600; color: #9a3412; }
+      .sx-issue ha-icon { --mdc-icon-size: 18px; flex: none; }
+      .sx-tools { display: flex; flex-wrap: wrap; gap: 8px; }
+      .sx-pill { height: 40px; padding: 0 14px; border-radius: 999px; border: 0; background: var(--card-bg); color: var(--primary-text);
+        display: inline-flex; align-items: center; gap: 6px; font: 700 13px Inter, system-ui, sans-serif; cursor: pointer; }
+      .sx-pill ha-icon { --mdc-icon-size: 18px; }
+      .sx-pill:disabled { opacity: .4; cursor: default; }
+      .sx-pill-ink { background: var(--primary-text); color: var(--card-bg); }
+
+      /* Sheets: from the bottom on a phone, from the side on a wide screen */
+      .sx-scrim { position: fixed; inset: 0; background: rgba(21,24,29,.38); z-index: 1000; }
+      .sx-drawer { position: fixed; z-index: 1001; background: var(--card-bg); color: var(--primary-text); display: flex; flex-direction: column;
+        left: 0; right: 0; bottom: 0; top: auto; width: auto; height: auto; max-height: 88vh; border-radius: 28px 28px 0 0;
+        padding: 10px 16px calc(16px + env(safe-area-inset-bottom)); box-shadow: 0 -12px 40px rgba(21,24,29,.18); }
+      @media (min-width: 900px) {
+        .sx-drawer { left: auto; top: 16px; right: 16px; bottom: 16px; width: 400px; max-height: none; border-radius: 24px; padding: 16px; }
+        .sx-grab { display: none; }
+      }
+      .sx-grab { align-self: center; width: 40px; height: 5px; border-radius: 999px; background: var(--divider); margin-bottom: 8px; flex: none; }
+      .sx-drawer .sx-drh { display: flex; align-items: center; gap: 8px; padding: 0 0 10px; border: 0; }
+      .sx-drawer .sx-drh ha-icon { --mdc-icon-size: 22px; }
+      .sx-drawer .sx-title { font-size: 22px; font-weight: 800; flex: 1; }
+      .sx-drawer .sx-drb { overflow-y: auto; display: flex; flex-direction: column; gap: 12px; padding: 0; flex: 0 1 auto; }
+      .sx-drawer .sx-drf { display: grid; grid-template-columns: 2fr 1fr; gap: 8px; padding: 12px 0 0; border: 0; }
+      .sx-drawer .sx-big-btn { height: 54px; border-radius: 999px; font-size: 16px; font-weight: 700; }
+      .sx-times { display: flex; align-items: center; gap: 8px; color: var(--secondary-text); }
+      .sx-time { flex: 1; }
+      .sx-time input { width: 100%; box-sizing: border-box; height: 60px; border-radius: 16px; border: 0; background: var(--bg); color: var(--primary-text);
+        font: 800 20px Inter, system-ui, sans-serif; text-align: center; }
+      .sx-dur { font-size: 13px; font-weight: 700; color: var(--secondary-text); min-width: 32px; text-align: right; }
+      .sx-note { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; color: var(--secondary-text); }
+      .sx-note ha-icon { --mdc-icon-size: 18px; }
+      .sx-note-warn { color: #9a3412; }
+      .sx-stp { display: flex; align-items: center; gap: 10px; background: var(--bg); border-radius: 16px; padding: 8px 8px 8px 14px; }
+      .sx-stp > ha-icon { --mdc-icon-size: 22px; color: var(--secondary-text); margin-right: auto; }
+      .sx-stp-heat > ha-icon { color: var(--gt-heat); } .sx-stp-cool > ha-icon { color: var(--gt-cool); }
+      .sx-drawer .sx-step { width: 48px; height: 48px; border-radius: 999px; border: 0; background: var(--card-bg); color: var(--primary-text);
+        font: 700 24px Inter, system-ui, sans-serif; cursor: pointer; }
+      .sx-chip { width: 72px; height: 48px; border-radius: 14px; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: 800; }
+      .sx-split { display: flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 600; color: var(--secondary-text); cursor: pointer; }
+      .sx-split ha-icon { --mdc-icon-size: 18px; }
+      .sx-split input { width: 20px; height: 20px; margin: 0 4px 0 0; accent-color: var(--primary-text); }
+      .sx-drawer .sx-zones { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 8px; }
+      .sx-drawer .sx-zone { border: 0; border-radius: 14px; height: 48px; background: var(--bg); color: var(--primary-text); font: 700 15px Inter, system-ui, sans-serif; cursor: pointer; display: block; padding: 0 10px; }
+      .sx-drawer .sx-zone[aria-pressed="true"] { background: var(--primary-text); color: var(--card-bg); }
+      .sx-dchips { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 5px; }
+      .sx-dchip { height: 40px; border-radius: 12px; background: var(--bg); color: var(--secondary-text); display: flex; align-items: center;
+        justify-content: center; font-size: 14px; font-weight: 800; }
+      .sx-dchip.on { background: var(--primary-text); color: var(--card-bg); }
+
+      /* History */
+      .hs { display: flex; flex-direction: column; gap: 12px; }
+      .hs-seg { display: flex; background: var(--card-bg); border-radius: 999px; padding: 4px; gap: 4px; }
+      .hs-seg button { flex: 1; border: 0; border-radius: 999px; height: 38px; font: 700 14px Inter, system-ui, sans-serif; background: none;
+        color: var(--secondary-text); cursor: pointer; }
+      .hs-seg button[aria-pressed="true"] { background: var(--primary-text); color: var(--card-bg); }
+      .hs-tiles { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+      .hs-tiles-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      @media (min-width: 900px) { .hs-tiles-2 { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+      .hs-tile { padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+      .hs-tile ha-icon { --mdc-icon-size: 20px; color: var(--secondary-text); }
+      .hs-tile ha-icon.c-heat { color: var(--gt-heat); } .hs-tile ha-icon.c-cool { color: var(--gt-cool); }
+      .hs-tile b { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }
+      .hs-tile span { font-size: 12px; font-weight: 600; color: var(--secondary-text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .hs-card { padding: 14px 16px 10px; display: flex; flex-direction: column; gap: 6px; }
+      .hs-h { font-size: 15px; font-weight: 800; }
+      .hs-hrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+      .hs-svg { width: 100%; height: auto; display: block; overflow: visible; }
+      .hs-grid { stroke: var(--divider); stroke-width: 1px; }
+      .hs-curve { fill: none; stroke: var(--primary-text); stroke-width: 2.5px; stroke-linejoin: round; stroke-linecap: round; }
+      .hs-evline { stroke: var(--divider); stroke-width: 1.2px; stroke-dasharray: 2 4; }
+      .hs-ev { fill: var(--bg); } .hs-ev-warm { fill: #fdf0e4; }
+      .hs-evi { fill: none; stroke: var(--primary-text); stroke-width: 2.4px; stroke-linecap: round; stroke-linejoin: round; }
+      .hs-evi-warm { fill: none; stroke: #9a3412; stroke-width: 2.4px; stroke-linecap: round; stroke-linejoin: round; }
+      .hs-outline { fill: none; stroke: var(--gt-accent); stroke-width: 1.5px; stroke-dasharray: 2 4; stroke-linecap: round; }
+      .hs-zero { fill: var(--divider); }
+      .hs-empty { display: flex; align-items: center; gap: 8px; padding: 30px 0; justify-content: center; color: var(--secondary-text); font-weight: 600; }
+      .hs-key { display: flex; align-items: center; gap: 4px; font-size: 11px; font-weight: 600; color: var(--secondary-text); }
+      .hs-key i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-left: 6px; }
+      .f-heatbg { background: var(--gt-heat); } .f-coolbg { background: var(--gt-cool); }
+      .hs-key .hs-key-in { width: 14px; height: 3px; background: var(--primary-text); }
+      .hs-cal { display: grid; grid-template-columns: 28px minmax(0, 1fr); row-gap: 3px; column-gap: 6px; align-items: center; }
+      .hs-ml { font-size: 11px; font-weight: 600; color: var(--secondary-text); }
+      .hs-ml.on { font-weight: 800; color: var(--primary-text); }
+      .hs-crow { display: grid; grid-template-columns: repeat(31, minmax(0, 1fr)); gap: 1.5px; }
+      .hs-c { display: block; aspect-ratio: 1; border-radius: 2px; }
+      .hs-c-none { visibility: hidden; }
+      .hs-c-nr { background: var(--bg); box-shadow: inset 0 0 0 1px var(--divider); }
+      .hs-c-off { background: var(--divider); }
+      .hs-c-today { box-shadow: 0 0 0 1.5px var(--primary-text); }
+      .hs-range { stroke: var(--divider); stroke-width: 7px; stroke-linecap: round; }
+      .hs-inside { stroke: var(--primary-text); stroke-width: 3px; stroke-linecap: round; }
+      .hs-nr { stroke: var(--divider); stroke-width: 1.5px; stroke-dasharray: 2 3; }
+      .hs-nrbar { fill: none; stroke: var(--divider); stroke-width: 1px; stroke-dasharray: 2 3; }
+      .hs-dot-off { fill: var(--divider); }
+      .hs-today { fill: none; stroke: var(--primary-text); stroke-width: 2.5px; }
+
+      /* Settings */
+      .st { display: flex; flex-direction: column; gap: 12px; }
+      .st-card { padding: 16px; display: flex; flex-direction: column; gap: 12px; border: 0; }
+      .st-h { display: flex; align-items: center; gap: 8px; }
+      .st-h > b { font-size: 17px; font-weight: 800; }
+      .st-h ha-icon { --mdc-icon-size: 20px; }
+      .st-grow { flex: 1; }
+      .st-sub { font-size: 12px; font-weight: 600; color: var(--secondary-text); }
+      .st-h .st-sub { font-size: 13px; font-weight: 700; }
+      .st-goals { display: grid; grid-template-columns: 62px minmax(0, 1fr) minmax(0, 1fr); gap: 8px; align-items: center; }
+      .st-colh, .st-rowh { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 700; color: var(--secondary-text); }
+      .st-colh { justify-content: center; }
+      .st-colh ha-icon, .st-rowh ha-icon { --mdc-icon-size: 16px; }
+      .st-rowh.c-heat { color: var(--gt-heat); } .st-rowh.c-cool { color: var(--gt-cool); }
+      .st-goal { position: relative; height: 50px; border-radius: 14px; border: 0; font: 800 21px Inter, system-ui, sans-serif; cursor: pointer;
+        display: flex; align-items: center; justify-content: center; gap: 6px; }
+      .st-goal-plan { background: var(--bg); color: var(--primary-text); font-size: 16px; }
+      .st-goal-plan ha-icon { --mdc-icon-size: 18px; }
+      .st-flag { position: absolute; top: 6px; right: 6px; width: 8px; height: 8px; border-radius: 999px; background: #fff; box-shadow: 0 0 0 2px #ea580c; }
+      .st-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+      .st-mini { text-align: left; }
+      .st-pic { display: flex; align-items: center; gap: 4px; }
+      .st-end { width: 34px; height: 34px; flex: none; border-radius: 999px; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 800; }
+      .st-end ha-icon { --mdc-icon-size: 18px; }
+      .st-end-warm { background: #fdf0e4; color: #9a3412; } .st-end-plain { background: var(--bg); color: var(--primary-text); }
+      .st-grad { flex: 1; height: 8px; border-radius: 999px; background: linear-gradient(90deg, rgb(196,218,244), rgb(251,232,204), rgb(242,182,120), rgb(222,104,40)); }
+      .st-dash { flex: 1; border-top: 2px dashed var(--divider); }
+      .st-mid { font-size: 20px; font-weight: 800; }
+      .st-path { display: flex; align-items: center; gap: 6px; border: 0; background: none; padding: 0; cursor: pointer; color: var(--primary-text); font: inherit; }
+      .st-pp { height: 40px; padding: 0 12px; border-radius: 999px; display: inline-flex; align-items: center; gap: 6px; font-size: 14px; font-weight: 800; color: #fff; flex: none; }
+      .st-pp ha-icon { --mdc-icon-size: 16px; }
+      .st-pp-heat { background: var(--gt-heat); } .st-pp-cool { background: var(--gt-cool); } .st-pp-both { background: var(--primary-text); color: var(--card-bg); }
+      .st-arrow { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 2px; min-width: 28px; }
+      .st-arrow b { font-size: 14px; font-weight: 800; }
+      .st-arrow ha-icon { --mdc-icon-size: 14px; display: none; }
+      .st-arrow i { width: 100%; height: 2px; background: var(--primary-text); position: relative; }
+      .st-arrow i::before, .st-arrow i::after { content: ""; position: absolute; top: -4px; width: 8px; height: 8px; border: solid var(--primary-text); border-width: 2px 2px 0 0; }
+      .st-arrow i::after { right: 0; transform: rotate(45deg); } .st-arrow i::before { left: 0; transform: rotate(-135deg); }
+      .st-inrow { display: flex; align-items: center; gap: 10px; background: var(--bg); border-radius: 14px; padding: 10px 12px; }
+      .st-inrow b { flex: 1; font-size: 14px; font-weight: 700; }
+      .st-inrow ha-icon { --mdc-icon-size: 18px; color: var(--secondary-text); }
+      .st-label { font-size: 13px; font-weight: 800; color: var(--secondary-text); margin-bottom: -4px; }
+      .st-three { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+      .st-four { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+      .st-mt { border: 0; background: var(--bg); color: var(--primary-text); border-radius: 14px; padding: 10px; display: flex; flex-direction: column;
+        align-items: flex-start; gap: 3px; text-align: left; min-width: 0; cursor: pointer; font: inherit; }
+      .st-mt ha-icon { --mdc-icon-size: 16px; color: var(--secondary-text); }
+      .st-mt b { font-size: 20px; font-weight: 800; }
+      .st-mt span { font-size: 12px; font-weight: 600; color: var(--secondary-text); line-height: 1.2; }
+      .st-rows { gap: 0; }
+      .st-rows .st-h { margin-bottom: 4px; }
+      .st-row { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--divider); }
+      .st-row:last-child { border-bottom: 0; }
+      .st-rowb { flex: 1; display: flex; align-items: center; gap: 12px; border: 0; background: none; padding: 0; text-align: left; color: var(--primary-text); cursor: pointer; font: inherit; min-width: 0; }
+      .st-ri { flex: none; width: 38px; height: 38px; border-radius: 12px; background: var(--bg); display: flex; align-items: center; justify-content: center; }
+      .st-ri ha-icon { --mdc-icon-size: 18px; }
+      .st-rt { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+      .st-rt b { font-size: 15px; font-weight: 800; }
+      .st-rt span { font-size: 12px; font-weight: 600; color: var(--secondary-text); }
+      .st-sw { flex: none; width: 46px; height: 28px; border-radius: 999px; border: 0; padding: 3px; display: flex; align-items: center;
+        background: var(--divider); cursor: pointer; justify-content: flex-start; }
+      .st-sw.on { background: var(--primary-text); justify-content: flex-end; }
+      .st-sw i { width: 22px; height: 22px; border-radius: 999px; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.2); }
+      .st-sw:disabled { opacity: .5; }
+      .st-sheet .set-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 0;
+        border-bottom: 1px solid var(--divider); flex-wrap: wrap; }
+      .st-sheet .set-row:last-child { border-bottom: 0; }
+      .st-sheet .set-text { flex: 1 1 140px; min-width: 0; }
+      .st-sheet .set-text label { font-size: 15px; font-weight: 800; color: var(--primary-text); }
+      .st-sheet .settings-hint { font-size: 12px; font-weight: 600; color: var(--secondary-text); margin-top: 2px; }
+      .st-sheet .set-control { display: flex; align-items: center; gap: 8px; flex: none; }
+      .st-sheet .set-num { width: 84px; height: 44px; border-radius: 12px; border: 0; background: var(--bg); color: var(--primary-text);
+        font: 800 18px Inter, system-ui, sans-serif; text-align: center; box-sizing: border-box; }
+      .st-sheet .set-select, .st-sheet .set-entity { height: 44px; border-radius: 12px; border: 0; background: var(--bg); color: var(--primary-text);
+        font: 600 16px Inter, system-ui, sans-serif; padding: 0 12px; max-width: 100%; }
+      .st-sheet .set-unit { font-size: 13px; font-weight: 700; color: var(--secondary-text); }
+      .st-sheet .set-range { accent-color: var(--primary-text); width: 150px; }
+      .st-sheet .set-out { font-size: 16px; font-weight: 800; min-width: 48px; text-align: right; }
+      .st-sheet .toggle-slider { background: var(--divider); }
+      .st-sheet .toggle-switch input:checked + .toggle-slider { background: var(--primary-text); }
+      .st-sheet input[type="checkbox"] { accent-color: var(--primary-text); }
+      .st-sheet .set-warn { font-size: 13px; font-weight: 600; color: #9a3412; background: #fdf0e4; border-radius: 12px; padding: 10px 12px; }
+      .st-sheet .set-row-dirty .set-text label::after { content: " •"; color: #ea580c; }
+      .st-sheet .save-bar { position: static; margin: 12px 0 0; border-radius: 16px; }
     `;
   }
 }

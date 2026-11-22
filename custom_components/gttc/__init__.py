@@ -35,7 +35,7 @@ _LOGGER = logging.getLogger(__name__)
 
 PANEL_URL = "/gttc_panel"
 PANEL_ICON = "mdi:calendar-clock"
-PANEL_TITLE = "GTTC"
+PANEL_TITLE = "Climate"
 FRONTEND_DIR = Path(__file__).parent / "frontend"
 
 # aiohttp static-path routes cannot be deregistered — they survive for the
