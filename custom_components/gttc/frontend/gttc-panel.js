@@ -4415,8 +4415,19 @@ class GttcPanel extends HTMLElement {
     // Goal steps over the window: the decision in force at the start, then each change
     const inWin = log.filter(e => e.t >= t0);
     const before = log.filter(e => e.t < t0).pop();
+    // Where the log does not reach (it starts at the first decision it kept),
+    // the climate entity's own recorded goal fills in — drawn, but no icon.
+    const logStart = before ? t0 : inWin.length ? inWin[0].t : now;
+    const derived = [];
+    for (const h of this._hvacHistory || []) {
+      const t = new Date(h.last_changed || h.last_updated).getTime(), a = h.attributes || {};
+      if (isNaN(t) || t >= logStart) continue;
+      const lo = a.target_temp_low ?? a.temperature, hi = a.target_temp_low != null ? a.target_temp_high : undefined;
+      if (lo == null) continue;
+      derived.push({ t: Math.max(t, t0), reason: "_recorded", target_temp: lo, target_high: hi, derived: true });
+    }
     const steps = [];
-    for (const e of [...(before ? [{ ...before, t: t0 }] : []), ...inWin]) {
+    for (const e of [...derived, ...(before ? [{ ...before, t: t0 }] : []), ...inWin]) {
       const last = steps[steps.length - 1];
       if (last && last.reason === e.reason && last.target_temp === e.target_temp && last.target_high === e.target_high) continue;
       steps.push(e);
@@ -4453,6 +4464,10 @@ class GttcPanel extends HTMLElement {
       if (!open && (a === "heating" || a === "cooling")) open = { a, s: t };
     }
     if (open) runs.push({ ...open, e: now });
+    // A heat pump cycles every few minutes; one run is anything with gaps under 15 min
+    for (let i = runs.length - 1; i > 0; i--) {
+      if (runs[i].a === runs[i - 1].a && runs[i].s - runs[i - 1].e < 15 * 60000) { runs[i - 1].e = runs[i].e; runs.splice(i, 1); }
+    }
     const runBars = runs.filter(r => r.e > t0).map(r => `<rect x="${hx(Math.max(t0, r.s))}" y="${Y0 + 8}" width="${Math.max(2, hx(r.e) - hx(Math.max(t0, r.s))).toFixed(1)}" height="6" rx="3" class="${r.a === "cooling" ? "f-cool" : "f-heat"}"/>`).join("");
     const ICON = {
       window_open: "M6 3h12a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM12 3v18M4 12h16",
@@ -4465,7 +4480,7 @@ class GttcPanel extends HTMLElement {
     };
     const warm = r => /override|window/.test(r);
     let lastX = -99;
-    const events = steps.filter(e => e.t >= t0).map(e => {
+    const events = steps.filter(e => e.t >= t0 && !e.derived).map(e => {
       const lx = hx(e.t);
       let x = lx; if (x - lastX < 28 && lastX + 28 <= X1 - 6) x = +(lastX + 28).toFixed(1); lastX = x;
       const path = ICON[e.reason] || ICON.schedule;

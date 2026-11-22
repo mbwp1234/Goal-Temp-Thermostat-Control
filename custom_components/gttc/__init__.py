@@ -89,6 +89,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinator = hass.data[DOMAIN].pop(entry.entry_id, None)
         if coordinator is not None:
             coordinator.async_shutdown_physical_override_watch()
+            await coordinator.async_save()
 
     # Unregister services and panel if no more entries
     if not hass.data.get(DOMAIN):
