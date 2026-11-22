@@ -166,6 +166,24 @@ RANGE_MISMATCH_GRACE = timedelta(seconds=60)
 RANGE_REWRITE_INTERVAL = timedelta(minutes=5)
 
 
+
+def _merge_runtime_days(rows: list) -> list:
+    """One row per date, in date order: minutes add up, outside readings average."""
+    by_date: dict[str, dict] = {}
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("date"):
+            continue
+        d = r["date"]
+        if d not in by_date:
+            by_date[d] = dict(r)
+            continue
+        a = by_date[d]
+        a["heating_min"] = round((a.get("heating_min") or 0) + (r.get("heating_min") or 0), 1)
+        a["cooling_min"] = round((a.get("cooling_min") or 0) + (r.get("cooling_min") or 0), 1)
+        o = [x for x in (a.get("avg_outdoor"), r.get("avg_outdoor")) if x is not None]
+        a["avg_outdoor"] = round(sum(o) / len(o), 2) if o else None
+    return [by_date[d] for d in sorted(by_date)]
+
 class GTTCCoordinator(DataUpdateCoordinator):
     """Central coordinator that ties together zones, schedule, learning, and thermostat control."""
 
@@ -339,6 +357,10 @@ class GTTCCoordinator(DataUpdateCoordinator):
         self._today_heating_min: float = 0.0
         self._today_cooling_min: float = 0.0
         self._today_date: str = ""
+        # Outside readings through the day, so a saved day carries its
+        # average rather than whatever it read at midnight
+        self._today_outdoor_sum: float = 0.0
+        self._today_outdoor_n: int = 0
 
         # Physical override detection — setpoint changes made at the wall unit
         # (or by anything other than GTTC) are promoted to a full manual
@@ -782,7 +804,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 except Exception:
                     pass
             if "runtime_history" in data and isinstance(data["runtime_history"], list):
-                self.runtime_history = data["runtime_history"]
+                self.runtime_history = _merge_runtime_days(data["runtime_history"])
         except Exception as err:
             _LOGGER.error("Error restoring state: %s", err)
 
@@ -3116,6 +3138,12 @@ class GTTCCoordinator(DataUpdateCoordinator):
             self._today_date = today
             self._today_heating_min = 0.0
             self._today_cooling_min = 0.0
+            self._today_outdoor_sum = 0.0
+            self._today_outdoor_n = 0
+
+        if self._outdoor_temp is not None:
+            self._today_outdoor_sum += self._outdoor_temp
+            self._today_outdoor_n += 1
 
         is_heating = self.hvac_action in (HVACAction.HEATING,)
         is_cooling = self.hvac_action in (HVACAction.COOLING,)
@@ -3173,15 +3201,26 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     self._hvac_run_start = now
                     self._hvac_run_start_temp = wall
 
+    def today_outdoor_avg(self) -> float | None:
+        """Average outside reading so far today, or the live one before any sample."""
+        if self._today_outdoor_n:
+            return round(self._today_outdoor_sum / self._today_outdoor_n, 2)
+        return self._outdoor_temp
+
     def _save_daily_runtime(self, date: str) -> None:
-        """Append the current day's runtime totals to the history."""
-        self.runtime_history.append({
+        """Append the current day's runtime totals to the history.
+
+        A day already in the history (a restart can roll the same date over
+        twice) is merged into its row rather than added as a second one.
+        """
+        row = {
             "date": date,
             "heating_min": round(self._today_heating_min, 1),
             "cooling_min": round(self._today_cooling_min, 1),
-            "avg_outdoor": self._outdoor_temp,
-        })
-        if len(self.runtime_history) > RUNTIME_HISTORY_MAX_DAYS:
+            "avg_outdoor": self.today_outdoor_avg(),
+        }
+        self.runtime_history = _merge_runtime_days(self.runtime_history + [row])
+        while len(self.runtime_history) > RUNTIME_HISTORY_MAX_DAYS:
             self.runtime_history.pop(0)
 
     async def _notify_heating_failure(

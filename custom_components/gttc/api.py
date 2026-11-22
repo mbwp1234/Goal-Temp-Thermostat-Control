@@ -870,11 +870,21 @@ async def ws_get_diagnostics(
     reg_entries = er.async_entries_for_config_entry(ent_reg, coordinator.config_entry.entry_id)
     climate_entity_id = None
     active_zone_temp_entity_id = None
+    outdoor_temp_entity_id = None
+    zone_temp_entity_ids: dict[str, str] = {}
+    zone_prefix = f"{DOMAIN}_{coordinator.config_entry.entry_id}_zone_"
     for reg_entry in reg_entries:
         if reg_entry.domain == "climate":
             climate_entity_id = reg_entry.entity_id
-        if reg_entry.domain == "sensor" and "active_zone_temp" in reg_entry.unique_id:
+        if reg_entry.domain != "sensor":
+            continue
+        uid = reg_entry.unique_id or ""
+        if "active_zone_temp" in uid:
             active_zone_temp_entity_id = reg_entry.entity_id
+        elif uid.endswith("_outdoor_temp"):
+            outdoor_temp_entity_id = reg_entry.entity_id
+        elif uid.startswith(zone_prefix) and uid.endswith("_temp"):
+            zone_temp_entity_ids[uid[len(zone_prefix):-len("_temp")]] = reg_entry.entity_id
 
     # Thermostat state
     thermostat_state = hass.states.get(coordinator.thermostat_entity)
@@ -996,6 +1006,9 @@ async def ws_get_diagnostics(
         "entity_ids": {
             "climate": climate_entity_id,
             "active_zone_temp": active_zone_temp_entity_id,
+            # Long-term statistics for the History year view (v2.8.0)
+            "outdoor_temp": outdoor_temp_entity_id,
+            "zone_temps": zone_temp_entity_ids,
         },
         "windows": {
             "open": coordinator._are_windows_open(),
@@ -1631,7 +1644,7 @@ async def ws_get_runtime_history(
             "date": coordinator._today_date,
             "heating_min": round(coordinator._today_heating_min, 1),
             "cooling_min": round(coordinator._today_cooling_min, 1),
-            "avg_outdoor": coordinator._outdoor_temp,
+            "avg_outdoor": coordinator.today_outdoor_avg(),
         },
         "learned_ramp_minutes": round(coordinator._learned_ramp_minutes, 1),
     })

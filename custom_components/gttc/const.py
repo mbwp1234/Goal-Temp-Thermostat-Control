@@ -254,7 +254,8 @@ BOOST_TYPES = {
 }
 
 # Daily runtime history
-RUNTIME_HISTORY_MAX_DAYS = 90
+# A year and a bit, so the panel can draw a whole year of days (v2.8.0)
+RUNTIME_HISTORY_MAX_DAYS = 400
 
 # Storage keys
 STORAGE_KEY = f"{DOMAIN}_data"
