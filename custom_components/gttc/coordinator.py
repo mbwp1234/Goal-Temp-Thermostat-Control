@@ -361,6 +361,7 @@ class GTTCCoordinator(DataUpdateCoordinator):
         # average rather than whatever it read at midnight
         self._today_outdoor_sum: float = 0.0
         self._today_outdoor_n: int = 0
+        self._last_runtime_save: datetime | None = None
 
         # Physical override detection — setpoint changes made at the wall unit
         # (or by anything other than GTTC) are promoted to a full manual
@@ -805,6 +806,9 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     pass
             if "runtime_history" in data and isinstance(data["runtime_history"], list):
                 self.runtime_history = _merge_runtime_days(data["runtime_history"])
+            if isinstance(data.get("action_log"), list):
+                self.action_log = [e for e in data["action_log"] if isinstance(e, dict) and e.get("ts")][-ACTION_LOG_MAX:]
+            self._restore_today_runtime(data.get("today_runtime"))
         except Exception as err:
             _LOGGER.error("Error restoring state: %s", err)
 
@@ -857,6 +861,16 @@ class GTTCCoordinator(DataUpdateCoordinator):
                 ),
                 "ramp_history": [r.to_dict() for r in self.ramp_history],
                 "runtime_history": self.runtime_history[-RUNTIME_HISTORY_MAX_DAYS:],
+                # Survive a restart: the decisions behind History's 24h chart,
+                # and the day's running minutes so far (v2.8.1)
+                "action_log": list(self.action_log[-ACTION_LOG_MAX:]),
+                "today_runtime": {
+                    "date": self._today_date,
+                    "heating_min": round(self._today_heating_min, 1),
+                    "cooling_min": round(self._today_cooling_min, 1),
+                    "outdoor_sum": round(self._today_outdoor_sum, 2),
+                    "outdoor_n": self._today_outdoor_n,
+                },
             }
             await self._store.async_save(data)
         except Exception as err:
@@ -3155,6 +3169,11 @@ class GTTCCoordinator(DataUpdateCoordinator):
         elif is_cooling:
             self._today_cooling_min += 0.5
 
+        # Save every ten minutes so a restart loses at most that much
+        if self._last_runtime_save is None or now - self._last_runtime_save >= timedelta(minutes=10):
+            self._last_runtime_save = now
+            await self.async_save()
+
         # Track start of HVAC run for failure detection — against the
         # thermostat's own reading, the one its setpoint is judged by
         wall = self._get_thermostat_current_temp()
@@ -3200,6 +3219,31 @@ class GTTCCoordinator(DataUpdateCoordinator):
                     # Reset so we don't spam — check again after another full window
                     self._hvac_run_start = now
                     self._hvac_run_start_temp = wall
+
+    def _restore_today_runtime(self, tr: Any) -> None:
+        """Put back the day's minutes after a restart.
+
+        The same day carries on where it stopped; a day that ended while Home
+        Assistant was down is written to the history it never reached.
+        """
+        if not isinstance(tr, dict) or not tr.get("date"):
+            return
+        today = datetime.now(timezone.utc).astimezone().strftime("%Y-%m-%d")
+        try:
+            heat = float(tr.get("heating_min") or 0)
+            cool = float(tr.get("cooling_min") or 0)
+            osum = float(tr.get("outdoor_sum") or 0)
+            on = int(tr.get("outdoor_n") or 0)
+        except (TypeError, ValueError):
+            return
+        self._today_heating_min, self._today_cooling_min = heat, cool
+        self._today_outdoor_sum, self._today_outdoor_n = osum, on
+        self._today_date = tr["date"]
+        if tr["date"] != today:
+            self._save_daily_runtime(tr["date"])
+            self._today_date = today
+            self._today_heating_min = self._today_cooling_min = 0.0
+            self._today_outdoor_sum, self._today_outdoor_n = 0.0, 0
 
     def today_outdoor_avg(self) -> float | None:
         """Average outside reading so far today, or the live one before any sample."""
