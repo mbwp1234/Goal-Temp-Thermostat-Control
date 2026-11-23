@@ -4825,7 +4825,7 @@ class GttcPanel extends HTMLElement {
 
   _settingsSections() {
     return [
-      { id: "goals", label: "Goals", keys: ["away_temp", "cooling_comfort", "cooling_away_temp"] },
+      { id: "goals", label: "Goals", keys: ["away_temp", "cooling_away_temp", "heat_cool_min_gap", "cooling_comfort"] },
       { id: "range", label: "Range", keys: ["temp_min", "temp_max"] },
       { id: "hold", label: "Changes", keys: ["manual_override_minutes"] },
       { id: "season", label: "Season switch", keys: ["auto_season_switch", "seasonal_recommend_hours", "heat_cool_ladder", "cool_lockout_temp", "heat_cool_min_gap", "heat_cool_settle_days"] },
@@ -4861,7 +4861,28 @@ class GttcPanel extends HTMLElement {
     const col = t => `background:${tempColor(t, s.temp_min, s.temp_max)};color:${tempInk(t, s.temp_min, s.temp_max)}`;
     const off = d.zone_offset;
     const capped = k => off != null && c(k) != null && (c(k) + off > c("temp_max") + 0.25 || c(k) + off < c("temp_min") - 0.25);
-    const goalCell = (k, t) => `<button class="st-goal" data-set-open="goals" style="${col(t)}">${t}°${capped(k) ? `<i class="st-flag" title="The wall cannot reach this"></i>` : ""}</button>`;
+    // What the room can actually reach when the wall stops at its range
+    const reach = k => {
+      if (!capped(k)) return "";
+      const hi = c(k) + off > c("temp_max");
+      const v = +(hi ? c("temp_max") - off : c("temp_min") - off).toFixed(1);
+      return `<span class="st-cap">${this._ic(hi ? "format-vertical-align-top" : "format-vertical-align-bottom")}${hi ? "max" : "min"} ${v}°</span>`;
+    };
+    // The plan's own goals, across every day of the plan that runs
+    const planOn = !!d.schedule_enabled || !!this._schedule?.enabled;
+    const span = (f) => {
+      const v = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+        .flatMap(day => this._getEntriesForDay(day)).map(f).filter(x => x != null);
+      if (!v.length) return null;
+      const lo = Math.min(...v), hi = Math.max(...v);
+      return lo === hi ? `${lo}°` : `${lo}–${hi}°`;
+    };
+    const heatPlan = span(e => e.target_temp);
+    const coolPlan = span(e => e.cooling_temp ?? c("cooling_comfort"));
+    const side = (ic, lbl, body, attrs) => `<button class="st-ss" ${attrs}><span class="st-sh">${this._ic(ic)}${lbl}</span>${body}</button>`;
+    const big = (t, ic) => `<b class="st-sv">${ic ? this._ic(ic) : ""}${t}</b>`;
+    const homeSide = (txt) => side("home-outline", "Home", planOn && txt ? big(txt, "calendar-blank-outline") : big("Off", "calendar-remove-outline"), `data-goto="schedule"`);
+    const strip = (cls, ic, lbl, home, away) => `<div class="st-strip ${cls}"><span class="st-sl">${this._ic(ic)}${lbl}</span>${home}${away}</div>`;
     const hold = c("manual_override_minutes");
     const holdTxt = hold >= 60 ? `${+(hold / 60).toFixed(1)}h` : `${hold}m`;
     const ladder = !!c("heat_cool_ladder");
@@ -4879,15 +4900,16 @@ class GttcPanel extends HTMLElement {
       <div class="st">
         <section class="card st-card" aria-label="Goals">
           <div class="st-h">${this._ic("thermometer")}<b>Goals</b></div>
-          <div class="st-goals">
-            <span></span><span class="st-colh">${this._ic("home-outline")}Home</span><span class="st-colh">${this._ic("bag-suitcase-outline")}Away</span>
-            <span class="st-rowh c-heat">${this._ic("fire")}Heat</span>
-            <button class="st-goal st-goal-plan" data-goto="schedule">${this._ic("calendar-blank-outline")}Plan</button>
-            ${goalCell("away_temp", c("away_temp"))}
-            <span class="st-rowh c-cool">${this._ic("snowflake")}Cool</span>
-            ${goalCell("cooling_comfort", c("cooling_comfort"))}
-            ${goalCell("cooling_away_temp", c("cooling_away_temp"))}
-          </div>
+          ${strip("st-heat", "fire", "Heat",
+            homeSide(heatPlan),
+            side("bag-suitcase-outline", "Away", big(`${c("away_temp")}°`) + reach("away_temp"), `data-set-open="goals"`))}
+          ${strip("st-cool", "snowflake", "Cool",
+            homeSide(coolPlan),
+            side("bag-suitcase-outline", "Away", big(`${c("cooling_away_temp")}°`) + reach("cooling_away_temp"), `data-set-open="goals"`))}
+          ${strip("st-both", "swap-horizontal", "Both",
+            side("home-outline", "Home", big(planOn ? "Plan" : "Off", planOn ? "calendar-blank-outline" : "calendar-remove-outline")
+              + `<span class="st-cap">${this._ic("arrow-left-right")}${c("heat_cool_min_gap") ?? 3}° apart</span>`, `data-set-open="goals"`),
+            side("bag-suitcase-outline", "Away", `<b class="st-sv"><span class="c-heat">${c("away_temp")}</span><i class="st-bandi"></i><span class="c-cool">${c("cooling_away_temp")}</span></b>` + reach("cooling_away_temp"), `data-set-open="goals"`))}
         </section>
         <div class="st-two">
           <button class="card st-card st-mini" data-set-open="range">
@@ -4963,10 +4985,11 @@ class GttcPanel extends HTMLElement {
       case "goals":
         icon = "thermometer"; title = "Goals";
         body = this._numField("away_temp", "Heat · Away", "", { min: 32, max: 100 })
-          + this._numField("cooling_comfort", "Cool · Home", "Blocks with no cool number", { min: 60, max: 85 })
-          + this._settingsClampWarning("cooling_comfort", "Cool · Home")
           + this._numField("cooling_away_temp", "Cool · Away", "", { min: 60, max: 90 })
-          + this._settingsClampWarning("cooling_away_temp", "Cool · Away");
+          + this._settingsClampWarning("cooling_away_temp", "Cool · Away")
+          + this._numField("heat_cool_min_gap", "Both · keep apart", "", { min: 0, max: 10, step: 0.5 })
+          + this._numField("cooling_comfort", "Cool · backup", "Plan blocks with no cool goal", { min: 60, max: 85 })
+          + this._settingsClampWarning("cooling_comfort", "Cool · backup");
         break;
       case "range":
         icon = "thermometer-lines";
@@ -6487,6 +6510,24 @@ class GttcPanel extends HTMLElement {
       .st-grow { flex: 1; }
       .st-sub { font-size: 12px; font-weight: 600; color: var(--secondary-text); }
       .st-h .st-sub { font-size: 13px; font-weight: 700; }
+      .st-strip { display: flex; align-items: stretch; border-radius: 16px; overflow: hidden; }
+      .st-heat { background: color-mix(in srgb, var(--gt-heat) 12%, transparent); color: var(--gt-heat); }
+      .st-cool { background: color-mix(in srgb, var(--gt-cool) 13%, transparent); color: var(--gt-cool); }
+      .st-both { background: linear-gradient(90deg, color-mix(in srgb, var(--gt-heat) 12%, transparent), color-mix(in srgb, var(--gt-cool) 13%, transparent)); color: var(--primary-text); }
+      .st-sl { width: 62px; flex: none; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px; font-size: 12px; font-weight: 800; }
+      .st-sl ha-icon { --mdc-icon-size: 20px; }
+      .st-ss { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px; padding: 10px 4px; border: 0;
+        border-left: 1px solid color-mix(in srgb, var(--primary-text) 8%, transparent); background: none; color: inherit; font: inherit; cursor: pointer; }
+      .st-sh { display: flex; align-items: center; gap: 5px; font-size: 12px; font-weight: 700; color: var(--secondary-text); }
+      .st-sh ha-icon { --mdc-icon-size: 14px; }
+      .st-sv { display: flex; align-items: center; gap: 5px; font-size: 20px; font-weight: 800; letter-spacing: -0.01em; white-space: nowrap; }
+      .st-sv ha-icon { --mdc-icon-size: 15px; }
+      .st-sv .c-heat { color: var(--gt-heat); } .st-sv .c-cool { color: var(--gt-cool); }
+      .st-bandi { width: 14px; height: 3px; border-radius: 2px; background: linear-gradient(90deg, var(--gt-heat), var(--gt-cool)); display: block; }
+      .st-cap { display: flex; align-items: center; gap: 3px; font-size: 11px; font-weight: 700; opacity: .85; }
+      .st-cap ha-icon { --mdc-icon-size: 12px; }
+      .st-both .st-cap { color: var(--secondary-text); opacity: 1; }
+      .st-both .st-ss:last-child .st-cap { color: var(--gt-cool); opacity: .85; }
       .st-goals { display: grid; grid-template-columns: 62px minmax(0, 1fr) minmax(0, 1fr); gap: 8px; align-items: center; }
       .st-colh, .st-rowh { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 700; color: var(--secondary-text); }
       .st-colh { justify-content: center; }
