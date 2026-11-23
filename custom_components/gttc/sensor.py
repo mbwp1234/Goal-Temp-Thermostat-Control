@@ -40,9 +40,7 @@ async def async_setup_entry(
     entities: list[SensorEntity] = [
         ActiveZoneTempSensor(coordinator, config_entry, name, temp_unit),
         OverrideRemainingSensor(coordinator, config_entry, name),
-        LearnedPatternsSensor(coordinator, config_entry, name),
         OutdoorTempSensor(coordinator, config_entry, name, temp_unit),
-        TOURateSensor(coordinator, config_entry, name),
         SeasonRecommendationSensor(coordinator, config_entry, name),
     ]
 
@@ -126,29 +124,6 @@ class OverrideRemainingSensor(CoordinatorEntity, SensorEntity):
         return {
             "override_source": source,
             "from_thermostat": source == OVERRIDE_SOURCE_PHYSICAL,
-        }
-
-
-class LearnedPatternsSensor(CoordinatorEntity, SensorEntity):
-    """Shows the number of learned schedule patterns."""
-
-    _attr_has_entity_name = True
-    _attr_icon = "mdi:brain"
-
-    def __init__(self, coordinator, config_entry, name):
-        super().__init__(coordinator)
-        self._attr_name = f"{name} Learned Patterns"
-        self._attr_unique_id = f"{DOMAIN}_{config_entry.entry_id}_learned_patterns"
-
-    @property
-    def native_value(self) -> int:
-        return len(self.coordinator.learning.learned_entries)
-
-    @property
-    def extra_state_attributes(self):
-        return {
-            "patterns": self.coordinator.learning.learned_entries,
-            "total_events": len(self.coordinator.learning.events),
         }
 
 
@@ -265,33 +240,4 @@ class SeasonRecommendationSensor(CoordinatorEntity, SensorEntity):
                 0.0,
                 round(coord.season_threshold_hours - coord.season_conditions_hours, 1),
             ) if coord.season_conditions_hours > 0 else None,
-        }
-
-
-class TOURateSensor(CoordinatorEntity, SensorEntity):
-    """Shows the current TOU rate period."""
-
-    _attr_has_entity_name = True
-    _attr_icon = "mdi:cash-clock"
-
-    def __init__(self, coordinator, config_entry, name):
-        super().__init__(coordinator)
-        self._attr_name = f"{name} TOU Rate Period"
-        self._attr_unique_id = f"{DOMAIN}_{config_entry.entry_id}_tou_rate"
-
-    @property
-    def native_value(self) -> str | None:
-        data = self.coordinator.data or {}
-        return data.get("tou_rate_period")
-
-    @property
-    def extra_state_attributes(self):
-        provider = self.coordinator.tou_provider
-        minutes_to_peak = provider.minutes_until_on_peak()
-        minutes_to_off = provider.minutes_until_off_peak()
-        return {
-            "provider": provider.name,
-            "enabled": self.coordinator.tou_enabled,
-            "minutes_until_on_peak": minutes_to_peak,
-            "minutes_until_off_peak": minutes_to_off,
         }

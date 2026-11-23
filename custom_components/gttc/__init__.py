@@ -1,4 +1,4 @@
-"""Goal Temp Thermostat Control (GTTC) - Smart zone-aware thermostat with learning and scheduling."""
+"""Goal Temp Thermostat Control (GTTC) - Smart zone-aware thermostat with scheduling."""
 from __future__ import annotations
 
 import logging
@@ -21,7 +21,6 @@ from .const import (
     PLATFORMS,
     SERVICE_ASSIGN_SENSOR,
     SERVICE_CANCEL_OVERRIDE,
-    SERVICE_CLEAR_LEARNED,
     SERVICE_REMOVE_SENSOR,
     SERVICE_SET_PRESET,
     SERVICE_SET_SCHEDULE,
@@ -96,7 +95,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         for service in (
             SERVICE_SET_ZONE_TEMP,
             SERVICE_SET_SCHEDULE,
-            SERVICE_CLEAR_LEARNED,
             SERVICE_SET_PRESET,
             SERVICE_ASSIGN_SENSOR,
             SERVICE_REMOVE_SENSOR,
@@ -219,13 +217,6 @@ def _register_services(hass: HomeAssistant) -> None:
             coordinator.scheduler.set_day_schedule(day, entries)
         await coordinator.async_save()
 
-    async def handle_clear_learned(call: ServiceCall) -> None:
-        coordinator = _get_coordinator(hass, call.data.get("entry_id"))
-        if coordinator is None:
-            _LOGGER.error("No GTTC instance found")
-            return
-        coordinator.learning.clear_learned()
-        await coordinator.async_save()
 
     async def handle_set_preset(call: ServiceCall) -> None:
         preset = call.data["preset"]
@@ -270,17 +261,6 @@ def _register_services(hass: HomeAssistant) -> None:
                         )
                     ],
                 ),
-                vol.Optional("entry_id"): cv.string,
-            }
-        ),
-    )
-
-    hass.services.async_register(
-        DOMAIN,
-        SERVICE_CLEAR_LEARNED,
-        handle_clear_learned,
-        schema=vol.Schema(
-            {
                 vol.Optional("entry_id"): cv.string,
             }
         ),

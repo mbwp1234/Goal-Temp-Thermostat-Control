@@ -1,20 +1,18 @@
 # Goal Temp Thermostat Control (GTTC)
 
-A smart, zone-aware thermostat integration for Home Assistant (HACS). Control your thermostat using temperature sensors from different rooms/floors, with intelligent scheduling, occupancy detection, TOU rate optimization, and automatic pattern learning.
+A zone-aware thermostat integration for Home Assistant (HACS). GTTC steers your real thermostat by the temperature of the room you care about, on a schedule, and is written to be gentle on a heat pump.
 
 ## Features
 
-- **Zone-Based Control** — Group temperature sensors by floor/room, average their readings, and target specific zones throughout the day
-- **Auto-Discovery** — Automatically finds temperature and occupancy sensors from your Home Assistant areas, or add zones manually
-- **Smart Scheduling** — Weekday/weekend schedules, per-day schedules, and built-in presets (Home, Away, Work From Home, Sleep). Drag-to-resize blocks, bulk add, copy entries or entire days, import/export as JSON, undo/redo
-- **Pattern Learning** — Automatically detects when you make similar temperature adjustments at similar times and creates schedule entries for you (configurable threshold, default: 3 similar events)
-- **Presence Detection** — Uses HA's built-in `person` entities (zone.home) and/or room occupancy sensors to detect if anyone is home. Three modes: Person entities only, Occupancy sensors only, or Both (recommended). Drops to away temperature when nobody is home, with per-zone overrides
-- **Manual Override** — Any manual temperature change takes priority for a configurable period (default: 2 hours, configurable 15–480 min), then resumes automation. This includes changes made directly on the physical thermostat — turning the dial at the wall holds for the same duration instead of being overwritten on the next update cycle
-- **TOU Rate Optimization** — Adjusts the thermostat setpoint during on-peak electricity hours to reduce energy cost. Supports Dominion Energy Virginia's Off-Peak Plan schedule with correct summer/winter windows
-- **Pre-conditioning** — Starts ramping toward the next schedule entry before it begins, so the house reaches comfort temperature right on time
-- **Window/Door Sensors** — Automatically pauses heating and cooling when a window or door is detected open. Supports multiple sensors and a manual suspend toggle
-- **Mirror HVAC Modes** — Exposes the same heat/cool/auto modes as your real thermostat, including heat pump and aux heat support
-- **Command Center** — Sidebar panel with live automation toggles, zone temperatures, TOU rate display, temperature history chart with HVAC state and on-peak overlays, and the full schedule editor — all in one view
+- **Zone-Based Control** — Group temperature sensors by floor/room, average their readings, and target a specific zone per schedule block. The wall setpoint is offset so the *zone* reaches the goal; the offset is smoothed (the wall reports whole degrees) and saved across restarts.
+- **Scheduling** — Plans (Home, Away, Sleep, plus your own), weekday/weekend or per-day, overnight blocks as one block, import/export as JSON, undo/redo
+- **Holds** — Any change you make, on a dashboard or at the wall, holds for a configurable period (default 2 hours, 15–480 min) and then the plan resumes. A hold never rewrites the plan.
+- **Seasons** — Heat, Cool, or Heat/Cool (both at once), with an optional demand-based automatic switch
+- **Heat-pump friendly** — A rise in the heat setpoint is stepped in 0.5° at a time, at most every 10 minutes, starting from the room's own reading, so the compressor carries it rather than the electric strips. Holds and boosts skip the ramp. Boosts are small (+2° / +1°).
+- **Quiet restarts** — After a restart nothing is written until the watched zone has a reading (or a saved offset to steer by), so the wall does not see the bare goal and then the offset goal seconds later.
+- **Window/Door Sensors** — Parks heating and cooling while a window or door is open
+- **Vacation** — A dated setback that ends by itself
+- **Sidebar panel** — Now (dial, steppers, mode), Schedule, History (week and year) and Settings, built for a phone first
 
 ## Installation
 
@@ -37,21 +35,17 @@ A smart, zone-aware thermostat integration for Home Assistant (HACS). Control yo
 2. Search for **Goal Temp Thermostat Control**
 3. Follow the setup wizard:
    - **Step 1**: Name your thermostat, select your real thermostat entity, choose temperature units and range
-   - **Step 2**: Configure zones — auto-discover from HA areas or add manually with temperature/occupancy sensors
-   - **Step 3**: Enable/disable features — learning, occupancy, presence detection method, away temp, override duration
+   - **Step 2**: Configure zones — auto-discover from HA areas or add manually
+   - **Step 3**: Away temperatures, hold duration, outdoor sensor
 
-## Command Center
+## The panel
 
-After installation a **GTTC** entry appears in the Home Assistant sidebar. The Command Center shows everything on one page:
+A **Climate** entry appears in the sidebar:
 
-- **Stat cards** — Live zone temperature, goal temperature, HVAC action, and active schedule entry
-- **Automation Controls** — Toggle grid to enable/disable Schedule, Learning, Presence, TOU Optimization, Pre-conditioning, and Window Suspend without leaving the page. Each card shows a live status badge (e.g. current TOU rate period, pattern count, home/away state)
-- **Quick Panel** — Active zone selector, override banner with cancel button, per-zone temperatures with occupancy indicators, current TOU rate period, and window sensor status
-- **Temperature Chart** — 24-hour zone temperature history with:
-  - Schedule goal step-function overlay
-  - HVAC state bands (orange = heating, blue = cooling)
-  - On-peak hour shading (when TOU is enabled)
-- **Schedule** — Every plan as a card (the running one marked), the chosen plan's day drawn from 6 AM so a night is one block, each block's goal and the room it is measured in, what the thermostat will do with it in each season, and a list of gaps and blocks with no room. Days are edited together (every day, weekdays/weekends, or each day) in a side editor, and each save is one undo step
+- **Now** — the zone temperature on a dial with the goal as its handle, − / + to hold, Heat · Both · Cool · Off, the plan, room and pause, every room's temperature, today's plan, and boosts
+- **Schedule** — every plan, the week as colour bars, and a sheet to edit a block; each save is one undo step
+- **History** — heating/cooling time per day against the outside temperature, by week or by year; tap a chart to read it
+- **Settings** — goals, range, hold length, the season switch, rooms, windows and the outdoor sensor
 
 ## Entities Created
 
@@ -60,8 +54,6 @@ After installation a **GTTC** entry appears in the Home Assistant sidebar. The C
 | `climate.gttc` | Climate | Main virtual thermostat — set temp, change modes, activate presets |
 | `select.gttc_active_zone` | Select | Pick which floor/room zone to target |
 | `select.gttc_schedule_mode` | Select | Switch between Weekday/Weekend and Per Day scheduling |
-| `switch.gttc_learning` | Switch | Toggle the pattern learning engine |
-| `switch.gttc_occupancy_mode` | Switch | Toggle occupancy-based temperature control |
 | `switch.gttc_schedule` | Switch | Toggle the schedule on/off |
 | `switch.gttc_windows_open` | Switch | Manually suspend HVAC (windows open override) |
 | `number.gttc_away_temperature` | Number | Set the away/eco temperature |
@@ -69,7 +61,6 @@ After installation a **GTTC** entry appears in the Home Assistant sidebar. The C
 | `sensor.gttc_active_zone_temperature` | Sensor | Current averaged temp of the active zone |
 | `sensor.gttc_*_temperature` | Sensor | Per-zone averaged temperature sensors |
 | `sensor.gttc_override_remaining` | Sensor | Minutes remaining on manual override |
-| `sensor.gttc_learned_patterns` | Sensor | Count of learned schedule patterns |
 
 ## Services
 
@@ -108,13 +99,7 @@ Activate a schedule preset.
 ```yaml
 service: gttc.set_preset
 data:
-  preset: work_from_home  # home, away, work_from_home, sleep
-```
-
-### `gttc.clear_learned_schedule`
-Clear all learned patterns from the learning engine.
-```yaml
-service: gttc.clear_learned_schedule
+  preset: sleep  # home, away, sleep, or a plan of your own
 ```
 
 ## How It Works
@@ -122,55 +107,33 @@ service: gttc.clear_learned_schedule
 ### Priority System
 Temperature decisions follow this priority (highest first):
 1. **Windows Open** — If a window/door sensor is open (or manual suspend is on), HVAC is paused entirely
-2. **Manual Override** — Any temp change you make holds for the override duration (default 2hr, configurable 15–480 min). Changes made on the physical thermostat count too — GTTC watches the real thermostat's setpoint and promotes any change it didn't make into a full override
-3. **Presence/Occupancy** — If enabled and nobody is detected home, drops to away temperature
-4. **Schedule** — Follows the active schedule/preset
-5. **Last Setting** — Maintains the last known target temperature
-
-### TOU Rate Optimization
-When enabled with the Dominion Energy Virginia provider, GTTC adjusts the thermostat setpoint during on-peak hours to reduce HVAC runtime and lower your electricity bill:
-
-| Season | On-Peak Hours (Weekdays) |
-|--------|--------------------------|
-| Summer (May–Sep) | 3:00 PM – 6:00 PM |
-| Winter (Oct–Apr) | 6:00 AM – 9:00 AM and 5:00 PM – 8:00 PM |
-
-- Weekends and holidays (New Year's Day, Memorial Day, Independence Day, Labor Day, Thanksgiving, Christmas) are always off-peak
-- Super off-peak (midnight–5 AM every day) is used for pre-conditioning
-- On-peak windows are visually overlaid on the schedule editor and temperature chart
+2. **Hold** — Any temp change you make holds for the hold duration (default 2hr, configurable 15–480 min). Changes made on the physical thermostat count too — GTTC watches the real thermostat's setpoint and promotes any change it didn't make into a hold
+3. **Vacation** — A dated setback
+4. **Schedule** — Follows the running plan
+5. **Last Setting** — Keeps the last goal (cooling: the cooling backup goal)
 
 ### Seasons: Heat, Heat/Cool, Cool
 
 A season picks which of a schedule block's two numbers runs (its heating target or its cooling target) and puts the thermostat in that mode. **Heat/Cool** runs both at once: the thermostat's `heat_cool` mode with the heating target below and the cooling target above, and the house drifts for free in between. It needs a thermostat that offers `heat_cool`; GTTC refuses the season otherwise.
 
 - **Minimum gap** (`heat_cool_min_gap`, default 3°F): set it to your thermostat's own auto-changeover differential. A block narrower than that has its heating end lowered, because a thermostat given a narrower band moves a setpoint by itself.
-- **No AC below** (`cool_lockout_temp`, default 55°F outside): in Heat/Cool the cooling setpoint is parked and the fan circulates instead.
-- **Ladder** (`heat_cool_ladder`, off by default): with auto season switch on, the switch goes Heat → Heat/Cool → Cool and back. It leaves Heat/Cool for a single season once only one side of the equipment has run for `heat_cool_settle_days` (default 5).
-- Automatic switches are demand-based. From Heat, the trigger is the house sitting 1° above the cooling goal with the heat idle. From Cool, it is the house 1° below the heating goal, on a cold day, with the AC idle. The house must hold there for the recommend threshold, and an open window resets the count.
+- **No AC below** (`cool_lockout_temp`, default 50°F outside): in Heat/Cool the cooling setpoint is parked and the fan circulates instead. A hold always gets the AC.
+- **Leaving Heat/Cool**: with the auto switch on, Heat/Cool hands over to a single season once only one side of the equipment has run for `heat_cool_settle_days` (default 5).
+- Automatic switches are demand-based. From Heat, the trigger is the house sitting 1° above the cooling goal with the heat idle. From Cool, it is the house 1° below the heating goal, on a cold day, with the AC idle. The house must hold there for the recommend threshold, and an open window resets the count. Time Home Assistant was down does not count.
 - A band changed at the wall is held like any other thermostat hold. Band writes widen before they narrow so the thermostat never sees a band narrower than its differential.
 
-### Pre-conditioning
-When pre-conditioning is enabled, GTTC begins ramping the thermostat toward the next schedule entry's target temperature before the entry starts (default: 60 minutes ahead). Combined with TOU awareness, this means the house reaches comfort temperature right as on-peak rates end.
-
-### Presence Detection
-Three modes for detecting if anyone is home:
-- **Person entities + Occupancy sensors** (recommended) — Checks both HA's built-in `person.xxx` entities (which use `zone.home`) AND room-level occupancy/motion sensors. Either method confirming presence = someone is home
-- **Person entities only** — Only uses HA person tracking (phone GPS, router, etc.)
-- **Occupancy sensors only** — Only uses motion/occupancy/presence binary sensors assigned to zones
-
-### Learning Engine
-The learning engine watches for manual temperature adjustments. When you make similar changes (within 2°F and 30 minutes) at similar times of day on 3+ occasions, it automatically creates a schedule entry for that pattern. Patterns are visible in the `sensor.gttc_learned_patterns` entity and can be cleared with the `gttc.clear_learned_schedule` service.
+### Heat pumps
+On a heat pump, most thermostats bring on the electric backup (aux) heat when the setpoint jumps well above the room. GTTC raises the heat setpoint in 0.5° steps no more than every 10 minutes, starting from the thermostat's own reading, so a morning change of two or three degrees reaches the wall over half an hour or so and the compressor does the work. Falls are never slowed. Holds and boosts go straight through — they are someone asking for heat now. For the backup heat itself, set the thermostat's own aux settings (droop, outdoor lockout) to suit your equipment.
 
 ### Zone Averaging
 Each zone can have multiple temperature sensors. The integration averages all available readings to get a single zone temperature. If a sensor becomes unavailable, it is excluded from the average automatically.
 
 ## Settings
 
-In the sidebar panel, go to the **Settings** tab to configure:
+In the sidebar panel's **Settings** tab:
 
-- **Temperature & Override** — Min/max range, away temperature, manual override duration
-- **Learning** — Enable/disable, configure the repetition threshold
-- **Occupancy** — Enable/disable, choose presence detection mode, select which `person` entities to track
-- **Energy & Efficiency** — Enable pre-conditioning, enable TOU optimization, select provider, set outdoor temperature sensor
-- **Window Sensors** — Add/remove contact sensors, manual suspend toggle
-- **Zones** — Add, edit, delete, or auto-discover zones from HA areas. Set active zone, assign temperature and occupancy sensors, configure per-zone away temperature
+- **Goals** — Away temperatures for heat and cool, the Heat/Cool gap, the cooling backup goal
+- **Range** — The lowest and highest the wall is ever set to
+- **Changes** — How long a hold lasts
+- **Season switch** — Automatic switching, how long to wait, and the Heat/Cool settings
+- **Rooms, Windows, Outside** — Zones and their sensors, window/door sensors, the outdoor temperature sensor

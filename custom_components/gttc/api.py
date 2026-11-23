@@ -71,7 +71,6 @@ def async_register_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_save_zone)
     websocket_api.async_register_command(hass, ws_delete_zone)
     websocket_api.async_register_command(hass, ws_set_active_zone)
-    websocket_api.async_register_command(hass, ws_list_persons)
     websocket_api.async_register_command(hass, ws_set_vacation)
     websocket_api.async_register_command(hass, ws_clear_vacation)
     websocket_api.async_register_command(hass, ws_activate_timed_preset)
@@ -959,7 +958,6 @@ async def ws_get_diagnostics(
             "cool_locked_out": coordinator.cool_locked_out,
             "gap_adjusted_from": coordinator._gap_adjusted_from,
             "min_gap": coordinator.heat_cool_min_gap,
-            "ladder": coordinator.heat_cool_ladder,
             "cool_lockout_temp": coordinator.cool_lockout_temp,
             "settle_days": coordinator.heat_cool_settle_days,
             "last_heat_call": (
@@ -975,23 +973,9 @@ async def ws_get_diagnostics(
         "active_zone_id": coordinator.zone_manager.active_zone_id,
         "active_zone_name": coordinator.zone_manager.active_zone.name if coordinator.zone_manager.active_zone else None,
         "zones": zones,
-        "learning": {
-            "enabled": coordinator.learning_enabled,
-            "events_recorded": len(coordinator.learning.events),
-            "patterns_learned": len(coordinator.learning.learned_entries),
-        },
         "features": {
-            "tou_enabled": coordinator.tou_enabled,
-            "tou_rate": (
-                coordinator.tou_provider.get_rate_period().value
-                if coordinator.tou_enabled else None
-            ),
-            "precondition_enabled": coordinator.precondition_enabled,
-            "precondition_active": coordinator._is_preconditioning(),
-            "occupancy_enabled": coordinator.occupancy_enabled,
             "heat_pump_detected": coordinator.is_heat_pump,
             "outdoor_temp": coordinator._outdoor_temp,
-            "presence_home": coordinator.zone_manager.is_anyone_home(),
         },
         "thermostat_entity": coordinator.thermostat_entity,
         "thermostat_temp": thermostat_temp,
@@ -1164,27 +1148,14 @@ async def ws_get_config(
             "temp_max": coordinator.temp_max,
             "away_temp": coordinator.away_temp,
             "manual_override_minutes": coordinator.manual_override_minutes,
-            "learning_enabled": coordinator.learning_enabled,
-            "learning_threshold": coordinator.learning.threshold,
-            "occupancy_enabled": coordinator.occupancy_enabled,
-            "presence_detection": coordinator.zone_manager.presence_mode,
-            "precondition_enabled": coordinator.precondition_enabled,
-            "tou_enabled": coordinator.tou_enabled,
-            "tou_provider": (
-                coordinator.tou_provider.name
-                if hasattr(coordinator.tou_provider, "name")
-                else "none"
-            ),
             "outdoor_temp_sensor": coordinator.outdoor_temp_sensor or "",
             "window_sensors": list(coordinator.window_sensors),
             "windows_open_override": coordinator.windows_open_override,
-            "tracked_persons": list(coordinator.zone_manager.tracked_persons),
             "season": coordinator.season,
             "cooling_comfort": coordinator.cooling_comfort,
             "cooling_away_temp": coordinator.cooling_away_temp,
             "seasonal_recommend_hours": coordinator.seasonal_recommend_hours,
             "auto_season_switch": coordinator.auto_season_switch,
-            "heat_cool_ladder": coordinator.heat_cool_ladder,
             "cool_lockout_temp": coordinator.cool_lockout_temp,
             "heat_cool_settle_days": coordinator.heat_cool_settle_days,
             "heat_cool_min_gap": coordinator.heat_cool_min_gap,
@@ -1204,26 +1175,13 @@ async def ws_get_config(
         vol.Optional("manual_override_minutes"): vol.All(
             vol.Coerce(int), vol.Range(min=15, max=480)
         ),
-        vol.Optional("learning_enabled"): bool,
-        vol.Optional("learning_threshold"): vol.All(
-            vol.Coerce(int), vol.Range(min=2, max=10)
-        ),
-        vol.Optional("occupancy_enabled"): bool,
-        vol.Optional("presence_detection"): vol.In(
-            ["both", "occupancy_sensors", "person_entities"]
-        ),
-        vol.Optional("precondition_enabled"): bool,
-        vol.Optional("tou_enabled"): bool,
-        vol.Optional("tou_provider"): vol.In(["none", "dominion_virginia"]),
         vol.Optional("outdoor_temp_sensor"): str,
-        vol.Optional("tracked_persons"): [str],
         vol.Optional("cooling_comfort"): vol.Coerce(float),
         vol.Optional("cooling_away_temp"): vol.Coerce(float),
         vol.Optional("seasonal_recommend_hours"): vol.All(
             vol.Coerce(float), vol.Range(min=1, max=48)
         ),
         vol.Optional("auto_season_switch"): bool,
-        vol.Optional("heat_cool_ladder"): bool,
         vol.Optional("cool_lockout_temp"): vol.All(vol.Coerce(float), vol.Range(min=30, max=70)),
         vol.Optional("heat_cool_settle_days"): vol.All(vol.Coerce(float), vol.Range(min=1, max=30)),
         vol.Optional("heat_cool_min_gap"): vol.All(vol.Coerce(float), vol.Range(min=0, max=10)),
@@ -1265,9 +1223,7 @@ async def ws_set_config(
     # Persist applicable keys to config_entry.data
     config_keys = {
         "temp_min", "temp_max", "away_temp", "manual_override_minutes",
-        "learning_enabled", "learning_threshold", "occupancy_enabled",
-        "presence_detection", "outdoor_temp_sensor", "tou_enabled",
-        "tou_provider", "precondition_enabled",
+        "outdoor_temp_sensor",
     }
     entry_updates = {k: v for k, v in updates.items() if k in config_keys}
     if entry_updates:
@@ -1433,42 +1389,6 @@ async def ws_set_active_zone(
 
     await coordinator.async_save()
     connection.send_result(msg["id"], {"success": True})
-
-
-# ── Person entity discovery ────────────────────────────────────────────────────
-
-@websocket_api.websocket_command(
-    {
-        vol.Required("type"): "gttc/list_persons",
-        vol.Optional("entry_id"): str,
-    }
-)
-@websocket_api.async_response
-async def ws_list_persons(
-    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
-) -> None:
-    """Return all HA person entities with their current state."""
-    coordinator = _get_coordinator(hass, msg.get("entry_id"))
-    if coordinator is None:
-        connection.send_error(msg["id"], "not_found", "No GTTC instance found")
-        return
-
-    persons = []
-    for state in hass.states.async_all("person"):
-        persons.append({
-            "entity_id": state.entity_id,
-            "name": state.attributes.get("friendly_name", state.entity_id),
-            "state": state.state,
-            "is_home": state.state == "home",
-        })
-
-    connection.send_result(
-        msg["id"],
-        {
-            "persons": persons,
-            "tracked_persons": list(coordinator.zone_manager.tracked_persons),
-        },
-    )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1646,7 +1566,6 @@ async def ws_get_runtime_history(
             "cooling_min": round(coordinator._today_cooling_min, 1),
             "avg_outdoor": coordinator.today_outdoor_avg(),
         },
-        "learned_ramp_minutes": round(coordinator._learned_ramp_minutes, 1),
     })
 
 

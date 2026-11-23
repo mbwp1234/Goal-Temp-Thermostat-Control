@@ -214,39 +214,6 @@ class PresetSchedule:
 
 
 @dataclass
-class LearningEvent:
-    """A recorded manual adjustment for learning."""
-
-    timestamp: str  # ISO format
-    day_of_week: str
-    time_of_day: str  # "HH:MM"
-    target_temp: float
-    zone_id: str | None = None
-    previous_temp: float | None = None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "timestamp": self.timestamp,
-            "day_of_week": self.day_of_week,
-            "time_of_day": self.time_of_day,
-            "target_temp": self.target_temp,
-            "zone_id": self.zone_id,
-            "previous_temp": self.previous_temp,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> LearningEvent:
-        return cls(
-            timestamp=data.get("timestamp", _utcnow().isoformat()),
-            day_of_week=data.get("day_of_week", "monday"),
-            time_of_day=data.get("time_of_day", "00:00"),
-            target_temp=data.get("target_temp", 70),
-            zone_id=data.get("zone_id"),
-            previous_temp=data.get("previous_temp"),
-        )
-
-
-@dataclass
 class ManualOverride:
     """Tracks an active manual override."""
 
@@ -352,30 +319,3 @@ class VacationMode:
         end = _parse_iso(self.end_dt)
         remaining = (end - _utcnow()).total_seconds() / 86400
         return max(0.0, round(remaining, 1))
-
-
-@dataclass
-class RampRecord:
-    """A recorded thermal ramp observation for adaptive lead-time learning."""
-
-    temp_delta: float  # degrees of temperature change needed
-    outdoor_temp: float | None  # outdoor temp at time of ramp (°F)
-    actual_minutes: int  # how long the ramp actually took
-    recorded_at: str  # ISO format
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "temp_delta": self.temp_delta,
-            "outdoor_temp": self.outdoor_temp,
-            "actual_minutes": self.actual_minutes,
-            "recorded_at": self.recorded_at,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> RampRecord:
-        return cls(
-            temp_delta=data.get("temp_delta", 0.0),
-            outdoor_temp=data.get("outdoor_temp"),
-            actual_minutes=data.get("actual_minutes", 30),
-            recorded_at=data.get("recorded_at", _utcnow().isoformat()),
-        )

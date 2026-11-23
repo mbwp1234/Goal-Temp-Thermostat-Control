@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "GTTC Setup",
-        "description": "Set up your smart thermostat with zone-aware scheduling and learning.",
+        "description": "Set up your smart thermostat with zone-aware scheduling.",
         "data": {
           "name": "Name",
           "thermostat_entity": "Main Thermostat",
@@ -41,17 +41,10 @@
       },
       "features": {
         "title": "Features & Settings",
-        "description": "Configure learning, occupancy, and override settings.",
+        "description": "Configure away and override settings.",
         "data": {
-          "learning_enabled": "Enable Learning (auto-create schedule from patterns)",
-          "learning_threshold": "Learning Threshold (adjustments before pattern)",
-          "occupancy_enabled": "Enable Occupancy-based Control",
-          "presence_detection": "Presence Detection Method",
           "away_temp": "Away Temperature",
           "manual_override_minutes": "Manual Override Duration",
-          "precondition_enabled": "Enable Pre-conditioning (ramp temp before schedule changes)",
-          "tou_enabled": "Enable Time-of-Use Rate Optimization",
-          "tou_provider": "Electricity Provider (TOU schedule)",
           "outdoor_temp_sensor": "Outdoor Temperature Sensor (for heat pump optimization & season detection)",
           "cooling_comfort": "Cooling Comfort Temperature (°F when AC is running, default 75°F)",
           "cooling_away_temp": "Cooling Away Temperature (°F when nobody is home in summer, default 78°F)",
@@ -82,15 +75,8 @@
       "settings": {
         "title": "General Settings",
         "data": {
-          "learning_enabled": "Enable Learning",
-          "learning_threshold": "Learning Threshold",
-          "occupancy_enabled": "Enable Occupancy Control",
-          "presence_detection": "Presence Detection Method",
           "away_temp": "Away Temperature",
           "manual_override_minutes": "Manual Override Duration (minutes)",
-          "precondition_enabled": "Enable Pre-conditioning",
-          "tou_enabled": "Enable TOU Rate Optimization",
-          "tou_provider": "Electricity Provider",
           "outdoor_temp_sensor": "Outdoor Temperature Sensor",
           "cooling_comfort": "Cooling Comfort Temperature",
           "cooling_away_temp": "Cooling Away Temperature",
