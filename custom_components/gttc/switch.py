@@ -127,7 +127,6 @@ class AutoSeasonSwitch(CoordinatorEntity, SwitchEntity):
             "suggest_switch": data.get("suggest_season_switch", False),
             "conditions_sustained_hours": data.get("season_conditions_hours", 0),
             "threshold_hours": self.coordinator.season_threshold_hours,
-            "heat_cool_ladder": self.coordinator.heat_cool_ladder,
         }
 
     async def async_turn_on(self, **kwargs) -> None:
