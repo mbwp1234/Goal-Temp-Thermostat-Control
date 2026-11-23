@@ -200,7 +200,7 @@ class GttcPanel extends HTMLElement {
   _isBusy() {
     if (this._blk || this._editingEntry || this._showCopyModal || this._showCopyDayModal || this._showPresetModal
         || this._showExportModal || this._showImportModal || this._showVacationModal) return true;
-    if (this._dragActive) return true;
+    if (this._dragActive || this._scrubbing) return true;
     if (this._activeMainTab === "settings") return true;
     const el = this.shadowRoot && this.shadowRoot.activeElement;
     return !!(el && /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName));
@@ -1142,7 +1142,9 @@ class GttcPanel extends HTMLElement {
     this._attachNowListeners();
     if (this._activeMainTab === "settings") this._attachSettingsSheetListeners();
     if (this._activeMainTab === "schedule") this._attachScheduleTabListeners();
+    if (this._activeMainTab === "history") this._attachScrubListeners();
     root.querySelectorAll("[data-hview]").forEach(b => b.addEventListener("click", () => {
+      this._scrubSel = null;
       this._histView = b.dataset.hview;
       this._render();
       if (this._histView === "week" && !this._actionLog) this._loadActionLog();
@@ -4341,6 +4343,99 @@ class GttcPanel extends HTMLElement {
     return `<text x="${x}" y="${y}" text-anchor="${anchor}" dominant-baseline="central" style="font:${weight} ${size}px Inter,system-ui,sans-serif;fill:${col}">${s}</text>`;
   }
 
+  // Tap, drag or hover a chart to read it. fn(x, y) gets SVG units and returns
+  // { x, y?, t: [title, ...parts] } or null.
+  _scrubWrap(k, svg, fn) {
+    (this._scrubFns ||= {})[k] = fn;
+    return `<div class="hs-scrub" data-scrub="${k}">${svg}<i class="hs-guide" hidden></i><i class="hs-gdot" hidden></i><div class="hs-tip" hidden></div></div>`;
+  }
+
+  _tipHTML(t) {
+    return `<b>${t[0]}</b>${t.slice(1).filter(Boolean).map(x => `<span>${x}</span>`).join("")}`;
+  }
+
+  _placeTip(wrap, html, xPx, yPx, guide, tipTop) {
+    const tip = wrap.querySelector(".hs-tip"), g = wrap.querySelector(".hs-guide"), dot = wrap.querySelector(".hs-gdot");
+    if (!tip) return;
+    tip.innerHTML = html; tip.hidden = false;
+    tip.style.top = tipTop != null ? `${tipTop - 6}px` : "";
+    const ww = wrap.clientWidth, tw = tip.offsetWidth;
+    tip.style.left = `${Math.max(0, Math.min(ww - tw, xPx - tw / 2))}px`;
+    if (g) { g.hidden = !guide; g.style.left = `${xPx}px`; }
+    if (dot) { dot.hidden = yPx == null; if (yPx != null) { dot.style.left = `${xPx}px`; dot.style.top = `${yPx}px`; } }
+  }
+
+  _showScrub(wrap, sel) {
+    const svg = wrap.querySelector("svg");
+    if (sel.cell != null) {
+      const c = wrap.querySelector(`[data-k="${sel.cell}"]`);
+      if (!c) return;
+      const r = c.getBoundingClientRect(), wr = wrap.getBoundingClientRect();
+      this._placeTip(wrap, this._tipHTML(c.dataset.tip.split("|")), r.left - wr.left + r.width / 2, null, false, r.top - wr.top);
+      return;
+    }
+    const fn = this._scrubFns?.[wrap.dataset.scrub];
+    if (!svg || !fn) return;
+    const vb = svg.viewBox.baseVal, r = svg.getBoundingClientRect();
+    const out = fn(sel.fx * vb.width, sel.fy * vb.height);
+    if (!out) { this._hideScrub(wrap); return; }
+    this._placeTip(wrap, this._tipHTML(out.t), out.x / vb.width * r.width, out.y != null ? out.y / vb.height * r.height : null, out.guide !== false);
+  }
+
+  _hideScrub(wrap) {
+    wrap.querySelectorAll(".hs-tip,.hs-guide,.hs-gdot").forEach(e => { e.hidden = true; });
+  }
+
+  _attachScrubListeners() {
+    const root = this.shadowRoot;
+    root.querySelectorAll(".hs-scrub").forEach(wrap => {
+      const k = wrap.dataset.scrub;
+      const at = e => {
+        const cell = e.target.closest?.("[data-tip]");
+        if (cell) return { k, cell: cell.dataset.k };
+        const svg = wrap.querySelector("svg");
+        if (!svg) return null;
+        const r = svg.getBoundingClientRect();
+        return { k, fx: (e.clientX - r.left) / r.width, fy: (e.clientY - r.top) / r.height };
+      };
+      const show = e => { const sel = at(e); if (!sel) return; this._scrubSel = sel; this._showScrub(wrap, sel); };
+      wrap.addEventListener("pointerdown", e => { this._scrubbing = true; show(e); });
+      wrap.addEventListener("pointermove", e => { if (this._scrubbing || e.pointerType === "mouse") show(e); });
+      const end = () => { this._scrubbing = false; };
+      wrap.addEventListener("pointerup", end);
+      wrap.addEventListener("pointercancel", end);
+      wrap.addEventListener("pointerleave", e => {
+        end();
+        if (e.pointerType === "mouse") { this._scrubSel = null; this._hideScrub(wrap); }
+      });
+    });
+    if (!this._scrubOutside) {
+      // A tap anywhere else puts the reading away; the release can never be missed
+      this._scrubOutside = true;
+      window.addEventListener("pointerup", () => { this._scrubbing = false; });
+      root.addEventListener("pointerdown", e => {
+        if (e.composedPath().some(n => n.classList?.contains("hs-scrub"))) return;
+        if (!this._scrubSel) return;
+        this._scrubSel = null;
+        root.querySelectorAll(".hs-scrub").forEach(w => this._hideScrub(w));
+      });
+    }
+    // A repaint redraws the chart; the reading comes back where it was
+    const sel = this._scrubSel;
+    if (sel) {
+      const w = root.querySelector(`.hs-scrub[data-scrub="${sel.k}"]`);
+      if (w) requestAnimationFrame(() => this._showScrub(w, sel)); else this._scrubSel = null;
+    }
+  }
+
+  _tipTime(t) {
+    return new Date(t).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).replace(/\s?([AP])M/i, (_, a) => a.toLowerCase());
+  }
+
+  _tipDay(k) {
+    return new Date(k + "T12:00").toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" });
+  }
+
   _histTile(ic, v, l, span = 2, col = "") {
     return `<div class="card hs-tile" style="grid-column:span ${span}">${this._ic(ic, col)}<b>${v}</b><span>${l}</span></div>`;
   }
@@ -4495,8 +4590,27 @@ class GttcPanel extends HTMLElement {
       const h = new Date(t).getHours();
       if (h % 6 === 0) axis += this._svgT(hx(t), H - 8, this._short12(h * 60), 11, 600, "var(--secondary-text)");
     }
-    return `<svg class="hs-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Last 24 hours: room temperature, goal and why it changed">
+    const inWinPts = pts.filter(p => p.t >= t0 - 6 * 3600e3);
+    const evs = steps.filter(e => e.t >= t0 && !e.derived);
+    const svg = `<svg class="hs-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Last 24 hours: room temperature, goal and why it changed">
       ${grid}${runBars}${goal}<path d="${curve}" class="hs-curve"/>${events}${axis}</svg>`;
+    return this._scrubWrap("d24", svg, (x) => {
+      const t = Math.max(t0, Math.min(now, t0 + (x - X0) / (X1 - X0) * (now - t0)));
+      let p = null;
+      for (const q of inWinPts) { if (q.t <= t) p = q; else break; }
+      let g = null;
+      for (const e of steps) { if (e.t <= t) g = e; else break; }
+      const run = runs.find(r => r.s <= t && r.e >= t);
+      const ev = evs.find(e => Math.abs(hx(e.t) - x) < 14);
+      const f = v => `${+(+v).toFixed(1)}°`;
+      const goalTxt = !g ? null : parked(g) ? "Goal paused" : `Goal ${g.target_high != null ? `${f(g.target_temp)}–${f(g.target_high)}` : f(g.target_temp)}`;
+      return {
+        x: hx(t), y: p ? ty(p.v) : undefined,
+        t: [this._tipTime(t), p ? `Room ${f(p.v)}` : null, goalTxt,
+          run ? (run.a === "cooling" ? "Cooling" : "Heating") : "Idle",
+          ev ? this._reasonLabel(ev.reason) : (g && !g.derived && g.reason ? this._reasonLabel(g.reason) : null)],
+      };
+    });
   }
 
   _hist7(days, keys) {
@@ -4524,8 +4638,18 @@ class GttcPanel extends HTMLElement {
           + this._svgT(cx, oy(r.o), Math.round(r.o), 11, 800, tempInk(r.o, s.temp_min, s.temp_max));
       }
     });
-    return `<svg class="hs-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Running time per day, last week, with the outside temperature">
+    const svg = `<svg class="hs-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Running time per day, last week, with the outside temperature">
       <path d="${line}" class="hs-outline"/>${out}</svg>`;
+    return this._scrubWrap("d7", svg, (x) => {
+      const i = Math.max(0, Math.min(ks.length - 1, Math.floor(x / step)));
+      const k = ks[i], r = days[k], today = i === ks.length - 1;
+      return {
+        x: +(step * i + step / 2).toFixed(1),
+        t: [today ? "Today" : this._tipDay(k),
+          r.h > 0 || r.c === 0 ? `${this._fmtH(r.h)} heat` : null, r.c > 0 ? `${this._fmtH(r.c)} cool` : null,
+          r.o != null ? `${Math.round(r.o)}° outside` : "No outside reading"],
+      };
+    });
   }
 
   async _loadYearStats() {
@@ -4573,11 +4697,12 @@ class GttcPanel extends HTMLElement {
         const k = `${y}-${pad(m)}-${pad(dd)}`;
         if (dd > len || k > todayK) { cells += `<i class="hs-c hs-c-none"></i>`; continue; }
         const r = days[k];
-        if (!r) { cells += `<i class="hs-c hs-c-nr" title="${k} · no record"></i>`; continue; }
+        const dk = new Date(y, m - 1, dd).toLocaleDateString([], { month: "short", day: "numeric" });
+        if (!r) { cells += `<i class="hs-c hs-c-nr" data-k="${k}" data-tip="${dk}|No record"></i>`; continue; }
         const tot = r.h + r.c;
-        if (tot < 1) { cells += `<i class="hs-c hs-c-off" title="${k} · off"></i>`; continue; }
+        if (tot < 1) { cells += `<i class="hs-c hs-c-off" data-k="${k}" data-tip="${dk}|Off${r.o != null ? `|${Math.round(r.o)}° outside` : ""}"></i>`; continue; }
         const heat = r.h >= r.c, k2 = Math.min(1, 0.25 + Math.max(r.h, r.c) / 600 * 0.75);
-        cells += `<i class="hs-c ${k === todayK ? "hs-c-today" : ""}" style="background:${mix(heat ? "heat" : "cool", k2)}" title="${k} · ${this._fmtH(tot)} ${heat ? "heat" : "cool"}"></i>`;
+        cells += `<i class="hs-c ${k === todayK ? "hs-c-today" : ""}" style="background:${mix(heat ? "heat" : "cool", k2)}" data-k="${k}" data-tip="${dk}|${r.h > 0 ? `${this._fmtH(r.h)} heat` : ""}${r.h > 0 && r.c > 0 ? "|" : ""}${r.c > 0 ? `${this._fmtH(r.c)} cool` : ""}${r.o != null ? `|${Math.round(r.o)}° outside` : ""}"></i>`;
       }
       const cur = y === now.getFullYear() && m === now.getMonth() + 1;
       return `<span class="hs-ml ${cur ? "on" : ""}">${MN[m - 1]}</span><div class="hs-crow">${cells}</div>`;
@@ -4644,6 +4769,30 @@ class GttcPanel extends HTMLElement {
     const cold = outs.reduce((a, r) => r.min != null && (!a || r.min < a.min) ? r : a, null);
     const mon = r => r ? MN[new Date(r.start).getMonth()] : "";
     const since = first ? new Date(first + "T12:00").toLocaleDateString([], { month: "short", day: "numeric" }) : "";
+    const monthTip = which => (x) => {
+      const i = Math.max(0, Math.min(11, Math.floor((x - 40) / cw)));
+      const [y, m] = months[i], name = `${MN[m - 1]} ${y}`;
+      if (which === "out") {
+        const o = OUT[`${y}-${m}`], inn = IN[`${y}-${m}`];
+        if (!o || o.mean == null) return { x: cx(i), t: [name, "No record"] };
+        return { x: cx(i), y: ty(o.mean), t: [name, `${Math.round(o.mean)}° outside`,
+          o.min != null && o.max != null ? `${Math.round(o.min)}–${Math.round(o.max)}°` : null,
+          inn?.mean != null ? `${Math.round(inn.mean)}° inside` : null] };
+      }
+      const mk = keys.filter(k => k.startsWith(`${y}-${pad(m)}-`));
+      if (!mk.length) return { x: cx(i), t: [name, "No record"] };
+      const h = mk.reduce((a, k) => a + days[k].h, 0), c = mk.reduce((a, k) => a + days[k].c, 0);
+      return { x: cx(i), t: [name, h > 0 || c === 0 ? `${this._fmtH(h)} heat` : null, c > 0 ? `${this._fmtH(c)} cool` : null, `${mk.length} day${mk.length === 1 ? "" : "s"}`] };
+    };
+    const dots = keys.filter(k => days[k].o != null).map(k => ({ k, x: sx(days[k].o), y: sy(Math.max(days[k].h, days[k].c)) }));
+    const dotTip = (x, y) => {
+      let best = null, bd = 30 * 30;
+      for (const d of dots) { const dd = (d.x - x) ** 2 + (d.y - y) ** 2; if (dd < bd) { bd = dd; best = d; } }
+      if (!best) return null;
+      const r = days[best.k];
+      return { x: best.x, y: best.y, guide: false, t: [best.k === todayK ? "Today" : this._tipDay(best.k), `${Math.round(r.o)}° outside`,
+        r.h + r.c < 1 ? "Off" : r.h >= r.c ? `${this._fmtH(r.h)} heat` : `${this._fmtH(r.c)} cool`] };
+    };
     return `
       <div class="hs-tiles hs-tiles-2">
         ${this._histTile("fire", `${Math.round(H / 60)}h`, `Heat · since ${since}`, 1, "c-heat")}
@@ -4654,19 +4803,19 @@ class GttcPanel extends HTMLElement {
       <section class="card hs-card">
         <div class="hs-hrow"><b class="hs-h">Every day</b>
           <span class="hs-key"><i class="f-heatbg"></i>Heat<i class="f-coolbg"></i>Cool<i class="hs-c-off"></i>Off<i class="hs-c-nr"></i>No record</span></div>
-        <div class="hs-cal">${cal}</div>
+        <div class="hs-scrub" data-scrub="cal"><div class="hs-cal">${cal}</div><div class="hs-tip" hidden></div></div>
       </section>
       <section class="card hs-card">
         <div class="hs-hrow"><b class="hs-h">Outside by month</b><span class="hs-key"><i class="hs-key-in"></i>Inside</span></div>
-        <svg class="hs-svg" viewBox="0 0 ${W} 222" role="img" aria-label="Monthly outside low, average and high, with the average inside">${tsvg}</svg>
+        ${this._scrubWrap("yout", `<svg class="hs-svg" viewBox="0 0 ${W} 222" role="img" aria-label="Monthly outside low, average and high, with the average inside">${tsvg}</svg>`, monthTip("out"))}
       </section>
       <section class="card hs-card">
         <b class="hs-h">Hours running</b>
-        <svg class="hs-svg" viewBox="0 0 ${W} 200" role="img" aria-label="Heating and cooling hours per month">${msvg}</svg>
+        ${this._scrubWrap("yhrs", `<svg class="hs-svg" viewBox="0 0 ${W} 200" role="img" aria-label="Heating and cooling hours per month">${msvg}</svg>`, monthTip("hrs"))}
       </section>
       <section class="card hs-card">
         <b class="hs-h">Outside vs running</b>
-        <svg class="hs-svg" viewBox="0 0 ${W} 216" role="img" aria-label="One dot per day: hours running against the outside average">${ssvg}</svg>
+        ${this._scrubWrap("ysc", `<svg class="hs-svg" viewBox="0 0 ${W} 216" role="img" aria-label="One dot per day: hours running against the outside average">${ssvg}</svg>`, dotTip)}
       </section>`;
   }
 
@@ -6289,6 +6438,17 @@ class GttcPanel extends HTMLElement {
       .hs-h { font-size: 15px; font-weight: 800; }
       .hs-hrow { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
       .hs-svg { width: 100%; height: auto; display: block; overflow: visible; }
+      .hs-scrub { position: relative; touch-action: pan-y; cursor: crosshair; -webkit-user-select: none; user-select: none; }
+      .hs-scrub .hs-cal { cursor: pointer; }
+      .hs-guide { position: absolute; top: 0; bottom: 0; width: 0; border-left: 1.5px solid var(--primary-text); opacity: .35; pointer-events: none; }
+      .hs-gdot { position: absolute; width: 12px; height: 12px; margin: -6px 0 0 -6px; border-radius: 50%; background: var(--primary-text); box-shadow: 0 0 0 3px var(--card-bg); pointer-events: none; }
+      .hs-tip { position: absolute; top: -8px; transform: translateY(-100%); z-index: 5; display: flex; align-items: baseline; gap: 8px; padding: 7px 11px;
+        border-radius: 10px; background: var(--primary-text); color: var(--card-bg); font-size: 13px; font-weight: 600; flex-wrap: wrap; row-gap: 2px; max-width: 100%; box-sizing: border-box; pointer-events: none;
+        box-shadow: 0 4px 14px rgba(0,0,0,.18); }
+      .hs-tip b, .hs-tip span { white-space: nowrap; } .hs-tip b { font-weight: 800; }
+      .hs-tip span { opacity: .8; }
+      .hs-tip span::before { content: "·"; margin-right: 8px; opacity: .6; }
+      .hs-guide[hidden], .hs-gdot[hidden], .hs-tip[hidden] { display: none; }
       .hs-grid { stroke: var(--divider); stroke-width: 1px; }
       .hs-curve { fill: none; stroke: var(--primary-text); stroke-width: 2.5px; stroke-linejoin: round; stroke-linecap: round; }
       .hs-evline { stroke: var(--divider); stroke-width: 1.2px; stroke-dasharray: 2 4; }
