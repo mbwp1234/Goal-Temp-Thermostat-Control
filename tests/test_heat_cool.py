@@ -116,7 +116,7 @@ async def test_leaving_clears_the_band_and_hands_the_fan_back():
     coord = _coord()
     coord.target_low, coord.target_high = 71.0, 74.0
     coord._last_thermostat_range = (71.0, 74.0)
-    coord._fan_precool_fan_on = True
+    coord._fan_running = True
 
     await coord.async_set_season(SEASON_COOLING)
 
@@ -213,7 +213,7 @@ async def test_cold_outside_parks_the_cool_end_and_circulates_a_warm_house():
 @pytest.mark.asyncio
 async def test_lockout_lifts_when_it_warms_up():
     coord = _coord(DAY, indoor=72.0, outdoor=71.0)
-    coord._fan_precool_fan_on = True
+    coord._fan_running = True
     await coord._update_heat_cool(None)
     assert coord.cool_locked_out is False
     assert _calls(coord, "set_temperature")[-1]["target_temp_high"] == 74.0
@@ -347,22 +347,12 @@ async def test_window_open_parks_both_ends():
 
 
 # ---------------------------------------------------------------------------
-# The ladder
+# Leaving a season
 # ---------------------------------------------------------------------------
 
-def test_cooling_demand_in_heat_season_points_at_heat_cool_with_the_ladder():
+def test_cooling_demand_in_heat_season_goes_straight_to_cool():
     coord = _coord(DAY, indoor=76.0)
     coord.season = SEASON_HEATING
-    coord.heat_cool_ladder = True
-    coord.auto_season_switch = False
-    coord._update_season_recommendation()
-    assert coord.recommended_season == SEASON_HEAT_COOL
-
-
-def test_without_the_ladder_it_still_goes_straight_across():
-    coord = _coord(DAY, indoor=76.0)
-    coord.season = SEASON_HEATING
-    coord.heat_cool_ladder = False
     coord.auto_season_switch = False
     coord._update_season_recommendation()
     assert coord.recommended_season == SEASON_COOLING
@@ -404,7 +394,7 @@ def test_equipment_runs_are_counted_in_heat_cool():
     assert datetime.now(timezone.utc) - coord._last_cool_call < timedelta(seconds=5)
 
 
-def test_auto_switch_acts_on_the_ladder_target():
+def test_auto_switch_acts_on_the_heat_cool_target():
     coord = _coord()
     coord.auto_season_switch = True
     now = datetime.now(timezone.utc)
@@ -422,13 +412,11 @@ def test_auto_switch_acts_on_the_ladder_target():
 
 def test_settings_and_clocks_survive_a_restart():
     coord = _coord()
-    coord.heat_cool_ladder = True
     coord.cool_lockout_temp = 52.0
     coord._last_cool_call = datetime(2026, 9, 28, 14, 0, tzinfo=timezone.utc)
     coord._last_heat_call = datetime(2026, 9, 29, 7, 0, tzinfo=timezone.utc)
     saved = {
         "season": coord.season,
-        "heat_cool_ladder": coord.heat_cool_ladder,
         "cool_lockout_temp": coord.cool_lockout_temp,
         "heat_cool_settle_days": 5.0,
         "heat_cool_min_gap": 3.0,
@@ -438,7 +426,7 @@ def test_settings_and_clocks_survive_a_restart():
     fresh = _make_coordinator()
     fresh._load_stored_data(saved)
     assert fresh.season == SEASON_HEAT_COOL
-    assert fresh.heat_cool_ladder is True and fresh.cool_lockout_temp == 52.0
+    assert fresh.cool_lockout_temp == 52.0
     assert fresh._last_cool_call == coord._last_cool_call
 
 
@@ -466,21 +454,3 @@ async def test_cool_air_outside_no_longer_delays_the_compressor():
     assert _calls(coord, "set_fan_mode") == []         # the fan is left alone
 
 
-@pytest.mark.asyncio
-async def test_the_heat_end_does_not_move_when_fan_precool_switches():
-    entry = ScheduleEntry(time_start="20:00", time_end="23:59", target_temp=69.0, cooling_temp=70.0)
-    coord = _coord(entry, indoor=74.0, outdoor=67.0)
-    await coord._update_heat_cool(None)
-    with_fan = coord.target_low
-    coord2 = _coord(entry, indoor=74.0, outdoor=72.0)   # too warm out for the fan
-    await coord2._update_heat_cool(None)
-    assert with_fan == coord2.target_low == 67.0
-
-
-@pytest.mark.asyncio
-async def test_lockout_takes_the_fan_from_fan_precool():
-    coord = _coord(DAY, indoor=75.0, outdoor=45.0)
-    coord._fan_precool_start_time = datetime.now(timezone.utc)   # a window left over from a warmer hour
-    await coord._update_heat_cool(None)
-    assert coord._fan_precool_start_time is None       # no pre-cool window running
-    assert coord._last_action_reason == "cool_lockout"

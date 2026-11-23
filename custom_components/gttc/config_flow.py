@@ -22,36 +22,24 @@ from .const import (
     CONF_AWAY_TEMP,
     CONF_COOLING_AWAY_TEMP,
     CONF_COOLING_COMFORT,
-    CONF_LEARNING_ENABLED,
-    CONF_LEARNING_THRESHOLD,
     CONF_MANUAL_OVERRIDE_MINUTES,
     CONF_NAME,
-    CONF_OCCUPANCY_ENABLED,
     CONF_OUTDOOR_TEMP_SENSOR,
-    CONF_PRECONDITION_ENABLED,
-    CONF_PRESENCE_DETECTION,
     CONF_SEASONAL_RECOMMEND_HOURS,
     CONF_TEMP_MAX,
     CONF_TEMP_MIN,
     CONF_TEMP_UNIT,
     CONF_THERMOSTAT,
-    CONF_TOU_ENABLED,
-    CONF_TOU_PROVIDER,
     CONF_ZONES,
     DEFAULT_AWAY_TEMP,
     DEFAULT_COOLING_AWAY,
     DEFAULT_COOLING_COMFORT,
-    DEFAULT_LEARNING_THRESHOLD,
     DEFAULT_MANUAL_OVERRIDE_MINUTES,
     DEFAULT_NAME,
-    DEFAULT_PRESENCE_MODE,
     DEFAULT_TEMP_MAX,
     DEFAULT_TEMP_MIN,
     DEFAULT_TEMP_UNIT,
     DOMAIN,
-    PRESENCE_MODE_BOTH,
-    PRESENCE_MODE_OCCUPANCY,
-    PRESENCE_MODE_PERSON,
     SEASONAL_RECOMMEND_HOURS,
 )
 
@@ -311,39 +299,6 @@ class GTTCConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
         schema = vol.Schema(
             {
-                vol.Required(CONF_LEARNING_ENABLED, default=True): bool,
-                vol.Required(
-                    CONF_LEARNING_THRESHOLD, default=DEFAULT_LEARNING_THRESHOLD
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(
-                        min=2,
-                        max=10,
-                        step=1,
-                        mode=selector.NumberSelectorMode.SLIDER,
-                    )
-                ),
-                vol.Required(CONF_OCCUPANCY_ENABLED, default=True): bool,
-                vol.Required(
-                    CONF_PRESENCE_DETECTION, default=DEFAULT_PRESENCE_MODE
-                ): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=[
-                            selector.SelectOptionDict(
-                                value=PRESENCE_MODE_BOTH,
-                                label="Person entities + Occupancy sensors (Recommended)",
-                            ),
-                            selector.SelectOptionDict(
-                                value=PRESENCE_MODE_PERSON,
-                                label="Person entities only (zone.home)",
-                            ),
-                            selector.SelectOptionDict(
-                                value=PRESENCE_MODE_OCCUPANCY,
-                                label="Occupancy sensors only",
-                            ),
-                        ],
-                        mode=selector.SelectSelectorMode.DROPDOWN,
-                    )
-                ),
                 vol.Required(
                     CONF_AWAY_TEMP, default=DEFAULT_AWAY_TEMP
                 ): vol.Coerce(float),
@@ -357,23 +312,6 @@ class GTTCConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         step=15,
                         mode=selector.NumberSelectorMode.SLIDER,
                         unit_of_measurement="min",
-                    )
-                ),
-                vol.Required(CONF_PRECONDITION_ENABLED, default=True): bool,
-                vol.Required(CONF_TOU_ENABLED, default=False): bool,
-                vol.Required(CONF_TOU_PROVIDER, default="none"): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=[
-                            selector.SelectOptionDict(
-                                value="none",
-                                label="None (disabled)",
-                            ),
-                            selector.SelectOptionDict(
-                                value="dominion_virginia",
-                                label="Dominion Energy Virginia",
-                            ),
-                        ],
-                        mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 ),
                 vol.Optional(CONF_OUTDOOR_TEMP_SENSOR): selector.EntitySelector(
@@ -484,44 +422,6 @@ class GTTCOptionsFlow(config_entries.OptionsFlow):
         schema = vol.Schema(
             {
                 vol.Required(
-                    CONF_LEARNING_ENABLED,
-                    default=data.get(CONF_LEARNING_ENABLED, True),
-                ): bool,
-                vol.Required(
-                    CONF_LEARNING_THRESHOLD,
-                    default=data.get(
-                        CONF_LEARNING_THRESHOLD, DEFAULT_LEARNING_THRESHOLD
-                    ),
-                ): selector.NumberSelector(
-                    selector.NumberSelectorConfig(min=2, max=10, step=1)
-                ),
-                vol.Required(
-                    CONF_OCCUPANCY_ENABLED,
-                    default=data.get(CONF_OCCUPANCY_ENABLED, True),
-                ): bool,
-                vol.Required(
-                    CONF_PRESENCE_DETECTION,
-                    default=data.get(CONF_PRESENCE_DETECTION, DEFAULT_PRESENCE_MODE),
-                ): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=[
-                            selector.SelectOptionDict(
-                                value=PRESENCE_MODE_BOTH,
-                                label="Person entities + Occupancy sensors",
-                            ),
-                            selector.SelectOptionDict(
-                                value=PRESENCE_MODE_PERSON,
-                                label="Person entities only",
-                            ),
-                            selector.SelectOptionDict(
-                                value=PRESENCE_MODE_OCCUPANCY,
-                                label="Occupancy sensors only",
-                            ),
-                        ],
-                        mode=selector.SelectSelectorMode.DROPDOWN,
-                    )
-                ),
-                vol.Required(
                     CONF_AWAY_TEMP,
                     default=data.get(CONF_AWAY_TEMP, DEFAULT_AWAY_TEMP),
                 ): vol.Coerce(float),
@@ -534,32 +434,6 @@ class GTTCOptionsFlow(config_entries.OptionsFlow):
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
                         min=15, max=480, step=15, unit_of_measurement="min"
-                    )
-                ),
-                vol.Required(
-                    CONF_PRECONDITION_ENABLED,
-                    default=data.get(CONF_PRECONDITION_ENABLED, True),
-                ): bool,
-                vol.Required(
-                    CONF_TOU_ENABLED,
-                    default=data.get(CONF_TOU_ENABLED, False),
-                ): bool,
-                vol.Required(
-                    CONF_TOU_PROVIDER,
-                    default=data.get(CONF_TOU_PROVIDER, "none"),
-                ): selector.SelectSelector(
-                    selector.SelectSelectorConfig(
-                        options=[
-                            selector.SelectOptionDict(
-                                value="none",
-                                label="None (disabled)",
-                            ),
-                            selector.SelectOptionDict(
-                                value="dominion_virginia",
-                                label="Dominion Energy Virginia",
-                            ),
-                        ],
-                        mode=selector.SelectSelectorMode.DROPDOWN,
                     )
                 ),
                 vol.Optional(

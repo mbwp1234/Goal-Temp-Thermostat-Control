@@ -55,16 +55,6 @@ async def test_fan_changed_by_someone_else_is_left_alone():
     assert len(_calls(coord, "set_fan_mode")) == n
 
 
-@pytest.mark.asyncio
-async def test_no_fan_mode_means_no_precool_hold_off():
-    coord = _coord()
-    _t6(coord, fan_modes=["Auto"])
-    coord.season = "cooling"
-    coord.current_temp = 75.0
-    coord._outdoor_temp = 60.0
-    assert await coord._apply_fan_precool(72.0) == 72.0
-
-
 # --------------------------------------------------------------------------- offset
 def test_integer_flicker_does_not_move_the_offset_a_degree():
     coord = _make_coordinator()

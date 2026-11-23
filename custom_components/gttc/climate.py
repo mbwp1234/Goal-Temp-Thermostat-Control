@@ -20,12 +20,9 @@ from .const import (
     ATTR_ACTIVE_ZONE,
     ATTR_ALL_ZONES,
     ATTR_CURRENT_SCHEDULE_ENTRY,
-    ATTR_LEARNING_STATUS,
-    ATTR_OCCUPANCY_STATUS,
     ATTR_OVERRIDE_ACTIVE,
     ATTR_OVERRIDE_REMAINING,
     ATTR_OVERRIDE_SOURCE,
-    ATTR_PRESENCE_HOME,
     ATTR_SCHEDULE_ACTIVE,
     ATTR_WINDOWS_OPEN,
     ATTR_ZONE_DETAILS,
@@ -90,7 +87,7 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
         return self.coordinator.available
 
     @property
-    def temperature_unit(self) -> str:
+    def native_temperature_unit(self) -> str:
         if self._temp_unit == "°C":
             return UnitOfTemperature.CELSIUS
         return UnitOfTemperature.FAHRENHEIT
@@ -128,19 +125,19 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
         return self.coordinator.hvac_action
 
     @property
-    def current_temperature(self) -> float | None:
+    def native_current_temperature(self) -> float | None:
         return self.coordinator.current_temp
 
     @property
-    def target_temperature(self) -> float | None:
+    def native_target_temperature(self) -> float | None:
         return None if self._banded else self.coordinator.target_temp
 
     @property
-    def target_temperature_low(self) -> float | None:
+    def native_target_temperature_low(self) -> float | None:
         return self.coordinator.target_low if self._banded else None
 
     @property
-    def target_temperature_high(self) -> float | None:
+    def native_target_temperature_high(self) -> float | None:
         return self.coordinator.target_high if self._banded else None
 
     @property
@@ -167,9 +164,6 @@ class GTTCClimate(CoordinatorEntity, ClimateEntity):
             ATTR_SCHEDULE_ACTIVE: data.get("schedule_enabled", False)
             and data.get("schedule_entry") is not None,
             ATTR_CURRENT_SCHEDULE_ENTRY: data.get("schedule_entry"),
-            ATTR_OCCUPANCY_STATUS: data.get("zone_occupancy", {}),
-            ATTR_PRESENCE_HOME: data.get("presence_home", True),
-            ATTR_LEARNING_STATUS: data.get("learning_status", {}),
             ATTR_OVERRIDE_ACTIVE: data.get("override_active", False),
             ATTR_OVERRIDE_REMAINING: data.get("override_remaining", 0),
             ATTR_OVERRIDE_SOURCE: data.get("override_source"),

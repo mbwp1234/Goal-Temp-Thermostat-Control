@@ -7,7 +7,6 @@ from typing import Any
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import area_registry as ar, entity_registry as er
 
-from .const import DOMAIN, PRESENCE_MODE_BOTH, PRESENCE_MODE_OCCUPANCY, PRESENCE_MODE_PERSON
 from .models import Zone
 
 _LOGGER = logging.getLogger(__name__)
@@ -21,9 +20,6 @@ class ZoneManager:
         self.config_entry_id = config_entry_id
         self.zones: dict[str, Zone] = {}
         self._active_zone_id: str | None = None
-        self.presence_mode: str = PRESENCE_MODE_BOTH
-        # Empty = track all person entities. Non-empty = only these entities.
-        self.tracked_persons: list[str] = []
 
     @property
     def active_zone(self) -> Zone | None:
@@ -230,62 +226,6 @@ class ZoneManager:
                 self.update_zone_occupancy(zone_id)
             except Exception as err:
                 _LOGGER.warning("Error updating zone '%s': %s", zone_id, err)
-
-    def is_anyone_home(self) -> bool:
-        """Check if anyone is home using configured presence detection method.
-
-        Uses HA person entities (zone.home detection), occupancy sensors, or both.
-        """
-        occupancy_detected = self._check_occupancy_sensors()
-        person_home = self._check_person_entities()
-
-        if self.presence_mode == PRESENCE_MODE_OCCUPANCY:
-            # Only use occupancy sensors; if none configured, assume home
-            if not self._has_any_occupancy_sensors():
-                return True
-            return occupancy_detected
-
-        if self.presence_mode == PRESENCE_MODE_PERSON:
-            return person_home
-
-        # BOTH mode: either method can confirm presence
-        if not self._has_any_occupancy_sensors():
-            # No occupancy sensors, rely on person entities
-            return person_home
-        return occupancy_detected or person_home
-
-    def _check_occupancy_sensors(self) -> bool:
-        """Check if any zone has occupancy detected."""
-        for zone in self.zones.values():
-            if zone.occupancy_sensor_entities and zone.is_occupied:
-                return True
-        return False
-
-    def _has_any_occupancy_sensors(self) -> bool:
-        return any(z.occupancy_sensor_entities for z in self.zones.values())
-
-    def _check_person_entities(self) -> bool:
-        """Check if any tracked person entity is 'home' (using HA's built-in zone.home).
-
-        If tracked_persons is non-empty, only those entities are checked.
-        If tracked_persons is empty, all person entities are checked.
-        """
-        try:
-            all_persons = self.hass.states.async_all("person")
-            if self.tracked_persons:
-                person_states = [p for p in all_persons if p.entity_id in self.tracked_persons]
-            else:
-                person_states = all_persons
-            for person in person_states:
-                if person.state == "home":
-                    return True
-            # If no person entities exist (or none selected), assume home
-            if not person_states:
-                return True
-            return False
-        except Exception as err:
-            _LOGGER.debug("Error checking person entities: %s", err)
-            return True  # Fail-safe: assume home
 
     def get_zone_temperatures(self) -> dict[str, float | None]:
         return {zone.name: zone.current_temp for zone in self.zones.values()}

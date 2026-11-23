@@ -128,7 +128,6 @@ async def test_a_warm_zone_is_cooled_against_after_ten_minutes():
     # 72 goal + (76 wall − 73.8 downstairs) — the wall at 76 calls for cooling
     assert written["target_temp_high"] == pytest.approx(74.2, abs=0.05)
     assert written["target_temp_high"] - written["target_temp_low"] >= coord.heat_cool_min_gap
-    assert coord._fan_precool_start_time is None      # no fan-only trial first
 
 
 @pytest.mark.asyncio

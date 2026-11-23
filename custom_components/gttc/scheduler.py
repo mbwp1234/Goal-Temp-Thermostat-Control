@@ -17,7 +17,7 @@ from .const import (
     PRESET_AWAY,
     PRESET_HOME,
     PRESET_SLEEP,
-    PRESET_WORK_FROM_HOME,
+    RETIRED_PRESETS,
 )
 from .models import DaySchedule, PresetSchedule, Schedule, ScheduleEntry
 
@@ -58,13 +58,6 @@ def _default_presets(temp_min: float, temp_max: float) -> dict[str, PresetSchedu
         ScheduleEntry("22:00", "06:00", sleep_temp, cooling_temp=cooling_sleep),
     ]
 
-    wfh_entries = [
-        ScheduleEntry("06:00", "08:00", comfort, cooling_temp=cooling_comfort),
-        ScheduleEntry("08:00", "18:00", comfort + 1, cooling_temp=cooling_comfort),
-        ScheduleEntry("18:00", "22:00", comfort, cooling_temp=cooling_comfort),
-        ScheduleEntry("22:00", "06:00", sleep_temp, cooling_temp=cooling_sleep),
-    ]
-
     away_entries = [
         ScheduleEntry("00:00", "23:59", away_temp, cooling_temp=cooling_away),
     ]
@@ -76,7 +69,6 @@ def _default_presets(temp_min: float, temp_max: float) -> dict[str, PresetSchedu
     presets = {}
     for name, label, entries in [
         (PRESET_HOME, "Home All Day", home_entries),
-        (PRESET_WORK_FROM_HOME, "Work From Home", wfh_entries),
         (PRESET_AWAY, "Away", away_entries),
         (PRESET_SLEEP, "Sleep", sleep_entries),
     ]:
@@ -446,7 +438,11 @@ class Scheduler:
                 self.presets = {
                     k: PresetSchedule.from_dict(v)
                     for k, v in data["presets"].items()
+                    if k not in RETIRED_PRESETS
                 }
+            # A retired plan that was running hands over to Home
+            if self.schedule.active_preset in RETIRED_PRESETS:
+                self.schedule.active_preset = PRESET_HOME if PRESET_HOME in self.presets else None
             self.enabled = data.get("enabled", True)
         except Exception as err:
             _LOGGER.error("Error loading scheduler data, using defaults: %s", err)
