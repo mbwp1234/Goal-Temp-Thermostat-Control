@@ -2290,7 +2290,9 @@ class GttcPanel extends HTMLElement {
         cool: b.e.cooling_temp ?? b.e.target_temp, split, zone: b.e.zone_id || "", away: b.e.away_temp ?? null,
         name: b.name, coolWasDefault: b.e.cooling_temp == null };
     }
-    this._blk = { plan, days: tgt.days, rep: tgt.rep, parts, draft, isNew: idx == null,
+    const ob = idx == null ? null : blocks[idx];
+    this._blk = { plan, days: [...tgt.days], rep: tgt.rep, parts, draft, isNew: idx == null,
+      orig: ob ? { a: ob.a, len: ob.len } : null,
       pv: this._isHeatCool() ? "heat_cool" : this._isCooling() ? "cooling" : "heating", armDelete: false };
     this._render();
   }
@@ -2310,13 +2312,32 @@ class GttcPanel extends HTMLElement {
   async _saveBlock(remove) {
     const B = this._blk;
     if (!B) return;
-    const list = this._planDayList(B.plan, B.rep);
+    if (!B.days.length) return;
     const add = remove ? null : { ...this._blkSpan(), e: this._blkEntry() };
-    const entries = this._paintDay(list, B.parts, add);
-    const msg = { type: "gttc/set_day_entries", days: B.days, entries };
-    if (B.plan) msg.preset = B.plan;
+    // Each chosen day is painted on its OWN list: a day picked in the drawer
+    // that is not in the group being edited keeps its other blocks. The block
+    // being edited is found there by its span; days that end up identical are
+    // written together.
+    const repSig = this._planSig(B.plan, B.rep);
+    const groups = new Map();
+    B.days.forEach(day => {
+      const list = this._planDayList(B.plan, day);
+      let parts = B.parts;
+      if (this._planSig(B.plan, day) !== repSig) {
+        const m = B.orig && this._blocksOf(list).find(b => b.a === B.orig.a && b.len === B.orig.len);
+        parts = m ? m.parts : [];
+      }
+      const entries = this._paintDay(list, parts, add);
+      const k = JSON.stringify(entries);
+      if (!groups.has(k)) groups.set(k, { days: [], entries });
+      groups.get(k).days.push(day);
+    });
     try {
-      await this._hass.callWS(msg);
+      for (const g of groups.values()) {
+        const msg = { type: "gttc/set_day_entries", days: g.days, entries: g.entries };
+        if (B.plan) msg.preset = B.plan;
+        await this._hass.callWS(msg);
+      }
       this._blk = null;
       await this._loadData();
       this._showToast(remove ? "Block deleted." : `Saved to ${this._planLabel(B.plan)}.`);
@@ -3183,7 +3204,8 @@ class GttcPanel extends HTMLElement {
         ${chip(d[key], key)}
         <button class="sx-step" data-sstep="${key}:1" aria-label="${label} higher">+</button>
       </div>`;
-    const dayChips = DAYS_ORDERED.map(x => `<span class="sx-dchip ${B.days.includes(x) ? "on" : ""}">${DAY_LABELS[x][0]}</span>`).join("");
+    const dayChips = DAYS_ORDERED.map(x => `<button type="button" class="sx-dchip ${B.days.includes(x) ? "on" : ""}" data-sday="${x}"
+      aria-pressed="${B.days.includes(x)}" aria-label="${DAY_LABELS[x]}">${DAY_LABELS[x][0]}</button>`).join("");
     const hrs = len / 60;
     return `
       <div class="sx-scrim" id="sxScrim"></div>
@@ -3212,7 +3234,7 @@ class GttcPanel extends HTMLElement {
           <div class="sx-dchips" aria-label="Days this saves to">${dayChips}</div>
         </div>
         <div class="sx-drf">
-          <button class="btn btn-add sx-big-btn" id="sxSave">Save</button>
+          <button class="btn btn-add sx-big-btn" id="sxSave" ${B.days.length ? "" : "disabled"}>Save</button>
           <button class="btn btn-cancel sx-big-btn" id="sxCancel">Cancel</button>
         </div>
       </aside>`;
@@ -3252,6 +3274,19 @@ class GttcPanel extends HTMLElement {
     time("sxStart", "start");
     time("sxEnd", "end");
     root.querySelectorAll("[data-szone]").forEach(b => b.addEventListener("click", () => { d.zone = b.dataset.szone; rerender(); }));
+    // Day chips pick which days the block saves to. The base schedule outside
+    // per-day mode stores one weekday list and one weekend list, so there a
+    // day toggles its whole half of the week.
+    root.querySelectorAll("[data-sday]").forEach(b => b.addEventListener("click", () => {
+      const B = this._blk;
+      const day = b.dataset.sday;
+      const perDay = !!B.plan || this._schedule.mode === "per_day";
+      const we = ["saturday", "sunday"];
+      const unit = perDay ? [day] : we.includes(day) ? we : DAYS_ORDERED.slice(0, 5);
+      const on = B.days.includes(day);
+      B.days = on ? B.days.filter(x => !unit.includes(x)) : DAYS_ORDERED.filter(x => B.days.includes(x) || unit.includes(x));
+      rerender();
+    }));
     const split = root.getElementById("sxSplit");
     if (split) split.addEventListener("change", () => {
       d.split = split.checked;
@@ -5337,7 +5372,9 @@ class GttcPanel extends HTMLElement {
       .sx-drawer .sx-zone[aria-pressed="true"] { background: var(--primary-text); color: var(--card-bg); }
       .sx-dchips { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 5px; }
       .sx-dchip { height: 40px; border-radius: 12px; background: var(--bg); color: var(--secondary-text); display: flex; align-items: center;
-        justify-content: center; font-size: 14px; font-weight: 800; }
+        justify-content: center; font-size: 14px; font-weight: 800; border: 0; padding: 0; font-family: inherit; cursor: pointer;
+        -webkit-tap-highlight-color: transparent; }
+      .sx-dchip:focus-visible { outline: 2px solid var(--primary-text); outline-offset: 2px; }
       .sx-dchip.on { background: var(--primary-text); color: var(--card-bg); }
 
       /* History */
